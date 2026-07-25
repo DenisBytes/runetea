@@ -71,6 +71,7 @@ package runetea
 
 import "core:testing"
 import "core:thread"
+import "core:time"
 
 N_PROD :: 4
 PER    :: 250
@@ -121,6 +122,35 @@ test_mailbox_reports_full :: proc(t: ^testing.T) {
 	testing.expect(t, !mailbox_send(&m, 3), "third send should report full")
 }
 
+// Regression test for the semaphore-desync defect described on
+// mailbox_try_recv. Without the credit consumption there, the recv below
+// returns (nil, false) almost immediately instead of blocking for the
+// delayed send.
+@(test)
+test_mailbox_try_recv_keeps_semaphore_in_sync :: proc(t: ^testing.T) {
+	m: Mailbox
+	testing.expect_value(t, mailbox_init(&m, 8), nil)
+	defer mailbox_destroy(&m)
+
+	testing.expect(t, mailbox_send(&m, 111), "send should succeed")
+	v1, ok1 := mailbox_try_recv(&m)
+	testing.expect(t, ok1, "try_recv should drain the message")
+	testing.expect_value(t, v1.(int), 111)
+
+	// Mailbox is now empty but OPEN. A delayed send must be what wakes recv.
+	sender := thread.create(proc(th: ^thread.Thread) {
+		time.sleep(50 * time.Millisecond)
+		_ = mailbox_send(cast(^Mailbox)th.data, 222)
+	})
+	sender.data = &m
+	thread.start(sender)
+	defer { thread.join(sender); thread.destroy(sender) }
+
+	v2, ok2 := mailbox_recv(&m)
+	testing.expect(t, ok2, "recv must NOT report closure on an open mailbox")
+	testing.expect_value(t, v2.(int), 222)
+}
+
 @(test)
 test_mailbox_close_wakes_receiver :: proc(t: ^testing.T) {
 	m: Mailbox
@@ -169,7 +199,16 @@ mailbox_init :: proc(m: ^Mailbox, cap: int, allocator := context.allocator) -> m
 	return nil
 }
 
+// PRECONDITION: every producer that might call mailbox_send must be stopped
+// and joined, and no thread may be inside mailbox_recv / mailbox_try_recv.
+// Destroying a mailbox a producer is still sending into is a use-after-free;
+// zeroing a mutex out from under a thread that holds it is undefined behavior.
+// Task 5's pool and Task 7's signal thread are exactly those producers.
 mailbox_destroy :: proc(m: ^Mailbox, allocator := context.allocator) {
+	assert(sync.mutex_try_lock(&m.mutex),
+		"mailbox_destroy: called while another thread holds the mailbox lock " +
+		"(a send/recv is in flight) -- stop and join all producers first")
+	sync.mutex_unlock(&m.mutex)
 	delete(m.buf, allocator)
 	m^ = {}
 }
@@ -184,9 +223,25 @@ mailbox_send :: proc(m: ^Mailbox, msg: any) -> bool {
 	m.buf[m.tail] = msg
 	m.tail = (m.tail + 1) % len(m.buf)
 	m.len += 1
-	sync.mutex_unlock(&m.mutex)
+	// Post while STILL HOLDING the lock. Any thread that later takes the mutex
+	// and sees this m.len also sees the credit already in the semaphore, which
+	// is what lets mailbox_try_recv's sema_wait be provably non-blocking.
+	// Posting after the unlock reopens a window where try_recv pops a message
+	// whose credit has not landed yet, and then blocks.
 	sync.sema_post(&m.items)
+	sync.mutex_unlock(&m.mutex)
 	return true
+}
+
+// Must be called with m.mutex held. Does NOT touch the semaphore -- callers
+// keep m.items in lockstep with the buffer.
+@(private)
+mailbox_pop :: proc(m: ^Mailbox) -> (msg: any, ok: bool) {
+	if m.len == 0 { return nil, false }
+	msg = m.buf[m.head]
+	m.head = (m.head + 1) % len(m.buf)
+	m.len -= 1
+	return msg, true
 }
 
 // Blocks until a message is available. ok=false once closed and drained.
@@ -194,23 +249,23 @@ mailbox_recv :: proc(m: ^Mailbox) -> (msg: any, ok: bool) {
 	sync.sema_wait(&m.items)
 	sync.mutex_lock(&m.mutex)
 	defer sync.mutex_unlock(&m.mutex)
-	if m.len == 0 { return nil, false }
-	msg = m.buf[m.head]
-	m.head = (m.head + 1) % len(m.buf)
-	m.len -= 1
-	return msg, true
+	return mailbox_pop(m)
 }
 
-// Non-blocking. Used by the event loop, which must never block on the mailbox
-// because nbio owns the blocking wait.
+// Non-blocking. Used by the event loop's drain fast-path.
+//
+// CRITICAL: this MUST consume a semaphore credit when it dequeues. An earlier
+// version popped without touching m.items, leaving a stale credit behind; a
+// later mailbox_recv would then wake on that credit, find len == 0, and report
+// ok=false -- "closed" on a mailbox that is open and still working. That is a
+// silent event-loop exit, and it reproduces with no threading at all:
+//   init -> send(x) -> try_recv() -> recv() returns (nil, false)
 mailbox_try_recv :: proc(m: ^Mailbox) -> (msg: any, ok: bool) {
 	sync.mutex_lock(&m.mutex)
-	defer sync.mutex_unlock(&m.mutex)
-	if m.len == 0 { return nil, false }
-	msg = m.buf[m.head]
-	m.head = (m.head + 1) % len(m.buf)
-	m.len -= 1
-	return msg, true
+	msg, ok = mailbox_pop(m)
+	sync.mutex_unlock(&m.mutex)
+	if ok { sync.sema_wait(&m.items) }   // cannot block; see mailbox_send
+	return
 }
 
 mailbox_close :: proc(m: ^Mailbox) {
@@ -224,7 +279,7 @@ mailbox_close :: proc(m: ^Mailbox) {
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cd runetea && odin test . -define:ODIN_TEST_THREADS=1`
-Expected: PASS, 3 tests. Reported memory leaks from `thread_unix.odin:_create()` mean a `thread.destroy` is missing — the test above already calls it.
+Expected: PASS, 4 tests. Reported memory leaks from `thread_unix.odin:_create()` mean a `thread.destroy` is missing — the test above already calls it.
 
 - [ ] **Step 5: Run under the thread sanitizer**
 
@@ -377,7 +432,7 @@ term_size :: proc(fd: posix.FD) -> (w: int, h: int, ok: bool) {
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cd runetea && odin test . -define:ODIN_TEST_THREADS=1`
-Expected: PASS, 6 tests total.
+Expected: PASS, 7 tests total.
 
 - [ ] **Step 5: Verify raw mode against a real tty by hand**
 
@@ -563,7 +618,7 @@ install_crash_handlers :: proc() {
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cd runetea && odin test . -define:ODIN_TEST_THREADS=1`
-Expected: PASS, 10 tests total.
+Expected: PASS, 11 tests total.
 
 - [ ] **Step 5: Verify Tier 2 restores the terminal on an unrecoverable trap**
 
@@ -752,7 +807,7 @@ box :: proc(v: $V, alloc: mem.Allocator) -> any {
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cd runetea && odin test . -define:ODIN_TEST_THREADS=1`
-Expected: PASS, 13 tests total. If `test_frame_reset_reaches_steady_state` fails, the arena is growing without bound — check that `frame_reset` is called every iteration.
+Expected: PASS, 14 tests total. If `test_frame_reset_reaches_steady_state` fails, the arena is growing without bound — check that `frame_reset` is called every iteration.
 
 - [ ] **Step 5: Confirm the type switch works across package boundaries**
 
@@ -1022,7 +1077,7 @@ dispatch :: proc(d: ^Dispatcher, c: Cmd) {
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cd runetea && odin test . -define:ODIN_TEST_THREADS=1`
-Expected: PASS, 16 tests total.
+Expected: PASS, 18 tests total.
 
 - [ ] **Step 5: Run under the thread sanitizer**
 
@@ -1194,7 +1249,7 @@ input_source_from_bytes :: proc(data: []u8) -> Input_Source {
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cd runetea && odin test . -define:ODIN_TEST_THREADS=1`
-Expected: PASS, 19 tests total.
+Expected: PASS, 21 tests total.
 
 - [ ] **Step 5: Verify nbio drives a real fd end to end**
 
@@ -1417,7 +1472,7 @@ signal_watcher_stop :: proc(sw: ^Signal_Watcher) {
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cd runetea && odin test . -define:ODIN_TEST_THREADS=1`
-Expected: PASS, 21 tests total.
+Expected: PASS, 23 tests total.
 
 If `posix.sigwait`'s signature differs from `sigwait(&set, &sig) -> result`, check `core/sys/posix/signal.odin:186` and adjust — this is the one API in the spike most likely to have drifted.
 
@@ -1614,7 +1669,7 @@ decode_keys :: proc(data: []u8, out: ^[dynamic]Key_Msg) -> (consumed: int) {
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cd runetea && odin test . -define:ODIN_TEST_THREADS=1`
-Expected: PASS, 26 tests total.
+Expected: PASS, 28 tests total.
 
 - [ ] **Step 5: Commit**
 
@@ -1753,7 +1808,7 @@ renderer_clear :: proc(r: ^Renderer) {
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cd runetea && odin test . -define:ODIN_TEST_THREADS=1`
-Expected: PASS, 29 tests total. If `test_second_render_rewinds_previous_lines` fails on the trailing-newline count, check whether `strings.split_lines` yields a trailing empty element for input ending in `\n` — the test inputs deliberately do not end in a newline to avoid that ambiguity.
+Expected: PASS, 31 tests total. If `test_second_render_rewinds_previous_lines` fails on the trailing-newline count, check whether `strings.split_lines` yields a trailing empty element for input ending in `\n` — the test inputs deliberately do not end in a newline to avoid that ambiguity.
 
 - [ ] **Step 5: Commit**
 
@@ -2051,7 +2106,7 @@ apply :: proc(p: ^Program($T), msg: any, fa: ^Frame_Arena, disp: ^Dispatcher, r:
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cd runetea && odin test . -define:ODIN_TEST_THREADS=1`
-Expected: PASS, 31 tests total.
+Expected: PASS, 33 tests total.
 
 The `Step(T)`-through-`rawptr` pattern was verified before this plan was written: a parapoly struct passed as `rawptr` into a non-generic callback and recovered with `cast(^Step(T))ud` works, because the proc literal is instantiated inside the generic parent. If it nonetheless fails here, fall back to a monomorphic `Step` holding `p: rawptr` plus a `step_proc: proc(rawptr)` set by `run`, and record the constraint.
 
@@ -2199,7 +2254,7 @@ Run:
 cd runetea && odin test . -define:ODIN_TEST_THREADS=1 -define:GOLDEN_UPDATE=true
 cd runetea && odin test . -define:ODIN_TEST_THREADS=1
 ```
-Expected: the second run PASSES, 32 tests. Inspect `runetea/testdata/simple_session.golden` with `cat -v` and confirm the escape sequences are what you expect — a golden file nobody has read is not a test.
+Expected: the second run PASSES, 34 tests. Inspect `runetea/testdata/simple_session.golden` with `cat -v` and confirm the escape sequences are what you expect — a golden file nobody has read is not a test.
 
 - [ ] **Step 4: Port examples/http and count the ergonomic cost**
 
