@@ -736,6 +736,9 @@ Create `runetea/arena_test.odin`:
 ```odin
 package runetea
 
+// Odin imports are FILE-scoped, not package-scoped: arena.odin's import of
+// core:mem does not cover this file.
+import "core:mem"
 import "core:testing"
 
 Boxed_A :: struct { n: int }
