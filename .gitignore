@@ -1,0 +1,23 @@
+# SDD scratch workspace (ledger, briefs, review packages)
+.superpowers/
+
+# Odin build artifacts
+*.o
+*.obj
+*.bin
+*.exe
+*.so
+*.dylib
+*.pdb
+*.ll
+*.bc
+
+# Built binaries (Odin emits the package name next to the source)
+/runetea/runetea
+/examples/*/simple
+/examples/*/http
+/tools/*/rawcheck
+/tools/*/crashcheck
+/tools/*/msgcheck
+/tools/*/nbiocheck
+/tools/*/golden

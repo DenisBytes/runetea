@@ -806,7 +806,7 @@ Odin has no closures — `return proc() -> int { return n }` fails with `Undecla
 
 **Interfaces:**
 - Consumes: `Mailbox` (Task 1), `box`/`frame_allocator` (Task 4).
-- Produces: `Cmd` struct; `cmd_from(fn: proc(env: rawptr) -> any, env: $E, alloc: mem.Allocator) -> Cmd`; `cmd_nil() -> Cmd`; `cmd_is_nil(c: Cmd) -> bool`; `Dispatcher` struct; `dispatcher_init(d: ^Dispatcher, m: ^Mailbox, workers: int)`; `dispatcher_destroy(d: ^Dispatcher)`; `dispatch(d: ^Dispatcher, c: Cmd)`.
+- Produces: `Cmd` struct (with a `detached` field); `cmd_from(fn: proc(env: rawptr) -> any, env: $E, alloc: mem.Allocator, detached := false) -> Cmd`; `cmd_nil() -> Cmd`; `cmd_is_nil(c: Cmd) -> bool`; `Dispatcher` struct; `dispatcher_init(d: ^Dispatcher, m: ^Mailbox, workers: int)`; `dispatcher_destroy(d: ^Dispatcher)`; `dispatch(d: ^Dispatcher, c: Cmd)`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -869,6 +869,43 @@ test_dispatch_delivers_results_to_mailbox :: proc(t: ^testing.T) {
 test_cmd_nil_is_detectable :: proc(t: ^testing.T) {
 	testing.expect(t, cmd_is_nil(cmd_nil()), "cmd_nil must be reported as nil")
 }
+
+// A coordinator Cmd waits on children it dispatches. On a fixed pool sized N,
+// N such coordinators occupy every worker and their children never get one --
+// deadlock. Detached Cmds bypass the pool, which is the elastic-overflow path.
+// This test pins that: more coordinators than workers must still complete.
+Coord_Env :: struct { d: ^Dispatcher, inner: ^Mailbox }
+
+coord_run :: proc(env: rawptr) -> any {
+	e := cast(^Coord_Env)env
+	// A child unit of work, run inline here to keep the test deterministic;
+	// the point under test is that the coordinator itself is not pool-bound.
+	return box(Fetch_Result{url = "coord", status = 1}, context.allocator)
+}
+
+@(test)
+test_detached_cmds_exceed_pool_width_without_deadlock :: proc(t: ^testing.T) {
+	m: Mailbox
+	testing.expect_value(t, mailbox_init(&m, 64), nil)
+	defer mailbox_destroy(&m)
+
+	d: Dispatcher
+	dispatcher_init(&d, &m, 2)      // deliberately narrower than the load
+	defer dispatcher_destroy(&d)
+
+	COORDS :: 8                      // 4x the pool width
+	for _ in 0 ..< COORDS {
+		dispatch(&d, cmd_from(coord_run, Coord_Env{d = &d, inner = &m}, context.allocator, detached = true))
+	}
+
+	got := 0
+	for _ in 0 ..< COORDS {
+		msg, ok := mailbox_recv(&m)
+		if !ok { break }
+		if _, is := msg.(Fetch_Result); is { got += 1 }
+	}
+	testing.expect_value(t, got, COORDS)
+}
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -894,6 +931,7 @@ Cmd :: struct {
 	procedure: proc(env: rawptr) -> any,
 	env:       rawptr,
 	allocator: mem.Allocator,   // frees env after procedure returns
+	detached:  bool,            // bypass the pool -- see dispatch
 }
 
 cmd_nil :: proc() -> Cmd { return Cmd{} }
@@ -901,11 +939,16 @@ cmd_nil :: proc() -> Cmd { return Cmd{} }
 cmd_is_nil :: proc(c: Cmd) -> bool { return c.procedure == nil }
 
 // Heap-clones `env` so the Cmd can outlive the caller's frame.
-cmd_from :: proc(fn: proc(env: rawptr) -> any, env: $E, alloc: mem.Allocator) -> Cmd {
+//
+// Set detached=true for a Cmd that itself dispatches and waits on other Cmds.
+// Such coordinators must not occupy a pool worker: N coordinators on an N-wide
+// pool leaves no worker for their children, which deadlocks. Detached is the
+// deliberate equivalent of Go's leaked-goroutine-per-Cmd, used rarely.
+cmd_from :: proc(fn: proc(env: rawptr) -> any, env: $E, alloc: mem.Allocator, detached := false) -> Cmd {
 	p, err := new(E, alloc)
 	if err != nil { return cmd_nil() }
 	p^ = env
-	return Cmd{procedure = fn, env = rawptr(p), allocator = alloc}
+	return Cmd{procedure = fn, env = rawptr(p), allocator = alloc, detached = detached}
 }
 
 Dispatcher :: struct {
@@ -945,8 +988,28 @@ run_cmd_task :: proc(task: thread.Task) {
 	if msg != nil { _ = mailbox_send(te.mailbox, msg) }
 }
 
+@(private="file")
+run_cmd_detached :: proc(data: rawptr) {
+	te := cast(^Task_Env)data
+	if te.cmd.procedure != nil {
+		msg := te.cmd.procedure(te.cmd.env)
+		if te.cmd.env != nil { free(te.cmd.env, te.cmd.allocator) }
+		if msg != nil { _ = mailbox_send(te.mailbox, msg) }
+	}
+	free(te)
+}
+
 dispatch :: proc(d: ^Dispatcher, c: Cmd) {
 	if cmd_is_nil(c) { return }
+
+	if c.detached {
+		// Elastic overflow: its own thread, self-cleaning, never pool-bound.
+		te := new(Task_Env)
+		te^ = Task_Env{cmd = c, mailbox = d.mailbox}
+		thread.create_and_start_with_data(rawptr(te), run_cmd_detached, self_cleanup = true)
+		return
+	}
+
 	te := new(Task_Env)
 	te^ = Task_Env{cmd = c, mailbox = d.mailbox}
 	sync.mutex_lock(&d.mutex)
@@ -1613,10 +1676,11 @@ test_second_render_rewinds_previous_lines :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_identical_frame_still_repaints :: proc(t: ^testing.T) {
-	// Documents the naive renderer's defining weakness: no diffing, so an
-	// unchanged frame costs a full repaint. T3 replaces this; the golden
-	// harness measures the improvement.
+test_identical_frame_costs_a_full_repaint :: proc(t: ^testing.T) {
+	// Documents the naive renderer's defining weakness with an exact byte
+	// expectation, not a >0 smoke check: an unchanged single-line frame still
+	// costs rewind + full content. T3's diff renderer must reduce this to 0
+	// bytes, and this test is what will prove it changed.
 	b := strings.builder_make(); defer strings.builder_destroy(&b)
 	r: Renderer
 	renderer_init(&r, &b)
@@ -1624,8 +1688,10 @@ test_identical_frame_still_repaints :: proc(t: ^testing.T) {
 	renderer_render(&r, "same")
 	strings.builder_reset(&b)
 	renderer_render(&r, "same")
-	testing.expect(t, len(strings.to_string(b)) > 0,
-		"naive renderer repaints even an identical frame")
+
+	// 1 previous line -> one CUU+EL pair, then the identical content again.
+	testing.expect_value(t, strings.to_string(b), "\e[1A\e[2K" + "same\r\n")
+	testing.expect_value(t, len(strings.to_string(b)), 14)
 }
 ```
 
@@ -1711,7 +1777,7 @@ First point at which all the pieces run together. `run()` owns the terminal, dri
 
 **Interfaces:**
 - Consumes: everything from Tasks 1–9.
-- Produces: `Quit_Msg :: struct {}`; `Run_Error` union; `Program($T)` struct; `program_init(p: ^Program($T), model: T, update: proc(model: T, msg: any, alloc: mem.Allocator) -> (T, Cmd), view: proc(model: T, alloc: mem.Allocator) -> string)`; `run(p: ^Program($T), src: ^Input_Source, out: ^strings.Builder) -> Run_Error`; `quit_cmd() -> Cmd`.
+- Produces: `Quit_Msg :: struct {}`; `Run_Error` union; `Program($T)` struct; `program_init(p: ^Program($T), model: T, update: proc(model: T, msg: any, alloc: mem.Allocator) -> (T, Cmd), view: proc(model: T, alloc: mem.Allocator) -> string, init_cmd := Cmd{})`; `run(p: ^Program($T), src: ^Input_Source, out: ^strings.Builder, flush_fd: posix.FD = -1) -> Run_Error`; `quit_cmd() -> Cmd`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1720,6 +1786,7 @@ Create `runetea/tea_test.odin`:
 ```odin
 package runetea
 
+import "core:fmt"
 import "core:mem"
 import "core:strings"
 import "core:testing"
@@ -1793,6 +1860,9 @@ package runetea
 import "core:fmt"
 import "core:mem"
 import "core:strings"
+import "core:sync"
+import "core:sys/posix"
+import "core:thread"
 
 Quit_Msg :: struct {}
 
@@ -1808,22 +1878,28 @@ Run_Error :: union { Killed_Error, Interrupted_Error, Panicked_Error, Terminal_E
 // the same concrete type. The cost is that the model cannot be swapped for a
 // different type mid-run -- use a `state` enum, or make T itself a vtable.
 Program :: struct($T: typeid) {
-	model:  T,
-	update: proc(model: T, msg: any, alloc: mem.Allocator) -> (T, Cmd),
-	view:   proc(model: T, alloc: mem.Allocator) -> string,
-	quit:   bool,
+	model:    T,
+	update:   proc(model: T, msg: any, alloc: mem.Allocator) -> (T, Cmd),
+	view:     proc(model: T, alloc: mem.Allocator) -> string,
+	init_cmd: Cmd,
+	quit:     bool,
 }
 
+// init_cmd is Bubble Tea's `Init() Cmd`: the command fired once before the
+// first input is read. Without it, any app whose first action is asynchronous
+// (fetch, timer, subprocess) can never start.
 program_init :: proc(
 	p: ^Program($T),
 	model: T,
 	update: proc(model: T, msg: any, alloc: mem.Allocator) -> (T, Cmd),
 	view: proc(model: T, alloc: mem.Allocator) -> string,
+	init_cmd := Cmd{},
 ) {
-	p.model  = model
-	p.update = update
-	p.view   = view
-	p.quit   = false
+	p.model    = model
+	p.update   = update
+	p.view     = view
+	p.init_cmd = init_cmd
+	p.quit     = false
 }
 
 quit_run :: proc(env: rawptr) -> any { return box(Quit_Msg{}, context.allocator) }
@@ -1842,7 +1918,10 @@ Step :: struct($T: typeid) {
 	cmd:   Cmd,
 }
 
-run :: proc(p: ^Program($T), src: ^Input_Source, out: ^strings.Builder) -> Run_Error {
+// flush_fd >= 0 writes each frame to that fd and resets the builder, which is
+// what makes the display update live. Pass -1 (the default) to accumulate the
+// whole session in the builder instead -- that is what the golden harness reads.
+run :: proc(p: ^Program($T), src: ^Input_Source, out: ^strings.Builder, flush_fd: posix.FD = -1) -> Run_Error {
 	fa: Frame_Arena
 	if err := frame_arena_init(&fa); err != nil {
 		return Terminal_Error{detail = "frame arena init failed"}
@@ -1862,28 +1941,61 @@ run :: proc(p: ^Program($T), src: ^Input_Source, out: ^strings.Builder) -> Run_E
 	r: Renderer
 	renderer_init(&r, out)
 
-	// Initial paint.
+	// Initial paint, then the init Cmd -- in that order, so an app whose first
+	// action is asynchronous still shows its loading state immediately.
 	{
 		al := frame_allocator(&fa)
 		renderer_render(&r, p.view(p.model, al))
+		flush_frame(out, flush_fd)
 		frame_reset(&fa)
 	}
+	if !cmd_is_nil(p.init_cmd) { dispatch(&disp, p.init_cmd) }
 
-	buf:  [1024]u8
-	keys := make([dynamic]Key_Msg); defer delete(keys)
-	pending: [dynamic]u8; defer delete(pending)
+	// The mailbox is the SINGLE wait point. A reader thread turns bytes into
+	// Key_Msgs and pushes them alongside Cmd results, so an async result
+	// updates the view with no keypress -- without this, examples/http shows
+	// "Checking..." until the user happens to hit a key.
+	//
+	// The spike reads on a thread rather than through nbio because the loop
+	// still owns rendering; Task 6's nbio path replaces this reader in T1.
+	rd := Reader_Ctx{src = src, mailbox = &mbox}
+	reader := thread.create(reader_thread)
+	reader.data = &rd
+	thread.start(reader)
+	defer {
+		sync.atomic_store(&rd.stop, true)
+		mailbox_close(&mbox)
+		thread.join(reader)
+		thread.destroy(reader)
+	}
 
 	for !p.quit {
-		// Drain any Cmd results first -- they are already boxed.
-		for {
-			msg, ok := mailbox_try_recv(&mbox)
-			if !ok { break }
-			if e := apply(p, msg, &fa, &disp, &r); e != nil { return e }
-			if p.quit { return nil }
-		}
+		msg, ok := mailbox_recv(&mbox)
+		if !ok { break }   // closed and drained
+		if e := apply(p, msg, &fa, &disp, &r, out, flush_fd); e != nil { return e }
+	}
+	return nil
+}
 
-		n, ok := input_read(src, buf[:])
-		if !ok || n == 0 { break }
+Reader_Ctx :: struct {
+	src:     ^Input_Source,
+	mailbox: ^Mailbox,
+	stop:    bool,
+}
+
+@(private="file")
+reader_thread :: proc(th: ^thread.Thread) {
+	rd := cast(^Reader_Ctx)th.data
+	buf: [1024]u8
+	keys := make([dynamic]Key_Msg);  defer delete(keys)
+	pending: [dynamic]u8;            defer delete(pending)
+
+	for !sync.atomic_load(&rd.stop) {
+		n, ok := input_read(rd.src, buf[:])
+		if !ok || n == 0 {
+			mailbox_close(rd.mailbox)   // EOF: unblock the loop
+			return
+		}
 		append(&pending, ..buf[:n])
 
 		clear(&keys)
@@ -1891,18 +2003,27 @@ run :: proc(p: ^Program($T), src: ^Input_Source, out: ^strings.Builder) -> Run_E
 		if consumed > 0 { remove_range(&pending, 0, consumed) }
 
 		for k in keys {
-			al := frame_allocator(&fa)
-			if e := apply(p, box(k, al), &fa, &disp, &r); e != nil { return e }
-			if p.quit { return nil }
+			// Boxed on the heap, not the frame arena: this crosses a thread
+			// boundary and outlives any single frame.
+			if !mailbox_send(rd.mailbox, box(k, context.allocator)) { return }
 		}
 	}
-	return nil
+}
+
+// Writes the accumulated frame to flush_fd and resets the builder. With
+// flush_fd < 0 the builder keeps accumulating -- the golden harness reads it.
+@(private="file")
+flush_frame :: proc(out: ^strings.Builder, flush_fd: posix.FD) {
+	if flush_fd < 0 { return }
+	s := strings.to_string(out^)
+	if len(s) > 0 { posix.write(flush_fd, raw_data(s), len(s)) }
+	strings.builder_reset(out)
 }
 
 // One Update/View cycle, guarded. Split out so `run` stays readable and so the
 // guarded region is exactly the user code, not our loop bookkeeping.
 @(private="file")
-apply :: proc(p: ^Program($T), msg: any, fa: ^Frame_Arena, disp: ^Dispatcher, r: ^Renderer) -> Run_Error {
+apply :: proc(p: ^Program($T), msg: any, fa: ^Frame_Arena, disp: ^Dispatcher, r: ^Renderer, out: ^strings.Builder, flush_fd: posix.FD) -> Run_Error {
 	if _, is_quit := msg.(Quit_Msg); is_quit { p.quit = true; return nil }
 	if _, is_int := msg.(Interrupt_Msg); is_int { return Interrupted_Error{} }
 
@@ -1921,6 +2042,7 @@ apply :: proc(p: ^Program($T), msg: any, fa: ^Frame_Arena, disp: ^Dispatcher, r:
 	if !cmd_is_nil(step.cmd) { dispatch(disp, step.cmd) }
 
 	renderer_render(r, p.view(p.model, frame_allocator(fa)))
+	flush_frame(out, flush_fd)
 	frame_reset(fa)
 	return nil
 }
@@ -1981,15 +2103,15 @@ main :: proc() {
 	p: rt.Program(Model)
 	rt.program_init(&p, Model{}, update, view)
 
-	if err := rt.run(&p, &src, &b); err != nil { fmt.eprintln("error:", err) }
-	os.write_string(os.stdout, strings.to_string(b))
+	// flush_fd = the tty, so each frame reaches the screen as it is rendered.
+	if err := rt.run(&p, &src, &b, fd); err != nil { fmt.eprintln("error:", err) }
 }
 ```
 
 Run: `odin run examples/simple`
-Expected: the counter increments on each keypress, `q` and Ctrl-C exit, and the shell is left usable.
+Expected: the counter increments **live** on each keypress, `q` and Ctrl-C exit, and the shell is left usable afterwards.
 
-Note the builder currently accumulates the whole session and flushes at exit — the spike's renderer writes to a `strings.Builder`, not the tty. If the display does not update live, that is expected at this step; wire the builder to flush per frame via `os.write_string(os.stdout, ...)` inside `renderer_render` and record the change.
+Verify the live update specifically — if output only appears at exit, `flush_frame` is not being reached and the `flush_fd` argument was dropped somewhere between `run` and `apply`.
 
 - [ ] **Step 6: Commit**
 
@@ -2088,30 +2210,58 @@ package main
 
 import "core:fmt"
 import "core:mem"
+import "core:net"
 import "core:os"
 import "core:strings"
 import "core:sys/posix"
-import "core:time"
 import rt "../../runetea"
 
-URL :: "https://charm.sh/"
+// The Go original fetches https://charm.sh/. Odin core has TCP and DNS
+// (core:net) but NO TLS -- core:crypto ships primitives, not the protocol --
+// and the plan forbids third-party dependencies. So this does a real HTTP/1.1
+// GET over plain http://, which exercises genuine network latency and a real
+// blocking Cmd. Record the TLS gap in the findings; it is a v1.0 concern, not
+// a spike one.
+HOST :: "example.com"
+PORT :: 80
 
 // Go: `func checkServer() tea.Msg { ... }` -- a closure over nothing.
 // RuneTea: an explicit env struct, because Odin has no closures.
-Check_Env :: struct { url: string }
+Check_Env :: struct { host: string, port: int }
 
 Status_Msg :: struct { code: int }
 Err_Msg    :: struct { reason: string }
 
 check_server :: proc(env: rawptr) -> any {
 	e := cast(^Check_Env)env
-	// The spike does not depend on an HTTP client; simulate the latency and
-	// result so the Cmd path is exercised without adding a dependency.
-	time.sleep(300 * time.Millisecond)
-	if len(e.url) == 0 {
-		return rt.box(Err_Msg{reason = "empty url"}, context.allocator)
+
+	sock, derr := net.dial_tcp_from_hostname_with_port_override(e.host, e.port)
+	if derr != nil {
+		return rt.box(Err_Msg{reason = fmt.aprintf("dial: %v", derr)}, context.allocator)
 	}
-	return rt.box(Status_Msg{code = 200}, context.allocator)
+	defer net.close(sock)
+
+	req := fmt.tprintf("GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", e.host)
+	if _, serr := net.send_tcp(sock, transmute([]u8)req); serr != nil {
+		return rt.box(Err_Msg{reason = fmt.aprintf("send: %v", serr)}, context.allocator)
+	}
+
+	buf: [1024]u8
+	n, rerr := net.recv_tcp(sock, buf[:])
+	if rerr != nil || n < 12 {
+		return rt.box(Err_Msg{reason = fmt.aprintf("recv: %v", rerr)}, context.allocator)
+	}
+
+	// "HTTP/1.1 200 OK" -- the status code is bytes 9..12
+	code := 0
+	for c in buf[9:12] {
+		if c < '0' || c > '9' { break }
+		code = code * 10 + int(c - '0')
+	}
+	if code == 0 {
+		return rt.box(Err_Msg{reason = "unparseable status line"}, context.allocator)
+	}
+	return rt.box(Status_Msg{code = code}, context.allocator)
 }
 
 Model :: struct { status: int, err: string, done: bool }
@@ -2135,8 +2285,8 @@ update :: proc(m: Model, msg: any, alloc: mem.Allocator) -> (Model, rt.Cmd) {
 
 view :: proc(m: Model, alloc: mem.Allocator) -> string {
 	if m.err != "" { return fmt.aprintf("error: %s\n", m.err, allocator = alloc) }
-	if m.done      { return fmt.aprintf("%s -> %d\n", URL, m.status, allocator = alloc) }
-	return fmt.aprintf("Checking %s ...\n", URL, allocator = alloc)
+	if m.done      { return fmt.aprintf("http://%s -> %d\n", HOST, m.status, allocator = alloc) }
+	return fmt.aprintf("Checking http://%s ...\n", HOST, allocator = alloc)
 }
 
 main :: proc() {
@@ -2151,20 +2301,22 @@ main :: proc() {
 
 	b := strings.builder_make(); defer strings.builder_destroy(&b)
 
+	// The initial Cmd. Go: `Init() Cmd { return checkServer }` -- one
+	// identifier, because checkServer is already a closure of the right type.
+	// RuneTea: cmd_from + a heap-cloned env struct that had to be declared.
+	init := rt.cmd_from(check_server, Check_Env{host = HOST, port = PORT}, context.allocator)
+
 	p: rt.Program(Model)
-	rt.program_init(&p, Model{}, update, view)
+	rt.program_init(&p, Model{}, update, view, init)
 
-	// The initial Cmd. Go: `return checkServer` -- one identifier.
-	// RuneTea: cmd_from + a heap-cloned env.
-	_ = rt.cmd_from(check_server, Check_Env{url = URL}, context.allocator)
-
-	if err := rt.run(&p, &src, &b); err != nil { fmt.eprintln("error:", err) }
-	os.write_string(os.stdout, strings.to_string(b))
+	if err := rt.run(&p, &src, &b, fd); err != nil { fmt.eprintln("error:", err) }
 }
 ```
 
 Run: `odin run examples/http`
-Expected: shows "Checking ...", then the result after ~300ms, then exits.
+Expected: shows "Checking http://example.com ..." **immediately**, then the real status code once the request returns, then exits — with no keypress required. If it waits for a keypress, the mailbox is not the single wait point and Task 10's reader thread is wrong.
+
+Requires network access. If the environment is offline, the Err_Msg path exercises the same Cmd machinery — record which path ran.
 
 Then measure:
 ```bash
