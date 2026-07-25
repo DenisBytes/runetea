@@ -381,6 +381,19 @@ g_term: Term_State
 
 term_enter_raw :: proc(fd: posix.FD) -> bool {
 	if posix.tcgetattr(fd, &g_term.saved) != .OK { return false }
+
+	// ORDERING INVARIANT: raw_active must be true for the ENTIRE interval in
+	// which the tty could possibly be raw, and g_term.saved must be valid
+	// before raw_active is ever true. saved is valid as of the line above, so
+	// flip raw_active on NOW, before tcsetattr touches the terminal. A crash
+	// anywhere from here through tcsetattr then sees raw_active == true and
+	// restores g_term.saved -- correct whether the tty is still cooked or has
+	// just become raw. Setting raw_active only after tcsetattr succeeds leaves
+	// a window where the tty is raw but term_restore_c() no-ops, stranding the
+	// terminal with no recovery.
+	g_term.fd = fd
+	g_term.raw_active = true
+
 	raw := g_term.saved
 
 	raw.c_iflag -= {.BRKINT, .ICRNL, .INPCK, .ISTRIP, .IXON}
@@ -396,9 +409,11 @@ term_enter_raw :: proc(fd: posix.FD) -> bool {
 	raw.c_cc[.VMIN]  = 1
 	raw.c_cc[.VTIME] = 0
 
-	if posix.tcsetattr(fd, .TCSAFLUSH, &raw) != .OK { return false }
-	g_term.fd = fd
-	g_term.raw_active = true
+	if posix.tcsetattr(fd, .TCSAFLUSH, &raw) != .OK {
+		// Roll back: the tty was never actually put into raw mode.
+		g_term.raw_active = false
+		return false
+	}
 	return true
 }
 
