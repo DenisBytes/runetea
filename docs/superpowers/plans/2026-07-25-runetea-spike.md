@@ -447,7 +447,7 @@ import "core:sys/posix"
 import rt "../../runetea"
 
 main :: proc() {
-	fd := posix.FD(os.stdin)
+	fd := posix.FD(os.fd(os.stdin))
 	if !rt.term_enter_raw(fd) { fmt.eprintln("not a tty"); os.exit(1) }
 	defer rt.term_restore()
 
@@ -633,7 +633,7 @@ import "core:sys/posix"
 import rt "../../runetea"
 
 main :: proc() {
-	fd := posix.FD(os.stdin)
+	fd := posix.FD(os.fd(os.stdin))
 	if !rt.term_enter_raw(fd) { fmt.eprintln("not a tty"); os.exit(1) }
 	rt.install_crash_handlers()
 
@@ -2144,7 +2144,7 @@ view :: proc(m: Model, alloc: mem.Allocator) -> string {
 }
 
 main :: proc() {
-	fd := posix.FD(os.stdin)
+	fd := posix.FD(os.fd(os.stdin))
 	if !rt.term_enter_raw(fd) { fmt.eprintln("not a tty"); os.exit(1) }
 	defer rt.term_restore()
 	rt.install_crash_handlers()
@@ -2345,7 +2345,7 @@ view :: proc(m: Model, alloc: mem.Allocator) -> string {
 }
 
 main :: proc() {
-	fd := posix.FD(os.stdin)
+	fd := posix.FD(os.fd(os.stdin))
 	if !rt.term_enter_raw(fd) { fmt.eprintln("not a tty"); os.exit(1) }
 	defer rt.term_restore()
 	rt.install_crash_handlers()
