@@ -575,9 +575,17 @@ Panic_Info :: struct {
 	recovered: bool,
 }
 
-@(private="file") g_guard:       libc.jmp_buf
-@(private="file") g_panic_msg:   string
-@(private="file") g_panic_alloc: mem.Allocator
+// THREAD-LOCAL, not file-global. Task 5's pool runs user Cmd code and Task 7's
+// signal thread both call into this; a shared jmp_buf would let one thread's
+// setjmp clobber another's jump target, and a later panic would longjmp into a
+// dead stack frame.
+@(thread_local, private="file") g_guard:       libc.jmp_buf
+@(thread_local, private="file") g_panic_msg:   string
+@(thread_local, private="file") g_panic_alloc: mem.Allocator
+// Debug-only re-entrancy guard. CAVEAT: compiled out by -disable-assert, which
+// silently restores the nesting-corruption bug. Do not ship release builds of
+// a TUI with assertions disabled unless you have re-checked this.
+@(thread_local, private="file") g_armed: bool
 
 @(private="file")
 guard_assertion_failure :: proc(prefix, message: string, loc: runtime.Source_Code_Location) -> ! {
@@ -594,7 +602,13 @@ guard_assertion_failure :: proc(prefix, message: string, loc: runtime.Source_Cod
 //
 // Bounds violations and nil derefs never reach here; install_crash_handlers
 // covers those and they are NOT recoverable.
+// NOT nestable on a single thread: the inner setjmp would clobber this
+// thread's jump target. The assert below fails loudly instead of corrupting.
 guarded :: proc(body: proc(ud: rawptr), ud: rawptr, allocator := context.allocator) -> Panic_Info {
+	assert(!g_armed, "guarded() does not support nesting on the same thread")
+	g_armed = true
+	defer g_armed = false
+
 	prev_proc  := context.assertion_failure_proc
 	g_panic_alloc = allocator
 	context.assertion_failure_proc = guard_assertion_failure
@@ -621,10 +635,33 @@ crash_handler :: proc "c" (sig: posix.Signal) {
 // Tier 2. Bounds-check failure is the likeliest TUI crash -- indexing a cell
 // buffer during render -- and it traps rather than calling assertion_failure_proc,
 // so this is the primary net, not a backstop.
+// Statically allocated: a stack-overflow SIGSEGV cannot afford a heap
+// allocation at handler time.
+@(private="file") g_altstack_buf: [posix.SIGSTKSZ]byte
+
 install_crash_handlers :: proc() {
-	for sig in ([]posix.Signal{.SIGSEGV, .SIGBUS, .SIGILL, .SIGFPE, .SIGABRT, .SIGTRAP, .SIGHUP, .SIGQUIT}) {
+	// Without an alternate stack, a stack-exhaustion SIGSEGV -- the commonest
+	// real cause -- is delivered on the exhausted stack and crash_handler
+	// re-faults before term_restore_c() finishes, defeating Tier 2 exactly
+	// when it matters. CAVEAT: sigaltstack is PER-THREAD. This installs one on
+	// the calling thread only; Task 5's pool threads and Task 7's signal
+	// thread get no altstack unless they call this themselves.
+	altstack := posix.stack_t{
+		ss_sp   = raw_data(g_altstack_buf[:]),
+		ss_size = len(g_altstack_buf),
+	}
+	posix.sigaltstack(&altstack, nil)
+
+	// SIGTERM is included: it is the default signal from kill(1), systemd and
+	// `docker stop` -- likelier than SIGBUS/SIGTRAP -- and mid-raw-mode it
+	// would otherwise strand the shell.
+	sigs := []posix.Signal{
+		.SIGSEGV, .SIGBUS, .SIGILL, .SIGFPE, .SIGABRT, .SIGTRAP, .SIGHUP, .SIGQUIT, .SIGTERM,
+	}
+	for sig in sigs {
 		act := posix.sigaction_t{}
 		act.sa_handler = crash_handler
+		act.sa_flags = {.ONSTACK}
 		posix.sigaction(sig, &act, nil)
 	}
 }
