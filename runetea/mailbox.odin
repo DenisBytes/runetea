@@ -25,7 +25,26 @@ mailbox_init :: proc(m: ^Mailbox, cap: int, allocator := context.allocator) -> m
 	return nil
 }
 
+// Frees the mailbox's backing buffer and zeroes the struct (including the
+// mutex and semaphore).
+//
+// PRECONDITION: every producer that might call mailbox_send must be stopped
+// and joined, and no thread may be inside mailbox_recv / mailbox_try_recv,
+// before this is called. Destroying a mailbox that a producer is still
+// sending into is a use-after-free; zeroing a mutex/semaphore out from under
+// a thread that holds or waits on it is undefined behavior. Task 5's thread
+// pool and Task 7's signal-watcher thread are exactly the long-lived
+// producers that must be joined first.
+//
+// Best-effort guard: asserts the mutex is uncontended at the moment of the
+// call, which catches the common case of destroying while a send/recv is
+// in flight. It cannot catch a producer that is about to call mailbox_send
+// but hasn't reached the lock yet -- that ordering is still on the caller.
 mailbox_destroy :: proc(m: ^Mailbox, allocator := context.allocator) {
+	assert(sync.mutex_try_lock(&m.mutex),
+		"mailbox_destroy: called while another thread holds the mailbox lock " +
+		"(a send/recv is in flight) -- stop and join all producers first")
+	sync.mutex_unlock(&m.mutex)
 	delete(m.buf, allocator)
 	m^ = {}
 }
@@ -40,9 +59,26 @@ mailbox_send :: proc(m: ^Mailbox, msg: any) -> bool {
 	m.buf[m.tail] = msg
 	m.tail = (m.tail + 1) % len(m.buf)
 	m.len += 1
-	sync.mutex_unlock(&m.mutex)
+	// Post while still holding the lock. This guarantees that any thread
+	// which later locks the mutex and observes the new m.len has this
+	// message's credit already sitting in the semaphore -- see mailbox_pop
+	// and mailbox_try_recv below, which depend on that ordering to prove
+	// their sema_wait calls cannot block.
 	sync.sema_post(&m.items)
+	sync.mutex_unlock(&m.mutex)
 	return true
+}
+
+// Must be called with m.mutex held. Pops one message off the ring buffer,
+// or reports ok=false if it's empty. Does not touch the semaphore -- callers
+// are responsible for keeping m.items in lockstep with the buffer.
+@(private)
+mailbox_pop :: proc(m: ^Mailbox) -> (msg: any, ok: bool) {
+	if m.len == 0 { return nil, false }
+	msg = m.buf[m.head]
+	m.head = (m.head + 1) % len(m.buf)
+	m.len -= 1
+	return msg, true
 }
 
 // Blocks until a message is available. ok=false once closed and drained.
@@ -50,23 +86,28 @@ mailbox_recv :: proc(m: ^Mailbox) -> (msg: any, ok: bool) {
 	sync.sema_wait(&m.items)
 	sync.mutex_lock(&m.mutex)
 	defer sync.mutex_unlock(&m.mutex)
-	if m.len == 0 { return nil, false }
-	msg = m.buf[m.head]
-	m.head = (m.head + 1) % len(m.buf)
-	m.len -= 1
-	return msg, true
+	return mailbox_pop(m)
 }
 
 // Non-blocking. Used by the event loop, which must never block on the mailbox
 // because nbio owns the blocking wait.
 mailbox_try_recv :: proc(m: ^Mailbox) -> (msg: any, ok: bool) {
 	sync.mutex_lock(&m.mutex)
-	defer sync.mutex_unlock(&m.mutex)
-	if m.len == 0 { return nil, false }
-	msg = m.buf[m.head]
-	m.head = (m.head + 1) % len(m.buf)
-	m.len -= 1
-	return msg, true
+	msg, ok = mailbox_pop(m)
+	sync.mutex_unlock(&m.mutex)
+	if ok {
+		// Consume the credit mailbox_send posted for this message so
+		// m.items stays in lockstep with the buffer. This cannot block:
+		// mailbox_pop only returns ok=true after observing m.len > 0 under
+		// the lock, and mailbox_send posts before it unlocks, so this
+		// message's credit is already present in the semaphore by the time
+		// we get here. (Relies on a single consumer, as documented for the
+		// whole mailbox; concurrent recv/try_recv callers would still stay
+		// balanced in aggregate but an individual call could then observe
+		// a transient wait.)
+		sync.sema_wait(&m.items)
+	}
+	return
 }
 
 mailbox_close :: proc(m: ^Mailbox) {

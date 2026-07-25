@@ -2,6 +2,7 @@ package runetea
 
 import "core:testing"
 import "core:thread"
+import "core:time"
 
 N_PROD :: 4
 PER    :: 250
@@ -60,4 +61,48 @@ test_mailbox_close_wakes_receiver :: proc(t: ^testing.T) {
 	mailbox_close(&m)
 	_, ok := mailbox_recv(&m)
 	testing.expect(t, !ok, "recv on a closed, drained mailbox should report !ok")
+}
+
+Delayed_Send :: struct { m: ^Mailbox, val: int }
+
+// Regression for: try_recv dequeuing without consuming a semaphore credit
+// left a stale credit behind. The next recv() would then wake immediately
+// on that stale credit, see an empty buffer, and misreport an open mailbox
+// as closed -- exactly the sequence below, confirmed as a real bug before
+// this fix (mailbox_recv returned <nil, false> here even though the mailbox
+// was never closed).
+@(test)
+test_mailbox_try_recv_keeps_semaphore_in_sync :: proc(t: ^testing.T) {
+	m: Mailbox
+	testing.expect_value(t, mailbox_init(&m, 4), nil)
+	defer mailbox_destroy(&m)
+
+	testing.expect(t, mailbox_send(&m, 111), "initial send should succeed")
+
+	msg, ok := mailbox_try_recv(&m)
+	testing.expect(t, ok, "try_recv should drain the buffered message")
+	v, is_int := msg.(int)
+	testing.expect(t, is_int, "try_recv message should be an int")
+	if is_int { testing.expect_value(t, v, 111) }
+
+	// Buffer is now empty and the mailbox is still open. If try_recv left a
+	// stale credit behind, the recv() below would return immediately with
+	// ok=false instead of blocking for this delayed send.
+	ds := Delayed_Send{m = &m, val = 222}
+	th := thread.create(proc(th: ^thread.Thread) {
+		d := cast(^Delayed_Send)th.data
+		time.sleep(50 * time.Millisecond)
+		_ = mailbox_send(d.m, d.val)
+	})
+	th.data = &ds
+	thread.start(th)
+
+	msg2, ok2 := mailbox_recv(&m)
+	thread.join(th)
+	thread.destroy(th)
+
+	testing.expect(t, ok2, "recv should deliver the delayed send, not report closed")
+	v2, is_int2 := msg2.(int)
+	testing.expect(t, is_int2, "recv message should be an int")
+	if is_int2 { testing.expect_value(t, v2, 222) }
 }
