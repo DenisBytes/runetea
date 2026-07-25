@@ -32,3 +32,24 @@ test_restore_is_noop_when_not_raw :: proc(t: ^testing.T) {
 	term_restore()  // must not crash or touch any fd
 	testing.expect(t, !g_term.raw_active, "restore should leave raw_active false")
 }
+
+// Pins the rollback path: term_enter_raw sets raw_active = true before the
+// tty is actually modified (see the ordering-invariant comment above the
+// g_term.fd/raw_active assignment in term_enter_raw), so a failed attempt
+// must roll raw_active back to false rather than leaving it stuck true. An
+// invalid fd fails at tcgetattr, before any tty is ever touched, so this is
+// an end-to-end check of the observable contract -- on failure, raw_active
+// is false and a subsequent term_restore() is a safe no-op -- not a probe of
+// the internal tcgetattr-vs-tcsetattr branch.
+@(test)
+test_failed_enter_raw_leaves_raw_active_false :: proc(t: ^testing.T) {
+	g_term = {}
+	ok := term_enter_raw(posix.FD(-1))
+	testing.expect(t, !ok, "term_enter_raw on an invalid fd must report failure")
+	testing.expect(t, !g_term.raw_active,
+		"a failed term_enter_raw must not leave raw_active true")
+
+	term_restore()  // must not crash or touch any fd
+	testing.expect(t, !g_term.raw_active,
+		"restore after a failed enter_raw should remain a no-op")
+}
