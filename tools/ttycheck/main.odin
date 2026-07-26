@@ -13,6 +13,7 @@ package main
 import "core:fmt"
 import "core:nbio"
 import "core:sys/posix"
+import "core:thread"
 import "core:time"
 import rt "../../runetea"
 
@@ -124,4 +125,105 @@ main :: proc() {
 	} else {
 		fmt.println("ANSWER: NO -- read callback fired but did not deliver the expected bytes")
 	}
+
+	fmt.println()
+	fmt.println("--- Input_Source (loop.odin's Fd_Source, fix round 1) against the same real tty ---")
+	check_input_source_against_real_tty()
+}
+
+// Fix round 1 added a posix.poll()-before-read() loop and a wake self-pipe
+// to Fd_Source (runetea/loop.odin), replacing the original bare
+// posix.read() call. loop_test.odin's own tests only exercise that against
+// a plain pipe. Since this whole file exists to answer platform questions a
+// pipe cannot (tty line discipline, character-device quirks), it is the
+// right place to also confirm the NEW poll-based Fd_Source still works
+// end-to-end against a real pty slave -- not just that nbio (a completely
+// separate code path, sharing no code with loop.odin) still does.
+//
+// Uses its own fresh pty pair, independent of the one above, so this has no
+// interaction with the nbio phase's already-associated slave fd.
+check_input_source_against_real_tty :: proc() {
+	master := posix.posix_openpt({.RDWR, .NOCTTY})
+	if master < 0 {
+		fmt.println("BLOCKED: posix_openpt (2nd pty) failed:", posix.errno())
+		return
+	}
+	defer posix.close(master)
+
+	if posix.grantpt(master) != .OK || posix.unlockpt(master) != .OK {
+		fmt.println("BLOCKED: grantpt/unlockpt (2nd pty) failed:", posix.errno())
+		return
+	}
+	name := posix.ptsname(master)
+	if name == nil {
+		fmt.println("BLOCKED: ptsname (2nd pty) failed:", posix.errno())
+		return
+	}
+
+	slave := posix.open(name, {.RDWR, .NOCTTY})
+	if slave < 0 {
+		fmt.println("BLOCKED: open(slave) (2nd pty) failed:", posix.errno())
+		return
+	}
+	defer posix.close(slave)
+
+	if !rt.term_enter_raw(slave) {
+		fmt.println("BLOCKED: term_enter_raw (2nd pty) failed")
+		return
+	}
+	defer rt.term_restore()
+
+	src, ok := rt.input_source_from_fd(slave)
+	if !ok {
+		fmt.println("ANSWER: NO -- input_source_from_fd failed on a real tty slave fd")
+		return
+	}
+	defer rt.input_close(&src)
+
+	// Phase 1: a normal blocking read must still deliver real tty bytes
+	// through the new poll()-then-read() path.
+	sh := Tty_Read_Shared{src = &src}
+	th := thread.create_and_start_with_data(&sh, tty_read_worker, init_context = context)
+
+	msg := "input-source-tty"
+	written := posix.write(master, raw_data(msg), len(msg))
+	fmt.printfln("wrote %d bytes into the 2nd pty master", written)
+
+	thread.destroy(th)
+
+	if sh.ok && !sh.woken && string(sh.buf[:sh.n]) == msg {
+		fmt.println("  Fd_Source data-read: YES -- poll()-then-read() still delivers real tty bytes")
+	} else {
+		fmt.printfln("  Fd_Source data-read: NO -- n=%d ok=%v woken=%v", sh.n, sh.ok, sh.woken)
+		return
+	}
+
+	// Phase 2: input_wake must cancel a reader blocked on the real tty slave
+	// with no data pending -- the exact scenario Task 10's shutdown path
+	// depends on, now proven against a character device rather than a pipe.
+	sh2 := Tty_Read_Shared{src = &src}
+	th2 := thread.create_and_start_with_data(&sh2, tty_read_worker, init_context = context)
+
+	time.sleep(20 * time.Millisecond)  // best-effort window to enter poll()
+	rt.input_wake(&src)
+	thread.destroy(th2)  // would hang here if the wake pipe didn't work on a real tty
+
+	if sh2.woken && !sh2.ok && sh2.n == 0 {
+		fmt.println("  Fd_Source input_wake:  YES -- cancels a reader blocked on a real tty slave")
+	} else {
+		fmt.printfln("  Fd_Source input_wake:  NO -- n=%d ok=%v woken=%v", sh2.n, sh2.ok, sh2.woken)
+	}
+}
+
+Tty_Read_Shared :: struct {
+	src: ^rt.Input_Source,
+	buf: [64]u8,
+	n:   int,
+	ok:  bool,
+	woken: bool,
+}
+
+tty_read_worker :: proc(data: rawptr) {
+	sh := cast(^Tty_Read_Shared)data
+	sh.n, sh.ok, sh.woken = rt.input_read(sh.src, sh.buf[:])
 }
