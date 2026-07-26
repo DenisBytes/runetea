@@ -230,7 +230,11 @@ reader_thread :: proc(th: ^thread.Thread) {
 
 // Writes the accumulated frame to flush_fd and resets the builder. With
 // flush_fd < 0 the builder keeps accumulating -- the golden harness reads it.
-@(private="file")
+//
+// package-visible: run_nbio's initial paint (loop_nbio.odin) calls this
+// directly, same as run() does above, for the same reason (paint before the
+// init Cmd is dispatched).
+@(private="package")
 flush_frame :: proc(out: ^strings.Builder, flush_fd: posix.FD) {
 	if flush_fd < 0 { return }
 	s := strings.to_string(out^)
@@ -240,7 +244,12 @@ flush_frame :: proc(out: ^strings.Builder, flush_fd: posix.FD) {
 
 // One Update/View cycle, guarded. Split out so `run` stays readable and so the
 // guarded region is exactly the user code, not our loop bookkeeping.
-@(private="file")
+//
+// package-visible, not file-visible: loop_nbio.odin's run_nbio shares this
+// verbatim rather than duplicating it, so both event-loop hosts run IDENTICAL
+// Update/View/quit/panic-recovery logic and can only differ in how a message
+// reaches this call, not in what happens once it does.
+@(private="package")
 apply :: proc(p: ^Program($T), msg: any, fa: ^Frame_Arena, disp: ^Dispatcher, r: ^Renderer, out: ^strings.Builder, flush_fd: posix.FD) -> Run_Error {
 	if _, is_quit := msg.(Quit_Msg); is_quit { p.quit = true; return nil }
 	if _, is_int := msg.(Interrupt_Msg); is_int { return Interrupted_Error{} }

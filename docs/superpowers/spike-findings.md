@@ -77,6 +77,20 @@ code with it, and it is structurally a miniature of the `cancelreader` the desig
 fallback shipped. **"The nbio event loop is RuneTea's event loop" remains an open bet
 and should be the first thing T1 either lands or abandons.**
 
+**RESOLVED (first T1 task, `docs/superpowers/nbio-decision.md`):** an
+nbio-hosted `run_nbio()` was built, tested (unit tests, a real-pty harness,
+and a ThreadSanitizer racecheck phase), and works correctly end to end on
+Linux, including the linchpin claim (`nbio.wake_up` genuinely wakes a loop
+blocked in `nbio.tick()` from another thread). Decision: **ABANDON as the
+primary/shipped loop** — on the one platform this project can verify it is
+not shorter, not simpler in the part that matters (input handling
+reintroduces a single-thread backpressure hazard the poll-thread design
+doesn't have), and the only thing that would justify its cost (Darwin/BSD
+support "coming free") is exactly as unverified after this work as before
+it. `run()` (`Fd_Source` + reader thread) stays the shipped path; `run_nbio`
+stays in the tree, tested, as a head start for whoever eventually validates
+Darwin/BSD.
+
 Surprise found along the way: `loop.odin`'s `Fd_Source` (the shipped input path, used by
 `run()`'s reader thread) originally treated `EINTR` on `poll`/`read` as
 fatal, and had no way to cancel a thread blocked inside a read — both fixed in Task 6

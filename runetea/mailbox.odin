@@ -141,3 +141,17 @@ mailbox_close :: proc(m: ^Mailbox) {
 	sync.mutex_unlock(&m.mutex)
 	sync.sema_post(&m.items)  // wake the consumer so it observes closure
 }
+
+// True once the mailbox is closed AND fully drained -- the non-blocking
+// equivalent of mailbox_recv's ok=false return. Needed by any consumer that
+// polls via mailbox_try_recv instead of blocking in mailbox_recv (loop_nbio.odin's
+// run_nbio, which must never block on the mailbox -- nbio owns the blocking
+// wait): try_recv's own ok=false is ambiguous between "empty for now, a
+// producer may still send" and "closed, nothing will ever arrive again",
+// and only this call, taken under the same lock as every other mailbox
+// operation, can tell the two apart without racing mailbox_close.
+mailbox_closed_and_empty :: proc(m: ^Mailbox) -> bool {
+	sync.mutex_lock(&m.mutex)
+	defer sync.mutex_unlock(&m.mutex)
+	return m.closed && m.len == 0
+}

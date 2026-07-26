@@ -53,6 +53,15 @@ Signal_Watcher :: struct {
 	// reproductions).
 	native: posix.pthread_t,
 	ready:  sync.Sema,
+
+	// Optional cross-thread notification, mirroring Dispatcher.wake
+	// (cmd.odin) exactly -- same reason: run()'s poll-thread path leaves
+	// this nil (mailbox_recv's own semaphore is the single wait point), and
+	// run_nbio (loop_nbio.odin) sets it to nbio.wake_up so a SIGINT/SIGWINCH
+	// delivered while the loop thread is parked in nbio.tick() is not stuck
+	// there until some UNRELATED read or Cmd completion happens to wake it.
+	wake:      proc(rawptr),
+	wake_data: rawptr,
 }
 
 // Blocks the handled signals on the calling thread, then waits for them on a
@@ -92,10 +101,12 @@ Signal_Watcher :: struct {
 // Full here is expected to clear on its own; Closed means run() has already
 // torn down and nothing sent from here on could ever be received anyway.
 @(private = "file")
-send_or_retry :: proc(m: ^Mailbox, msg: any) {
+send_or_retry :: proc(sw: ^Signal_Watcher, msg: any) {
 	for {
-		switch mailbox_send(m, msg) {
-		case .Ok:     return
+		switch mailbox_send(sw.mailbox, msg) {
+		case .Ok:
+			if sw.wake != nil { sw.wake(sw.wake_data) }
+			return
 		case .Closed: return
 		case .Full:   thread.yield()
 		}
@@ -103,10 +114,12 @@ send_or_retry :: proc(m: ^Mailbox, msg: any) {
 }
 
 // Clear this mask before spawning a child process, or $EDITOR inherits it.
-signal_watcher_start :: proc(sw: ^Signal_Watcher, m: ^Mailbox, tty: posix.FD) {
+signal_watcher_start :: proc(sw: ^Signal_Watcher, m: ^Mailbox, tty: posix.FD, wake: proc(rawptr) = nil, wake_data: rawptr = nil) {
 	sw.mailbox = m
 	sw.tty = tty
 	sw.running = true
+	sw.wake = wake
+	sw.wake_data = wake_data
 
 	set: posix.sigset_t
 	posix.sigemptyset(&set)
@@ -155,9 +168,9 @@ signal_watcher_start :: proc(sw: ^Signal_Watcher, m: ^Mailbox, tty: posix.FD) {
 			case SIGWINCH:
 				w, h, ok := term_size(sw.tty)
 				if !ok { w, h = 0, 0 }
-				send_or_retry(sw.mailbox, box(Window_Size_Msg{w = w, h = h}, context.allocator))
+				send_or_retry(sw, box(Window_Size_Msg{w = w, h = h}, context.allocator))
 			case .SIGINT, .SIGTERM:
-				send_or_retry(sw.mailbox, box(Interrupt_Msg{}, context.allocator))
+				send_or_retry(sw, box(Interrupt_Msg{}, context.allocator))
 			case:
 				// SIG_WAKE (signal_watcher_stop's nudge, handled by the loop
 				// condition re-checking sw.stop above) or anything else not

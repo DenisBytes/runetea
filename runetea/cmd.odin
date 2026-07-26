@@ -39,15 +39,31 @@ cmd_from :: proc(fn: proc(env: rawptr) -> any, env: $E, alloc: mem.Allocator, de
 // CRITICAL note on dispatcher_destroy below for why the latter needs its own
 // tracking distinct from thread.Pool's built-in join.
 Dispatcher :: struct {
-	pool:     thread.Pool,
-	mailbox:  ^Mailbox,
-	inflight: sync.Wait_Group,   // counts detached Cmds not yet finished
+	pool:      thread.Pool,
+	mailbox:   ^Mailbox,
+	inflight:  sync.Wait_Group,   // counts detached Cmds not yet finished
+
+	// Optional cross-thread notification, called after a Cmd result is
+	// successfully handed to the mailbox (mailbox_send == .Ok) from whatever
+	// worker thread produced it. nil for run()'s poll-thread path -- that
+	// design's single wait point IS the mailbox's own semaphore
+	// (mailbox_recv), so nothing else needs telling. run_nbio (loop_nbio.odin)
+	// sets this to a wrapper around nbio.wake_up: nbio's blocking wait
+	// (nbio.tick) knows nothing about the mailbox, so delivering a message
+	// there does not by itself wake a loop thread parked in tick() -- this
+	// hook is what closes that gap. Deliberately a plain proc(rawptr), not an
+	// nbio type: keeps this file's proven, race-tested code free of an nbio
+	// dependency for the (default, common) case where nothing is listening.
+	wake:      proc(rawptr),
+	wake_data: rawptr,
 }
 
 Task_Env :: struct {
-	cmd:      Cmd,
-	mailbox:  ^Mailbox,
-	inflight: ^sync.Wait_Group,  // detached only; nil for pool tasks
+	cmd:       Cmd,
+	mailbox:   ^Mailbox,
+	inflight:  ^sync.Wait_Group,  // detached only; nil for pool tasks
+	wake:      proc(rawptr),      // copied from Dispatcher.wake at dispatch time
+	wake_data: rawptr,
 }
 
 // Runs once per pool WORKER at pool startup (thread.Pool's own init_proc
@@ -61,8 +77,10 @@ pool_worker_install_crash_handlers :: proc(th: ^thread.Thread, user_data: rawptr
 	install_crash_handlers()
 }
 
-dispatcher_init :: proc(d: ^Dispatcher, m: ^Mailbox, workers: int) {
+dispatcher_init :: proc(d: ^Dispatcher, m: ^Mailbox, workers: int, wake: proc(rawptr) = nil, wake_data: rawptr = nil) {
 	d.mailbox = m
+	d.wake = wake
+	d.wake_data = wake_data
 	thread.pool_init(&d.pool, context.allocator, max(workers, 1), init_proc = pool_worker_install_crash_handlers)
 	thread.pool_start(&d.pool)
 }
@@ -96,12 +114,14 @@ dispatcher_destroy :: proc(d: ^Dispatcher) {
 // detached Cmd thread is blocked here, so Full is expected to clear; Closed
 // means run() has already torn down and nothing sent from here on could
 // ever be received anyway.
+// Returns whether the message was actually handed to the mailbox (false only
+// for Closed -- see the call sites' handling of a nil wake below).
 @(private="file")
-deliver_result :: proc(m: ^Mailbox, msg: any) {
+deliver_result :: proc(m: ^Mailbox, msg: any) -> bool {
 	for {
 		switch mailbox_send(m, msg) {
-		case .Ok:     return
-		case .Closed: return
+		case .Ok:     return true
+		case .Closed: return false
 		case .Full:   thread.yield()
 		}
 	}
@@ -126,7 +146,9 @@ run_cmd_task :: proc(task: thread.Task) {
 		// task-10-report.md. `.id` is nil ONLY for a genuinely absent message
 		// (a real `nil` any, or box()'s own allocator-failure return), which
 		// is what this check must key on instead.
-		if msg.id != nil { deliver_result(te.mailbox, msg) }
+		if msg.id != nil {
+			if deliver_result(te.mailbox, msg) && te.wake != nil { te.wake(te.wake_data) }
+		}
 	}
 	// Freed here, per-task, rather than accumulated in the Dispatcher and
 	// freed only at dispatcher_destroy: a Dispatcher is meant to live for
@@ -153,7 +175,9 @@ run_cmd_detached :: proc(data: rawptr) {
 		if te.cmd.env != nil { free(te.cmd.env, te.cmd.allocator) }
 		// See run_cmd_task's comment: msg.id, not msg, distinguishes "a real
 		// zero-sized Msg" from "genuinely nothing to send".
-		if msg.id != nil { deliver_result(te.mailbox, msg) }
+		if msg.id != nil {
+			if deliver_result(te.mailbox, msg) && te.wake != nil { te.wake(te.wake_data) }
+		}
 	}
 	free(te)
 	// Must be the LAST action: dispatcher_destroy's wait_group_wait treats
@@ -195,12 +219,12 @@ dispatch :: proc(d: ^Dispatcher, c: Cmd) {
 		// seeing a zero count that was never incremented for this Cmd.
 		sync.wait_group_add(&d.inflight, 1)
 		te := new(Task_Env)
-		te^ = Task_Env{cmd = c, mailbox = d.mailbox, inflight = &d.inflight}
+		te^ = Task_Env{cmd = c, mailbox = d.mailbox, inflight = &d.inflight, wake = d.wake, wake_data = d.wake_data}
 		thread.create_and_start_with_data(rawptr(te), run_cmd_detached, init_context = context, self_cleanup = true)
 		return
 	}
 
 	te := new(Task_Env)
-	te^ = Task_Env{cmd = c, mailbox = d.mailbox}
+	te^ = Task_Env{cmd = c, mailbox = d.mailbox, wake = d.wake, wake_data = d.wake_data}
 	thread.pool_add_task(&d.pool, context.allocator, run_cmd_task, te)
 }

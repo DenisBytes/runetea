@@ -62,6 +62,7 @@ main :: proc() {
 	phase_dispatcher()
 	phase_signals()
 	phase_program()
+	phase_program_nbio()
 	fmt.printfln("=== racecheck: all phases completed without crashing (%v) ===", time.since(start))
 }
 
@@ -484,5 +485,63 @@ phase_program :: proc() {
 	}
 
 	fmt.printfln("  program: %d full run() cycles completed (%d async-Cmd quits with no keypress, %d keypress-driven quits)",
+		RACE_PROGRAM_ITERS, (RACE_PROGRAM_ITERS + 1) / 2, RACE_PROGRAM_ITERS / 2)
+}
+
+// --- Phase E: Program/run_nbio() ---------------------------------------
+//
+// Same scenario as Phase D, same Race_Model/race_update/race_view/
+// race_async_quit/Race_Key_Feeder, run through rt.run_nbio (loop_nbio.odin)
+// instead of rt.run -- this is the ONLY thing this phase changes, so a
+// TSan report here versus a clean Phase D would isolate the race to the
+// nbio-hosted path specifically (loop_nbio.odin, or the wake hooks added to
+// cmd.odin/signals.odin), not to Program/apply/Dispatcher/Signal_Watcher
+// generally, which Phase D already covers at the same volume.
+//
+// Answers 2c from the decision doc empirically, not just by inspection: the
+// Dispatcher pool and the Signal_Watcher thread both call the wake hook
+// (nbio_wake -> nbio.wake_up) from threads that never acquire an nbio event
+// loop of their own, concurrently with the loop thread (this one) ticking,
+// reading, and tearing the whole thing down at the end of every iteration --
+// exactly the "does nbio's one-loop-per-thread rule fight the pool/watcher"
+// question, at volume, under ThreadSanitizer.
+phase_program_nbio :: proc() {
+	fmt.println("--- phase E: Program/run_nbio() (nbio loop racing async-Cmd wake_up and keypress-driven quits) ---")
+
+	for iter in 0 ..< RACE_PROGRAM_ITERS {
+		via_cmd := iter % 2 == 0
+
+		fds: [2]posix.FD
+		if posix.pipe(&fds) != .OK {
+			fmt.eprintln("pipe failed")
+			os.exit(1)
+		}
+		read_fd, write_fd := fds[0], fds[1]
+
+		feeder := Race_Key_Feeder{w = write_fd, send_q = !via_cmd}
+		feeder_th := thread.create_and_start_with_data(&feeder, race_key_feeder_run, init_context = context)
+
+		b := strings.builder_make(); defer strings.builder_destroy(&b)
+
+		p: rt.Program(Race_Model)
+		init_cmd := rt.cmd_nil()
+		if via_cmd {
+			init_cmd = rt.Cmd{procedure = race_async_quit, env = nil, allocator = context.allocator}
+		}
+		rt.program_init(&p, Race_Model{}, race_update, race_view, init_cmd)
+
+		err := rt.run_nbio(&p, read_fd, &b)
+		if err != nil {
+			fmt.eprintln("run_nbio() returned an error:", err)
+			os.exit(1)
+		}
+
+		thread.join(feeder_th); thread.destroy(feeder_th)
+
+		posix.close(write_fd)
+		posix.close(read_fd)
+	}
+
+	fmt.printfln("  program_nbio: %d full run_nbio() cycles completed (%d async-Cmd quits with no keypress, %d keypress-driven quits)",
 		RACE_PROGRAM_ITERS, (RACE_PROGRAM_ITERS + 1) / 2, RACE_PROGRAM_ITERS / 2)
 }
