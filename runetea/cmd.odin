@@ -24,11 +24,27 @@ Cmd :: struct {
 	env:       rawptr,
 	allocator: mem.Allocator,   // frees env after procedure returns
 	detached:  bool,            // bypass the pool -- see dispatch
+
+	// Non-nil ONLY for a Cmd produced by tick()/every() (timer.odin) --
+	// dispatch() below special-cases these entirely, bypassing procedure/
+	// env/allocator/detached above (left zeroed for such a Cmd) in favor of
+	// the dedicated timer thread. See timer.odin's own top-of-file comment
+	// for why registering a timer doesn't fit run_cmd_task/run_cmd_detached's
+	// "exactly one result per dispatch" shape.
+	timer: ^Timer_Handle,
 }
 
 cmd_nil :: proc() -> Cmd { return Cmd{} }
 
-cmd_is_nil :: proc(c: Cmd) -> bool { return c.procedure == nil }
+// c.timer == nil is part of this check, not just c.procedure == nil: a Cmd
+// produced by tick()/every() (timer.odin) has procedure == nil by
+// construction (it never runs through run_cmd_task/run_cmd_detached at
+// all -- see dispatch()'s own special case below), so checking procedure
+// alone would misreport every such Cmd as nil. That matters beyond
+// symmetry: apply() and run() (tea.odin) both guard their dispatch() call
+// with `if !cmd_is_nil(cmd)`, so a wrong answer here would silently drop
+// every Tick/Every before dispatch() ever saw it.
+cmd_is_nil :: proc(c: Cmd) -> bool { return c.procedure == nil && c.timer == nil }
 
 // Heap-clones `env` so the Cmd can outlive the caller's frame.
 //
@@ -87,6 +103,14 @@ Dispatcher :: struct {
 	mailbox:   ^Mailbox,
 	inflight:  sync.Wait_Group,   // counts detached Cmds not yet finished
 	cancel:    Cancel_Token,      // fired by dispatcher_destroy/dispatcher_reap; shared by every Cmd this Dispatcher ever runs
+
+	// Lazily-started nbio timer thread backing tick()/every() (timer.odin).
+	// Owned here, not by run()/run_nbio(), so it shares the Dispatcher's own
+	// proven lifetime (started on demand, joined by dispatcher_destroy
+	// before the Mailbox it feeds can be destroyed) instead of needing a
+	// second set of teardown rules layered on top of run()'s. See
+	// docs/superpowers/tick-every-decision.md §a.
+	timers: Timer_Service,
 
 	// Optional cross-thread notification, called after a Cmd result is
 	// successfully handed to the mailbox (mailbox_send == .Ok) from whatever
@@ -160,6 +184,13 @@ dispatcher_destroy :: proc(d: ^Dispatcher) {
 	thread.pool_finish(&d.pool)
 	thread.pool_destroy(&d.pool)
 	sync.wait_group_wait(&d.inflight)
+	// LAST, after the pool and every detached Cmd are provably finished --
+	// see timer_service_stop's own doc comment (timer.odin) for why that
+	// ordering is load-bearing (a detached Cmd may itself call dispatch(),
+	// including a fresh tick()/every()) and not just a convenient place to
+	// put it. No-op if this Dispatcher never had a Tick/Every dispatched
+	// through it.
+	timer_service_stop(&d.timers)
 }
 
 // Heap-owned bundle for run()'s non-blocking teardown path (dispatcher_reap,
@@ -363,7 +394,12 @@ dispatcher_reap :: proc(rc: ^Reap_Ctx, grace: time.Duration = 0) -> (finished_in
 // ever be received anyway.
 // Returns whether the message was actually handed to the mailbox (false only
 // for Closed -- see the call sites' handling of a nil wake below).
-@(private="file")
+//
+// package-visible, not file-visible: timer.odin's timer_fire reuses this
+// verbatim (same retry-on-Full/discard-on-Closed policy every producer in
+// this codebase already follows) rather than duplicating it for a second,
+// repeating-delivery code path that could drift from this one.
+@(private="package")
 deliver_result :: proc(m: ^Mailbox, msg: any) -> bool {
 	for {
 		switch mailbox_send(m, msg) {
@@ -544,6 +580,19 @@ run_cmd_detached :: proc(data: rawptr) {
 }
 
 dispatch :: proc(d: ^Dispatcher, c: Cmd) {
+	// Tick/Every (timer.odin) bypass everything below: registering an nbio
+	// timeout is a microsecond-fast, non-blocking call, so routing it
+	// through a pool worker would only add latency and hold a worker slot
+	// for no reason -- and a repeating Every delivers MANY results over its
+	// lifetime, which doesn't fit run_cmd_task/run_cmd_detached's "exactly
+	// one result per dispatch" shape at all (see cmd.odin's own msg.id-vs-msg
+	// comment below in run_cmd_task). procedure/env/allocator/detached are
+	// unused for such a Cmd (left zeroed by tick()/every()).
+	if c.timer != nil {
+		timer_dispatch(d, c.timer)
+		return
+	}
+
 	if cmd_is_nil(c) { return }
 
 	if c.detached {

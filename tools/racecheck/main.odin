@@ -64,6 +64,7 @@ main :: proc() {
 	phase_program()
 	phase_program_nbio()
 	phase_dispatcher_reap()
+	phase_timers()
 	fmt.printfln("=== racecheck: all phases completed without crashing (%v) ===", time.since(start))
 }
 
@@ -695,4 +696,137 @@ phase_dispatcher_reap :: proc() {
 
 	fmt.printfln("  dispatcher_reap: %d/%d Cmds completed (async-detach, cancellation, and in-grace outcomes all exercised)",
 		sync.atomic_load(&completed), RD_ITERS)
+}
+
+// --- Phase G: Tick/Every timer thread (timer.odin) -----------------------
+//
+// All-new concurrency phases A-F never touch: timer.odin's dedicated,
+// lazily-started nbio timer thread, one per Dispatcher. This phase drives:
+//
+//   - Several threads dispatching Tick onto the SAME Dispatcher
+//     concurrently, stressing timer_service_ensure_started's lazy,
+//     mutex-guarded start (exactly one caller must actually spawn the
+//     thread) and nbio's own cross-thread timeout registration
+//     (docs/superpowers/nbio-decision.md §2b) at volume.
+//   - timer_stop racing the timer thread's own fire for a fraction of those
+//     Ticks -- both "cancelled before it fires" and "cancelled just as (or
+//     after) it fires" must be safe, never a double-release or UAF on
+//     Timer_Handle.
+//   - A handful of repeating Everys, deliberately NEVER stopped by anything
+//     in this phase -- dispatcher_destroy must tear them down on its own.
+//   - THE scenario verification item 5 asks for directly: dispatcher_destroy
+//     called while those Everys are still actively mid-repeat, over many
+//     independent create/destroy cycles (mirroring phase_dispatcher_reap's
+//     own shape above), so a race in the timer thread's shutdown ordering
+//     (cmd.odin's dispatcher_destroy, timer.odin's timer_service_stop) shows
+//     up here under real ThreadSanitizer pressure, not just in a single
+//     single-threaded unit test (runetea/timer_test.odin's
+//     test_dispatcher_destroy_tears_down_a_pending_every covers the same
+//     scenario without TSan, for a fast plain-test signal).
+TIMER_ROUNDS         :: 40
+TIMER_TICK_PER_ROUND :: 20 // Ticks dispatched concurrently per driver thread, per round
+TIMER_EVERY_PER_ROUND :: 6 // repeating Everys alive per round, never explicitly stopped
+TIMER_DRIVERS        :: 4
+
+Timer_Result :: struct { n: int }
+
+timer_fire_fn :: proc(env: rawptr, t: time.Tick) -> any {
+	e := cast(^int)env
+	return rt.box(Timer_Result{n = e^}, context.allocator)
+}
+
+Timer_Dispatch_Driver :: struct {
+	d:     ^rt.Dispatcher,
+	id:    int,
+	count: int,
+}
+
+timer_dispatch_driver_run :: proc(data: rawptr) {
+	dr := cast(^Timer_Dispatch_Driver)data
+	for i in 0 ..< dr.count {
+		n := dr.id*1_000_000 + i
+		cmd, h := rt.tick(time.Duration(1 + i%5) * time.Millisecond, timer_fire_fn, n, context.allocator)
+		rt.dispatch(dr.d, cmd)
+		if i % 3 == 0 {
+			// Race cancellation against the fire itself from a DIFFERENT
+			// thread than the timer thread that will (or won't) deliver it
+			// -- some win, some lose, both must be safe either way.
+			rt.timer_stop(h)
+		}
+	}
+}
+
+Timer_Drainer :: struct {
+	m:     ^rt.Mailbox,
+	count: ^int, // atomic
+}
+
+timer_drainer_run :: proc(data: rawptr) {
+	d := cast(^Timer_Drainer)data
+	for {
+		_, ok := rt.mailbox_recv(d.m)
+		if !ok { return }
+		sync.atomic_add(d.count, 1)
+	}
+}
+
+phase_timers :: proc() {
+	fmt.println("--- phase G: Tick/Every timer thread (concurrent dispatch, cancellation racing fires, destroy while an Every is pending) ---")
+
+	total_fires := 0
+	for round in 0 ..< TIMER_ROUNDS {
+		m: rt.Mailbox
+		if err := rt.mailbox_init(&m, 256); err != nil {
+			fmt.eprintln("mailbox_init failed:", err)
+			os.exit(1)
+		}
+
+		d: rt.Dispatcher
+		rt.dispatcher_init(&d, &m, 2)
+
+		recv_count: int
+		drainer_state := Timer_Drainer{m = &m, count = &recv_count}
+		drainer := thread.create_and_start_with_data(&drainer_state, timer_drainer_run, init_context = context)
+
+		drivers := make([]Timer_Dispatch_Driver, TIMER_DRIVERS); defer delete(drivers)
+		driver_th := make([]^thread.Thread, TIMER_DRIVERS); defer delete(driver_th)
+		for i in 0 ..< TIMER_DRIVERS {
+			drivers[i] = Timer_Dispatch_Driver{d = &d, id = i, count = TIMER_TICK_PER_ROUND}
+			driver_th[i] = thread.create_and_start_with_data(&drivers[i], timer_dispatch_driver_run, init_context = context)
+		}
+
+		// Repeating Everys, deliberately never stopped by anything in this
+		// phase -- dispatcher_destroy below is what must tear them down.
+		for i in 0 ..< TIMER_EVERY_PER_ROUND {
+			n := 9_000_000 + round*100 + i
+			cmd, _ := rt.every(2 * time.Millisecond, timer_fire_fn, n, context.allocator)
+			rt.dispatch(&d, cmd)
+		}
+
+		for i in 0 ..< TIMER_DRIVERS { thread.join(driver_th[i]) }
+		for i in 0 ..< TIMER_DRIVERS { thread.destroy(driver_th[i]) }
+
+		// Let the Everys above fire for real, several times over, before
+		// tearing down -- THE scenario under test: destroy while a
+		// repeating Every is genuinely still mid-repeat, not merely just
+		// dispatched.
+		time.sleep(10 * time.Millisecond)
+
+		// Concurrent with: the drainer thread still draining, the timer
+		// thread possibly mid-callback on one of the Everys above, and any
+		// still-in-flight cross-thread nbio.timeout registration from the
+		// driver threads' last dispatch() calls (already joined above, so
+		// none are still running, but their registrations may not have
+		// fired yet).
+		rt.dispatcher_destroy(&d)
+
+		rt.mailbox_close(&m)
+		thread.join(drainer); thread.destroy(drainer)
+		rt.mailbox_destroy(&m)
+
+		total_fires += recv_count
+	}
+
+	fmt.printfln("  timers: %d create/destroy rounds completed (%d drivers x %d Ticks + %d never-stopped Everys per round), %d total fires drained before each round's teardown",
+		TIMER_ROUNDS, TIMER_DRIVERS, TIMER_TICK_PER_ROUND, TIMER_EVERY_PER_ROUND, total_fires)
 }
