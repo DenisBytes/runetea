@@ -91,3 +91,52 @@ test_detached_cmds_exceed_pool_width_without_deadlock :: proc(t: ^testing.T) {
 	}
 	testing.expect_value(t, got, COORDS)
 }
+
+// dispatcher_destroy must block until every detached Cmd it ever dispatched
+// has actually finished, not just until the pool workers are joined --
+// thread.Pool's join (thread.pool_finish/pool_destroy) says nothing about a
+// detached Cmd's self_cleanup thread, which is tracked nowhere else. If
+// dispatcher_destroy returned early, a caller's very next line -- typically
+// mailbox_destroy, per mailbox.odin's own documented precondition -- would
+// free the mailbox out from under a detached Cmd still mid mailbox_send.
+//
+// Deliberately does NOT drain the mailbox first. test_detached_cmds_exceed_
+// pool_width_without_deadlock above proves the elastic-overflow path doesn't
+// deadlock, but it drains every result before its deferred destroys run --
+// and since mailbox_send always completes before its message becomes
+// receivable, having received every message already proves every send has
+// happened. That ordering makes it structurally incapable of telling "destroy
+// waited" apart from "destroy returned immediately but got lucky", so it
+// can't catch this. This test dispatches one slow detached Cmd, calls
+// dispatcher_destroy immediately without receiving anything, and times it:
+// against the unfixed code dispatcher_destroy returns near-instantly (it
+// only waits on the pool) and the elapsed-time assertion below fails
+// deterministically, well before the still-running Cmd's later mailbox_send
+// would hit the meanwhile-destroyed mailbox.
+Slow_Env :: struct {}
+
+slow_run :: proc(env: rawptr) -> any {
+	time.sleep(150 * time.Millisecond)
+	return box(Fetch_Result{url = "slow", status = 2}, context.allocator)
+}
+
+@(test)
+test_dispatcher_destroy_waits_for_detached_cmds :: proc(t: ^testing.T) {
+	m: Mailbox
+	testing.expect_value(t, mailbox_init(&m, 8), nil)
+
+	d: Dispatcher
+	dispatcher_init(&d, &m, 1)
+
+	dispatch(&d, cmd_from(slow_run, Slow_Env{}, context.allocator, detached = true))
+
+	start := time.now()
+	dispatcher_destroy(&d)
+	elapsed := time.since(start)
+	testing.expect(t, elapsed >= 100 * time.Millisecond,
+		"dispatcher_destroy returned before its detached Cmd finished")
+
+	// Only safe to reach here, after dispatcher_destroy has proven no
+	// detached Cmd can still be touching the mailbox.
+	mailbox_destroy(&m)
+}
