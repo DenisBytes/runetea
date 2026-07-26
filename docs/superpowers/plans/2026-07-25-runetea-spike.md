@@ -1116,7 +1116,20 @@ run_cmd_task :: proc(task: thread.Task) {
 	if te.cmd.procedure != nil {
 		msg := te.cmd.procedure(te.cmd.env)
 		if te.cmd.env != nil { free(te.cmd.env, te.cmd.allocator) }
-		if msg != nil { _ = mailbox_send(te.mailbox, msg) }
+		// msg.id != nil, NOT msg != nil: Odin's `any == nil` compares by the
+		// `data` field alone, and new() legitimately returns a nil pointer
+		// for a zero-sized allocation -- exactly what box() produces for any
+		// zero-sized Msg (Task 10's Quit_Msg is `struct {}`). `msg != nil` on
+		// that result is FALSE, silently discarding the message: a Cmd
+		// returning Quit_Msg through this path never reached the mailbox and
+		// the program could never quit. Found in Task 10 (this bug was
+		// verbatim in the plan since Task 5, invisible until a zero-sized Msg
+		// type existed to trigger it) via a hang in a fresh Dispatcher/Cmd
+		// race harness, root-caused with a standalone repro (`a: any = p^`
+		// for `p := new(Empty)` prints `a == nil: true`, `a.id != nil:
+		// true`), and proven non-vacuous by reverting it: the regression
+		// tests then hang the whole suite. See task-10-report.md.
+		if msg.id != nil { _ = mailbox_send(te.mailbox, msg) }
 	}
 	// Freed per-task, not accumulated in the Dispatcher: a Dispatcher lives
 	// for a whole TUI session, so retaining every completed Task_Env until
@@ -1131,7 +1144,9 @@ run_cmd_detached :: proc(data: rawptr) {
 	if te.cmd.procedure != nil {
 		msg := te.cmd.procedure(te.cmd.env)
 		if te.cmd.env != nil { free(te.cmd.env, te.cmd.allocator) }
-		if msg != nil { _ = mailbox_send(te.mailbox, msg) }
+		// See run_cmd_task's comment: msg.id, not msg, distinguishes "a real
+		// zero-sized Msg" from "genuinely nothing to send".
+		if msg.id != nil { _ = mailbox_send(te.mailbox, msg) }
 	}
 	free(te)
 	// MUST be the last action: dispatcher_destroy treats this as proof the
@@ -2176,7 +2191,6 @@ Create `runetea/tea.odin`:
 ```odin
 package runetea
 
-import "core:fmt"
 import "core:mem"
 import "core:strings"
 import "core:sync"
@@ -2280,6 +2294,14 @@ run :: proc(p: ^Program($T), src: ^Input_Source, out: ^strings.Builder, flush_fd
 	rd := Reader_Ctx{src = src, mailbox = &mbox}
 	reader := thread.create(reader_thread)
 	reader.data = &rd
+	// init_context MUST be set, for the identical reason Task 5's detached
+	// dispatch and Task 7's signal-watcher thread both need it: left at its
+	// nil default the new OS thread runs under runtime.default_context(), a
+	// DIFFERENT context.allocator than this one, and reader_thread's own
+	// box(k, context.allocator) calls below would then allocate on a
+	// mismatched allocator -- the exact SIGSEGV-in-libc-free() class of bug
+	// Task 5 first hit. Missing from this block until Task 10 caught it.
+	reader.init_context = context
 	thread.start(reader)
 	defer {
 		sync.atomic_store(&rd.stop, true)
