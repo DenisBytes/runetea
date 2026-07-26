@@ -1568,12 +1568,29 @@ Window_Size_Msg :: struct { w, h: int }
 // at the POSIX-standard set. The per-platform constant does exist, so cast it.
 SIGWINCH :: posix.Signal(posix.SIGWINCH)
 
+// A dedicated wake signal. Do NOT reuse SIGWINCH for the stop nudge: it queues
+// a bogus Window_Size_Msg on every shutdown. SIGUSR1 is taken by loop_test's
+// EINTR test, and pthread_sigmask state persists across sequential tests.
+SIG_WAKE :: posix.Signal.SIGUSR2
+
 Signal_Watcher :: struct {
 	thread:  ^thread.Thread,
 	mailbox: ^Mailbox,
 	tty:     posix.FD,
 	running: bool,
 	stop:    bool,
+
+	// The watcher's OWN thread handle, captured by the watcher first thing and
+	// published via `ready`. Every wakeup targets it with pthread_kill.
+	// This is load-bearing, not style:
+	//   - posix.raise() is THREAD-DIRECTED under glibc/NPTL
+	//     (pthread_kill(self, sig)), so it never reaches the watcher and
+	//     signal_watcher_stop hangs forever.
+	//   - posix.kill(getpid(), sig) is process-directed and races for delivery
+	//     among all threads that have the signal unblocked -- under the test
+	//     runner it killed the process instead.
+	native: posix.pthread_t,
+	ready:  sync.Sema,
 }
 
 // Blocks the handled signals process-wide, then waits for them on a dedicated
@@ -1590,7 +1607,11 @@ signal_watcher_start :: proc(sw: ^Signal_Watcher, m: ^Mailbox, tty: posix.FD) {
 	posix.sigemptyset(&set)
 	posix.sigaddset(&set, .SIGINT)
 	posix.sigaddset(&set, .SIGTERM)
+	posix.sigaddset(&set, SIG_WAKE)
 	posix.sigaddset(&set, SIGWINCH)
+	// Installed on the CALLING thread before thread.create, so the watcher
+	// inherits it. Any thread already running keeps the default (fatal)
+	// disposition -- call this early in main().
 	posix.pthread_sigmask(.BLOCK, &set, nil)   // Sig.BLOCK, not .SIG_BLOCK
 
 	// init_context for the same reason as Task 5's detached dispatch: without
@@ -1599,17 +1620,27 @@ signal_watcher_start :: proc(sw: ^Signal_Watcher, m: ^Mailbox, tty: posix.FD) {
 	// loop's. See core/thread/thread.odin:534.
 	sw.thread = thread.create(proc(th: ^thread.Thread) {
 		sw := cast(^Signal_Watcher)th.data
+
+		// Publish our handle FIRST. A signal sent to it while blocked simply
+		// queues as pending on this thread -- correctness needs only that
+		// `ready` is posted before any caller reads sw.native, not that we
+		// have reached sigwait.
+		sw.native = posix.pthread_self()
+		sync.sema_post(&sw.ready)
+
 		set: posix.sigset_t
 		posix.sigemptyset(&set)
 		posix.sigaddset(&set, .SIGINT)
 		posix.sigaddset(&set, .SIGTERM)
+		posix.sigaddset(&set, SIG_WAKE)
 		posix.sigaddset(&set, SIGWINCH)
 
 		for !sync.atomic_load(&sw.stop) {
 			sig: posix.Signal
 			// sigwait returns Errno; success is .NONE, not .OK
 			if posix.sigwait(&set, &sig) != .NONE { continue }
-			switch sig {
+			// #partial: Signal is a large exhaustive enum
+			#partial switch sig {
 			case SIGWINCH:
 				w, h, ok := term_size(sw.tty)
 				if !ok { w, h = 0, 0 }
@@ -1624,12 +1655,15 @@ signal_watcher_start :: proc(sw: ^Signal_Watcher, m: ^Mailbox, tty: posix.FD) {
 	sw.thread.data = sw
 	sw.thread.init_context = context
 	thread.start(sw.thread)
+	sync.sema_wait(&sw.ready)   // sw.native is valid once this returns
 }
 
 signal_watcher_stop :: proc(sw: ^Signal_Watcher) {
 	if !sw.running { return }
 	sync.atomic_store(&sw.stop, true)
-	posix.raise(SIGWINCH)   // unblock the sigwait so the thread observes stop
+	// Target the watcher's OWN thread. posix.raise() would signal the CALLER
+	// (thread-directed under NPTL) and hang here forever.
+	posix.pthread_kill(sw.native, SIG_WAKE)
 	thread.join(sw.thread)
 	thread.destroy(sw.thread)
 	sw.running = false
