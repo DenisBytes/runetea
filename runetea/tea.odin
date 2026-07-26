@@ -251,6 +251,23 @@ flush_frame :: proc(out: ^strings.Builder, flush_fd: posix.FD) {
 // reaches this call, not in what happens once it does.
 @(private="package")
 apply :: proc(p: ^Program($T), msg: any, fa: ^Frame_Arena, disp: ^Dispatcher, r: ^Renderer, out: ^strings.Builder, flush_fd: posix.FD) -> Run_Error {
+	// Every msg reaching apply() came off the mailbox, which means it was
+	// boxed with context.allocator (never frame_allocator(fa) -- see
+	// Frame_Arena's LIFETIME CONTRACT in arena.odin): tea.odin's reader
+	// thread and loop_nbio.odin's nbio_on_read both box Key_Msg that way,
+	// cmd.odin's pool/detached paths box Cmd results that way (via whatever
+	// the Cmd body itself passed to box() -- always context.allocator by
+	// convention, see cmd.odin), and signals.odin boxes Window_Size_Msg/
+	// Interrupt_Msg that way. box_free is therefore correct here regardless
+	// of which of those produced `msg`, and regardless of which of the
+	// branches below actually runs -- deferred so it fires on every exit
+	// path (the two early returns below, the panic-recovered return, and
+	// the normal end-of-frame return alike) exactly once. Sound only
+	// because of box()'s MESSAGE OWNERSHIP CONTRACT (arena.odin): every
+	// boxed Msg is POD, so this is always the ONLY allocation to reclaim
+	// for it -- see docs/superpowers/message-ownership-decision.md.
+	defer box_free(msg, context.allocator)
+
 	if _, is_quit := msg.(Quit_Msg); is_quit { p.quit = true; return nil }
 	if _, is_int := msg.(Interrupt_Msg); is_int { return Interrupted_Error{} }
 

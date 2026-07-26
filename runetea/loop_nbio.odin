@@ -92,7 +92,18 @@ run_nbio :: proc(p: ^Program($T), fd: posix.FD, out: ^strings.Builder, flush_fd:
 	h, aerr := nbio.associate_handle(uintptr(fd))
 	if aerr != nil { return Terminal_Error{detail = "nbio associate_handle failed"} }
 	rc.handle = h
-	defer { delete(rc.pending); delete(rc.keys); delete(rc.backlog) }
+	defer {
+		delete(rc.pending)
+		delete(rc.keys)
+		// Any entries still sitting unflushed (only reachable if the mailbox
+		// closed mid-flush -- see nbio_flush_backlog) were boxed but never
+		// handed to apply(), so nothing else will ever free them; box_free
+		// them here rather than leaving them for delete(rc.backlog) below,
+		// which only reclaims the [dynamic]any's own backing slice, not what
+		// each element's box() call allocated.
+		for i in rc.backlog_pos ..< len(rc.backlog) { box_free(rc.backlog[i], context.allocator) }
+		delete(rc.backlog)
+	}
 	nbio_issue_read(&rc)
 
 	for !p.quit {
@@ -147,7 +158,21 @@ Nbio_Read_Ctx :: struct {
 	buf:         [1024]u8,
 	pending:     [dynamic]u8,        // undecoded tail (partial escape/UTF-8 sequence)
 	keys:        [dynamic]Key_Msg,   // scratch, reused every callback
-	backlog:     [dynamic]Key_Msg,   // decoded keys not yet accepted by the mailbox
+	// Boxed (via context.allocator), not raw Key_Msg -- box()'s own MESSAGE
+	// OWNERSHIP CONTRACT (arena.odin) requires anything that reaches the
+	// mailbox to be a real box() allocation, not an implicit `any` pointing
+	// into this dynamic array's own backing storage. That was the ORIGINAL
+	// shape here (`mailbox_send(rc.mailbox, rc.backlog[rc.backlog_pos])`
+	// with `backlog: [dynamic]Key_Msg`) and it happened to work only because
+	// nothing downstream ever freed a message; the moment apply() started
+	// calling box_free() on every message (the T1 message-ownership fix,
+	// see docs/superpowers/message-ownership-decision.md), that pattern
+	// surfaced as Tracking_Allocator "bad free" reports -- free() was being
+	// called on a pointer into the middle of this array's buffer, not on a
+	// new()'d block's start address. Boxing once here, at append time, also
+	// means a .Full retry in nbio_flush_backlog resends the SAME allocation
+	// rather than boxing (and leaking) a fresh one on every retry attempt.
+	backlog:     [dynamic]any,
 	backlog_pos: int,                // next unsent index into backlog
 }
 
@@ -179,7 +204,11 @@ nbio_on_read :: proc(op: ^nbio.Operation) {
 	consumed := decode_keys(rc.pending[:], &rc.keys)
 	if consumed > 0 { remove_range(&rc.pending, 0, consumed) }
 
-	append(&rc.backlog, ..rc.keys[:])
+	// Boxed here, once per key, via context.allocator -- same convention as
+	// tea.odin's reader_thread -- so every message that ever reaches the
+	// mailbox is a genuine box() allocation. See Nbio_Read_Ctx's own comment
+	// on `backlog` for why this replaced sending rc.keys' elements directly.
+	for k in rc.keys { append(&rc.backlog, box(k, context.allocator)) }
 	nbio_flush_backlog(rc)
 }
 

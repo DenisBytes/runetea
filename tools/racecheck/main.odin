@@ -195,7 +195,11 @@ phase_mailbox :: proc() {
 
 // --- Phase B: Dispatcher ------------------------------------------------
 
-Cmd_Result :: struct { tag: string, id: int }
+// tag was a bare `string` field ("pool"/"detached") -- never actually read
+// anywhere below (only the message's PRESENCE is counted), so under box()'s
+// MESSAGE OWNERSHIP CONTRACT (arena.odin) it is simply dropped rather than
+// converted to a Msg_Text; there is nothing here worth the fixed-buffer cost.
+Cmd_Result :: struct { id: int }
 
 Pool_Env :: struct { id: int }
 
@@ -204,7 +208,7 @@ pool_cmd_run :: proc(env: rawptr) -> any {
 	// Stagger completion so a meaningful fraction are still running when the
 	// dispatch loop below reaches dispatcher_destroy.
 	if e.id % 7 == 0 { time.sleep(time.Millisecond) }
-	return rt.box(Cmd_Result{tag = "pool", id = e.id}, context.allocator)
+	return rt.box(Cmd_Result{id = e.id}, context.allocator)
 }
 
 Detached_Env :: struct { id: int }
@@ -212,7 +216,7 @@ Detached_Env :: struct { id: int }
 detached_cmd_run :: proc(env: rawptr) -> any {
 	e := cast(^Detached_Env)env
 	if e.id % 5 == 0 { time.sleep(time.Millisecond) }
-	return rt.box(Cmd_Result{tag = "detached", id = e.id}, context.allocator)
+	return rt.box(Cmd_Result{id = e.id}, context.allocator)
 }
 
 Dispatch_Drainer :: struct {

@@ -24,26 +24,29 @@ PORT :: 80
 Check_Env :: struct { host: string, port: int }
 
 Status_Msg :: struct { code: int }
-Err_Msg    :: struct { reason: string }
+// Msg_Text, not string: see examples/http/main.odin's identical comment --
+// this file is that example ported verbatim onto run_nbio, same POD
+// requirement applies (box()'s MESSAGE OWNERSHIP CONTRACT, runetea/arena.odin).
+Err_Msg :: struct { reason: rt.Msg_Text }
 
 check_server :: proc(env: rawptr) -> any {
 	e := cast(^Check_Env)env
 
 	sock, derr := net.dial_tcp_from_hostname_with_port_override(e.host, e.port)
 	if derr != nil {
-		return rt.box(Err_Msg{reason = fmt.aprintf("dial: %v", derr)}, context.allocator)
+		return rt.box(Err_Msg{reason = rt.msg_text_fmt("dial: %v", derr)}, context.allocator)
 	}
 	defer net.close(sock)
 
 	req := fmt.tprintf("GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", e.host)
 	if _, serr := net.send_tcp(sock, transmute([]u8)req); serr != nil {
-		return rt.box(Err_Msg{reason = fmt.aprintf("send: %v", serr)}, context.allocator)
+		return rt.box(Err_Msg{reason = rt.msg_text_fmt("send: %v", serr)}, context.allocator)
 	}
 
 	buf: [1024]u8
 	n, rerr := net.recv_tcp(sock, buf[:])
 	if rerr != nil || n < 12 {
-		return rt.box(Err_Msg{reason = fmt.aprintf("recv: %v", rerr)}, context.allocator)
+		return rt.box(Err_Msg{reason = rt.msg_text_fmt("recv: %v", rerr)}, context.allocator)
 	}
 
 	code := 0
@@ -52,7 +55,7 @@ check_server :: proc(env: rawptr) -> any {
 		code = code * 10 + int(c - '0')
 	}
 	if code == 0 {
-		return rt.box(Err_Msg{reason = "unparseable status line"}, context.allocator)
+		return rt.box(Err_Msg{reason = rt.msg_text_from("unparseable status line")}, context.allocator)
 	}
 	return rt.box(Status_Msg{code = code}, context.allocator)
 }
@@ -70,7 +73,8 @@ update :: proc(m: Model, msg: any, alloc: mem.Allocator) -> (Model, rt.Cmd) {
 		m.status = v.code; m.done = true
 		return m, rt.quit_cmd()
 	case Err_Msg:
-		m.err = v.reason; m.done = true
+		m.err = rt.msg_text_clone(v.reason, context.allocator)
+		m.done = true
 		return m, rt.quit_cmd()
 	}
 	return m, rt.cmd_nil()

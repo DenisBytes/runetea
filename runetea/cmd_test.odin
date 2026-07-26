@@ -3,13 +3,21 @@ package runetea
 import "core:testing"
 import "core:time"
 
-Fetch_Env    :: struct { url: string, delay: time.Duration }
-Fetch_Result :: struct { url: string, status: int }
+// Fetch_Env is Cmd env, not a Msg -- it is never passed to box() (cmd_from
+// heap-clones it directly and cmd.odin frees it as one opaque block once the
+// Cmd finishes), so it is exempt from box()'s POD requirement and may keep
+// a bare `string` field.
+Fetch_Env :: struct { url: string, delay: time.Duration }
+
+// Fetch_Result IS a Msg (returned through box() below), so its `url` field
+// must be POD -- see arena.odin's MESSAGE OWNERSHIP CONTRACT. Msg_Text, not
+// string.
+Fetch_Result :: struct { url: Msg_Text, status: int }
 
 fetch_run :: proc(env: rawptr) -> any {
 	e := cast(^Fetch_Env)env
 	time.sleep(e.delay)
-	return box(Fetch_Result{url = e.url, status = 200}, context.allocator)
+	return box(Fetch_Result{url = msg_text_from(e.url), status = 200}, context.allocator)
 }
 
 @(test)
@@ -20,7 +28,8 @@ test_cmd_carries_env_without_closures :: proc(t: ^testing.T) {
 	msg := c.procedure(c.env)
 	r, ok := msg.(Fetch_Result)
 	testing.expect(t, ok, "expected a Fetch_Result")
-	testing.expect_value(t, r.url, "https://example.com")
+	url := r.url
+	testing.expect_value(t, msg_text_string(&url), "https://example.com")
 	testing.expect_value(t, r.status, 200)
 	free(c.env, c.allocator)
 	free_all(context.allocator)
@@ -45,7 +54,7 @@ test_dispatch_delivers_results_to_mailbox :: proc(t: ^testing.T) {
 	for _ in 0 ..< len(urls) {
 		msg, ok := mailbox_recv(&m)
 		testing.expect(t, ok, "expected a result")
-		if r, is := msg.(Fetch_Result); is { seen[r.url] = true }
+		if r, is := msg.(Fetch_Result); is { u := r.url; seen[msg_text_string(&u)] = true }
 	}
 	testing.expect_value(t, len(seen), len(urls))
 }
@@ -117,7 +126,7 @@ coord_run :: proc(env: rawptr) -> any {
 	e := cast(^Coord_Env)env
 	// A child unit of work, run inline here to keep the test deterministic;
 	// the point under test is that the coordinator itself is not pool-bound.
-	return box(Fetch_Result{url = "coord", status = 1}, context.allocator)
+	return box(Fetch_Result{url = msg_text_from("coord"), status = 1}, context.allocator)
 }
 
 @(test)
@@ -169,7 +178,7 @@ Slow_Env :: struct {}
 
 slow_run :: proc(env: rawptr) -> any {
 	time.sleep(150 * time.Millisecond)
-	return box(Fetch_Result{url = "slow", status = 2}, context.allocator)
+	return box(Fetch_Result{url = msg_text_from("slow"), status = 2}, context.allocator)
 }
 
 @(test)
