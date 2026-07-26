@@ -821,6 +821,24 @@ import "core:mem/virtual"
 // One arena per event-loop iteration. Every Msg payload and every View string
 // is allocated here and released wholesale by frame_reset.
 //
+// LIFETIME CONTRACT -- read before using frame_allocator():
+// frame_reset runs once per iteration, on the main thread, and unconditionally
+// reclaims everything allocated from this arena since the last reset, including
+// on the crash-recovery path where longjmp has skipped every `defer`. A
+// frame_allocator(fa) allocation is therefore good only for the remainder of
+// the iteration that made it.
+//
+// Anything crossing a thread boundary, or that may still be queued in the
+// mailbox when the next frame_reset fires, MUST be boxed with
+// context.allocator -- never frame_allocator(fa). That covers Task 5's worker
+// pool and Task 7's signal-watcher thread.
+//
+// Note virtual.Arena guards its own bookkeeping with an internal mutex, so
+// concurrent box() calls will NOT corrupt it. That makes the naive
+// "is it thread-safe?" check pass while this lifetime hazard remains -- a
+// stale any.data pointing at reclaimed memory, with any.id still claiming the
+// old type. Type confusion, not a torn counter.
+//
 // This also serves the crash path: longjmp does not run `defer`, so after a
 // recovered panic the loop calls frame_reset to reclaim everything the failed
 // iteration allocated.
