@@ -6,12 +6,23 @@ Key_Kind :: enum u8 { Press, Release }
 
 // Collapsed vocabulary: Bubble Tea matches six key/mouse types by method set,
 // which Odin cannot express. One struct with a discriminant instead (spec §9).
+//
+// New members are APPENDED, never inserted: nothing serialises a Key_Code, but
+// the enum's numeric order is relied on inside this file (F1 + n indexing in
+// the CSI/SS3 tables), so keeping the F-key block contiguous and in order is
+// load-bearing, and reordering the block would silently mis-decode.
 Key_Code :: enum u8 {
 	Rune, Enter, Escape, Backspace, Tab, Space,
 	Up, Down, Right, Left,
+	Home, End, Page_Up, Page_Down, Insert, Delete,
+	F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12,
 }
 
-Modifier  :: enum u8 { Ctrl, Alt, Shift }
+// Meta is the 4th xterm modifier bit (see xterm_mods). It is NOT the same as
+// Alt on every terminal -- most Unix terminals send ESC-prefixed bytes for Alt
+// and never set this bit -- but the wire encoding has a slot for it, so it
+// gets a name rather than being silently folded into Alt.
+Modifier  :: enum u8 { Ctrl, Alt, Shift, Meta }
 Modifiers :: bit_set[Modifier; u8]
 
 Key_Msg :: struct {
@@ -42,28 +53,260 @@ utf8_lead_len :: proc(b: u8) -> int {
 	}
 }
 
+// THE C0 NORMALISATION POLICY, in one place on purpose.
+//
+// Applies to the bytes 0x00-0x20 and 0x7F. Three policies are defensible, and
+// terminals/toolkits differ on which they pick:
+//
+//   (a) Named keys win, and carry no Ctrl flag. Enter, Tab, Space and
+//       Backspace are reported as themselves; every other C0 byte becomes
+//       Rune + {.Ctrl}. Ctrl+I is therefore indistinguishable from Tab, and
+//       Ctrl+M from Enter, because on the wire they ARE the same byte -- no
+//       decoder without the Kitty protocol or modifyOtherKeys can separate
+//       them.
+//   (b) Named keys ALSO carry {.Ctrl} (0x09 -> Tab + {.Ctrl}), so an app that
+//       binds Ctrl+I can at least see the flag. Costs: every `key.mods == {}`
+//       check on Tab/Enter in user code breaks, and the flag is a lie for the
+//       overwhelmingly common case of a real Tab keypress.
+//   (c) 0x08 (BS, Ctrl+H) -> Backspace instead of Rune 'h' + {.Ctrl}, since
+//       some terminals and most serial lines send 0x08 for the Backspace key
+//       where xterm sends 0x7F. Costs: Ctrl+H becomes unbindable, and which
+//       byte Backspace sends is a terminfo (kbs) question this decoder does
+//       not consult.
+//
+// (a) IS WHAT IS IMPLEMENTED, unchanged from the pre-T1-H decoder. It is a
+// deliberate, revisitable choice, not an oversight: it matches xterm's default
+// wire behaviour and Bubble Tea's own default, and it never reports a modifier
+// the user did not press. Changing it means editing this one proc -- that is
+// the whole reason it exists as a proc rather than as switch arms inlined in
+// decode_keys. input_test.odin's test_c0_policy pins the current answer.
+decode_c0 :: proc(b: u8) -> Key_Msg {
+	switch b {
+	case '\r', '\n': return Key_Msg{code = .Enter}
+	case '\t':       return Key_Msg{code = .Tab}
+	case ' ':        return Key_Msg{code = .Space, r = ' '}
+	case 0x7f:       return Key_Msg{code = .Backspace}
+	}
+	// 0x00 lands on '`' (0x00 + 'a' - 1 == 0x60), matching the ctrl+@ /
+	// ctrl+space convention closely enough for a byte nothing generates
+	// deliberately.
+	return Key_Msg{code = .Rune, r = rune(b + 'a' - 1), mods = {.Ctrl}}
+}
+
+// The xterm modifier parameter is 1 + a bitmask, so an unmodified key is 1 and
+// there is no valid 0. Returns ok = false for anything outside 1..=256, which
+// keeps a stray numeric parameter (a device report that happens to end in a
+// letter we recognise, say) from being forced into a plausible-looking
+// modifier set.
+//
+// Bits above 8 -- Kitty's Hyper (16), Super (32), CapsLock (64), NumLock (128)
+// -- are MASKED OFF, deliberately: Modifiers has no member for them, and
+// mapping them onto the four we do have would report a modifier the user did
+// not press. CSI 1;33A (Up with CapsLock latched) therefore decodes as plain
+// Up, which is a lossy but honest answer. Decoding them properly is Kitty
+// keyboard protocol work, which is out of T1-H's scope.
+xterm_mods :: proc(param: int) -> (mods: Modifiers, ok: bool) {
+	if param < 1 || param > 256 { return {}, false }
+	mask := param - 1
+	if mask & 1 != 0 { mods += {.Shift} }
+	if mask & 2 != 0 { mods += {.Alt} }
+	if mask & 4 != 0 { mods += {.Ctrl} }
+	if mask & 8 != 0 { mods += {.Meta} }
+	return mods, true
+}
+
+CSI_MAX_PARAMS :: 4
+
+// Parses the parameter-byte run of a CSI (everything between "\e[" and the
+// intermediate/final bytes) into at most CSI_MAX_PARAMS integers. A parameter
+// that is present but empty ("\e[;5A") reports as -1 so callers can apply
+// their own default, which is not the same as 0.
+//
+// Returns ok = false -- meaning "not a sequence this decoder assigns meaning
+// to", NOT "malformed" -- for anything with a private prefix byte
+// ('<' '=' '>' '?', i.e. mouse reports, DECRPM, Kitty flag queries) or a ':'
+// sub-parameter separator (Kitty's key:shifted:base form). All of those are
+// out of T1-H's scope and must fall through to the cleanly-ignored path with
+// their byte length intact, which the caller computes independently of this
+// proc.
+csi_params :: proc(p: []u8) -> (params: [CSI_MAX_PARAMS]int, count: int, ok: bool) {
+	for k in 0 ..< CSI_MAX_PARAMS { params[k] = -1 }
+	if len(p) == 0 { return params, 0, true }
+	count = 1
+	for c in p {
+		switch {
+		case c >= '0' && c <= '9':
+			d := int(c - '0')
+			v := params[count - 1]
+			if v < 0 { v = 0 }
+			// No real key parameter exceeds three digits; the bound exists so
+			// a long digit run in some unrecognised report cannot overflow
+			// into a value that happens to look like a valid modifier.
+			if v > 9999 { return params, 0, false }
+			params[count - 1] = v * 10 + d
+		case c == ';':
+			if count >= CSI_MAX_PARAMS { return params, 0, false }
+			count += 1
+		case:
+			return params, 0, false
+		}
+	}
+	return params, count, true
+}
+
+// CSI <param>* ~ -- the "tilde" keys. Table from ultraviolet's key_table.go.
+// 9, 10, 16, 22, 27 and 30 are unassigned; 25/26/28/29/31-34 are F13-F20,
+// which Key_Code does not carry, so they report ok = false and get cleanly
+// ignored rather than being folded onto some nearby F-key.
+csi_tilde_code :: proc(param: int) -> (code: Key_Code, ok: bool) {
+	switch param {
+	case 1:  return .Home, true       // "find" on VT220 keyboards
+	case 2:  return .Insert, true
+	case 3:  return .Delete, true
+	case 4:  return .End, true        // "select" on VT220 keyboards
+	case 5:  return .Page_Up, true
+	case 6:  return .Page_Down, true
+	case 7:  return .Home, true       // rxvt/urxvt
+	case 8:  return .End, true        // rxvt/urxvt
+	case 11 ..= 15: return Key_Code(int(Key_Code.F1) + param - 11), true
+	case 17 ..= 21: return Key_Code(int(Key_Code.F6) + param - 17), true
+	case 23, 24:    return Key_Code(int(Key_Code.F11) + param - 23), true
+	}
+	return .Rune, false
+}
+
+// The letter-final CSI keys: CSI <final>, CSI 1 <final>, CSI 1 ; <mod> <final>.
+// 'R' is F3, which collides with a cursor position report (CSI <row>;<col> R);
+// see decode_keys' doc comment.
+csi_letter_code :: proc(final: u8) -> (code: Key_Code, ok: bool) {
+	switch final {
+	case 'A': return .Up, true
+	case 'B': return .Down, true
+	case 'C': return .Right, true
+	case 'D': return .Left, true
+	case 'F': return .End, true
+	case 'H': return .Home, true
+	case 'P': return .F1, true
+	case 'Q': return .F2, true
+	case 'R': return .F3, true
+	case 'S': return .F4, true
+	}
+	return .Rune, false
+}
+
+// Decodes one COMPLETE CSI whose parameter bytes are `p` and whose final byte
+// is `final`. `has_intermed` says whether any intermediate byte (0x20-0x2F)
+// was present; every key form this decoder knows has none, so an intermediate
+// byte is an immediate "not a key" (it is DECRPM, urxvt's CSI <n> $, ...).
+//
+// ok = false means "complete, but not a key this decoder understands" -- the
+// caller consumes the sequence and emits nothing. It never means "incomplete";
+// incompleteness is decided by the caller before this proc is reached.
+csi_decode :: proc(p: []u8, has_intermed: bool, final: u8) -> (key: Key_Msg, ok: bool) {
+	if has_intermed { return {}, false }
+	params, count := csi_params(p) or_return
+
+	if final == '~' {
+		if count == 0 || count > 2 { return {}, false }
+		code := csi_tilde_code(params[0]) or_return
+		if count == 1 { return Key_Msg{code = code}, true }
+		mods := xterm_mods(params[1]) or_return
+		return Key_Msg{code = code, mods = mods}, true
+	}
+
+	code := csi_letter_code(final) or_return
+	if count == 0 { return Key_Msg{code = code}, true }
+	if count > 2 { return {}, false }
+	// The first parameter of a modified cursor/function key is always 1 (the
+	// "one key" repeat count); anything else is a different sequence that
+	// happens to share our final byte -- a cursor position report, most
+	// importantly -- and must not be decoded as a key.
+	id := params[0]
+	if id < 0 { id = 1 }
+	if id != 1 { return {}, false }
+	if count == 1 { return Key_Msg{code = code}, true }
+	mods := xterm_mods(params[1]) or_return
+	return Key_Msg{code = code, mods = mods}, true
+}
+
+// SS3: ESC O <digits>* <GL byte>. The digit run is the same 1+bitmask
+// modifier xterm uses in CSI (some xterm configurations emit ESC O 5 P for
+// Ctrl+F1); absent digits mean no modifiers.
+//
+// Keypad keys (ESC O M/X/j-y, DECKPAM) and ESC O E (Begin) have no Key_Code,
+// so they report ok = false and are cleanly ignored. Lowercase a-d (rxvt's
+// Ctrl+arrows) are likewise not decoded -- rxvt-specific key tables are out of
+// T1-H's scope.
+ss3_decode :: proc(mod_digits: []u8, gl: u8) -> (key: Key_Msg, ok: bool) {
+	code: Key_Code
+	switch gl {
+	case 'A': code = .Up
+	case 'B': code = .Down
+	case 'C': code = .Right
+	case 'D': code = .Left
+	case 'F': code = .End
+	case 'H': code = .Home
+	case 'P': code = .F1
+	case 'Q': code = .F2
+	case 'R': code = .F3
+	case 'S': code = .F4
+	case:     return {}, false
+	}
+	if len(mod_digits) == 0 { return Key_Msg{code = code}, true }
+	v := 0
+	for c in mod_digits {
+		if v > 9999 { return {}, false }
+		v = v * 10 + int(c - '0')
+	}
+	mods := xterm_mods(v) or_return
+	return Key_Msg{code = code, mods = mods}, true
+}
+
 // Decodes as many complete keys as `data` contains, appending to `out`.
 // Returns the number of bytes consumed; a trailing partial escape sequence
 // or a trailing partial UTF-8 rune is left unconsumed so the caller can
 // retry once more bytes arrive.
 //
-// This is a minimal decoder: printable runes, C0 control bytes as
-// Ctrl+letter, Enter/Tab/Backspace/Escape, and the four arrow keys -- just
-// enough for the spike's two examples. It does not decode parameterised CSI
-// keys (PageUp, Ctrl+arrow, F-keys, ...), SS3 sequences, or the Kitty
-// protocol; those are cleanly ignored (see the CSI handling below), and
-// actually decoding what they mean is T1/T4 work (spec §12).
+// Vocabulary: printable runes; C0 control bytes per decode_c0's policy;
+// Enter/Tab/Space/Backspace/Escape; arrows, Home, End, Page_Up, Page_Down,
+// Insert, Delete and F1-F12 in their CSI-tilde, CSI-letter and SS3 encodings;
+// and xterm modifier parameters (Shift/Alt/Ctrl/Meta) on all of those.
+//
+// DOCUMENTED LIMITATIONS -- each of these is a separate future unit, and each
+// is CLEANLY IGNORED here (consumed whole, nothing emitted) rather than
+// leaking bytes as garbage runes:
+//   - mouse reporting (X10, SGR: CSI M ..., CSI < ... M/m);
+//   - bracketed paste (CSI 200~ / CSI 201~ and the text between them);
+//   - the Kitty keyboard protocol (CSI u, CSI ? <flags> u, and the ':'
+//     sub-parameter form), including its Hyper/Super/CapsLock/NumLock
+//     modifier bits -- see xterm_mods for why those are masked off;
+//   - focus in/out (CSI I / CSI O);
+//   - keypad/DECKPAM keys (ESC O M/X/j-y) and Begin (CSI E / ESC O E);
+//   - Shift+Tab (CSI Z) and rxvt's lowercase-letter arrow forms;
+//   - F13-F20 (CSI 25~ and up), which Key_Code does not carry;
+//   - terminfo. The tables here are the xterm/VT220 defaults, not the
+//     terminal's own key table; a terminal that reports something else is a
+//     terminal this decoder does not fully understand. See the real-terminal
+//     capture note in the T1-H report.
+//   - cursor position reports. CSI <row>;<col> R and modified-F3
+//     (CSI 1;<mod> R) are the same bytes when row == 1, and this decoder
+//     resolves them as F3 because RuneTea never issues a DSR 6n. If that ever
+//     changes, this is the collision to revisit; ultraviolet handles it by
+//     emitting BOTH events, which needs a Msg vocabulary we do not have yet.
 //
 // HOLD-BACK CONTRACT (the subtle part): a sequence that is still arriving --
 // "\e" alone at the very end of the buffer, "\e[" with nothing after it, a
-// CSI whose final byte (0x40-0x7E) hasn't arrived yet, or a UTF-8 lead byte
-// without all of its continuation bytes yet -- must NOT be decoded yet.
-// Emitting a spurious Escape, or a spurious U+FFFD replacement rune, for any
-// of these would be the classic bug where a sequence split across two reads
-// turns into a bogus keypress plus garbage once the rest of it arrives and
-// gets decoded on its own. Every "not enough bytes yet" case below returns
-// early with `consumed` short of `len(data)`, and Task 10's reader loop
-// retries the undecoded tail once more bytes land.
+// CSI whose final byte (0x40-0x7E) hasn't arrived yet, an SS3 whose GL byte
+// hasn't arrived yet, or a UTF-8 lead byte without all of its continuation
+// bytes yet -- must NOT be decoded yet. Emitting a spurious Escape, or a
+// spurious U+FFFD replacement rune, for any of these would be the classic bug
+// where a sequence split across two reads turns into a bogus keypress plus
+// garbage once the rest of it arrives and gets decoded on its own. Every "not
+// enough bytes yet" case below returns early with `consumed` short of
+// `len(data)`, and Task 10's reader loop retries the undecoded tail once more
+// bytes land. input_test.odin's test_split_at_every_byte_boundary feeds every
+// proper prefix of every sequence in the key table through here and asserts
+// exactly this.
 //
 // The ONE exception is a lone ESC at the very end of the buffer with no
 // sequence pending (data == {0x1b}, nothing else on the stream): decoded
@@ -78,6 +321,34 @@ utf8_lead_len :: proc(b: u8) -> int {
 // have at least one byte already in hand that positively identifies a
 // sequence in progress.
 //
+// "\eO" AT THE END OF THE BUFFER IS THE SAME EXCEPTION, not a second one.
+// ESC O is both the SS3 introducer and Alt+Shift+O, so unlike "\e[" the two
+// bytes in hand do NOT positively identify a sequence in progress -- they are
+// a complete, plausible keypress on their own. With no third byte present it
+// therefore resolves immediately, exactly as the lone ESC above does, and for
+// exactly the same reason: only a timer could tell "sequence in flight" from
+// "key pressed", and there is no timer. When a third byte IS present, SS3
+// wins, because ESC O followed by anything is overwhelmingly more likely to
+// be a function/arrow key than Alt+O followed by an unrelated keystroke
+// inside one read. The cost is that Alt+O immediately followed by another
+// keystroke is swallowed as an unrecognised SS3 -- accepted, and pinned by
+// test_esc_o_ambiguity.
+//
+// THE ASYMMETRY IS DELIBERATE: "\e[" at end-of-buffer holds back, "\eO"
+// resolves. "\e[" is never a key on its own (there is no Alt+[ that a
+// terminal encodes as ESC [ -- that byte pair is unconditionally the CSI
+// introducer, which is why every terminal escapes a literal Alt+[ some other
+// way), so holding it back costs nothing and risks nothing. "\eO" is a key on
+// its own, so holding it back would mean silently dropping a real keypress
+// whenever the user's next keystroke never comes.
+//
+// It also reports Alt+O as Rune 'O' + {.Alt}, NOT as lowercase 'o' +
+// {.Alt, .Shift} the way ultraviolet does. That is a deliberate deviation:
+// this decoder's generic Alt+printable path (below) reports ESC-then-'P' as
+// Rune 'P' + {.Alt}, and a decoder where 'O' alone came out in a different
+// shape from every other uppercase letter would be a trap for anyone writing
+// a key binding.
+//
 // A second ESC arriving immediately after the first ("\e\e", e.g. a user
 // double-tapping Escape in a modal/vim-like UI) is likewise not ambiguous:
 // it is treated as a real Escape keypress, and the second ESC byte is left
@@ -88,7 +359,6 @@ decode_keys :: proc(data: []u8, out: ^[dynamic]Key_Msg) -> (consumed: int) {
 	for i < len(data) {
 		b := data[i]
 
-		// CSI sequences: ESC [ <final>
 		if b == 0x1b {
 			if i + 1 >= len(data) {
 				// Lone ESC at the very end of the buffer. Ambiguous: it may be a
@@ -102,12 +372,16 @@ decode_keys :: proc(data: []u8, out: ^[dynamic]Key_Msg) -> (consumed: int) {
 				// CSI grammar: ESC [ <parameter bytes 0x30-0x3F>*
 				//                    <intermediate bytes 0x20-0x2F>*
 				//                    <final byte 0x40-0x7E>
-				// Scan to the final byte without interpreting any parameters --
-				// that is enough to know where the sequence ENDS, which is all
-				// that is needed to either hold it back or skip it cleanly.
-				// Deciding what a parameterised sequence MEANS stays T1/T4.
-				j := i + 2
+				// Scan to the final byte first, WITHOUT interpreting any
+				// parameters: that is what decides where the sequence ends,
+				// and therefore whether to hold it back at all. Only once the
+				// whole sequence is in hand does csi_decode get to say what it
+				// means -- so "not a key we know" and "not here yet" can never
+				// be confused for each other.
+				ps := i + 2
+				j  := ps
 				for j < len(data) && data[j] >= 0x30 && data[j] <= 0x3F { j += 1 }
+				pe := j
 				for j < len(data) && data[j] >= 0x20 && data[j] <= 0x2F { j += 1 }
 				if j >= len(data) { return i }   // final byte not arrived yet: hold back
 				final := data[j]
@@ -120,32 +394,38 @@ decode_keys :: proc(data: []u8, out: ^[dynamic]Key_Msg) -> (consumed: int) {
 					i += 2
 					continue
 				}
-				seq_len := j - i + 1
-				// The four arrows are the only 3-byte CSI (no parameter or
-				// intermediate bytes) this decoder assigns a meaning to.
-				if seq_len == 3 {
-					code: Key_Code
-					matched := true
-					switch final {
-					case 'A': code = .Up
-					case 'B': code = .Down
-					case 'C': code = .Right
-					case 'D': code = .Left
-					case:     matched = false
-					}
-					if matched {
-						append(out, Key_Msg{code = code})
-						i += seq_len
-						continue
-					}
+				if key, ok := csi_decode(data[ps:pe], pe != j, final); ok {
+					append(out, key)
 				}
-				// Unsupported CSI (parameterised, or an unrecognised bare
-				// final byte): the whole thing is a single complete sequence
-				// now that its final byte has arrived, so consume it as one
-				// unit and emit nothing -- "cleanly ignore an unsupported
-				// key" rather than leaking its trailing bytes as garbage
-				// rune keypresses.
-				i += seq_len
+				// Whether decoded or not, the sequence is consumed as ONE unit
+				// -- "cleanly ignore an unsupported key" rather than leaking
+				// its trailing bytes as garbage rune keypresses.
+				i = j + 1
+				continue
+			}
+			if data[i + 1] == 'O' {
+				if i + 2 >= len(data) {
+					// ESC O with no third byte: resolve as Alt+O. See the ESC O
+					// discussion in this proc's doc comment -- this is the lone-ESC
+					// exception again, not a new one.
+					append(out, Key_Msg{code = .Rune, r = 'O', mods = {.Alt}})
+					return i + 2
+				}
+				// SS3 grammar: ESC O <digits>* <GL byte 0x21-0x7E>.
+				ds := i + 2
+				j  := ds
+				for j < len(data) && data[j] >= '0' && data[j] <= '9' { j += 1 }
+				if j >= len(data) { return i }   // GL byte not arrived yet: hold back
+				gl := data[j]
+				if gl < 0x21 || gl > 0x7E {
+					// Same resynchronisation rule as a malformed CSI above.
+					i += 2
+					continue
+				}
+				if key, ok := ss3_decode(data[ds:j], gl); ok {
+					append(out, key)
+				}
+				i = j + 1
 				continue
 			}
 			if data[i + 1] == 0x1b {
@@ -164,16 +444,9 @@ decode_keys :: proc(data: []u8, out: ^[dynamic]Key_Msg) -> (consumed: int) {
 			continue
 		}
 
-		switch b {
-		case '\r', '\n': append(out, Key_Msg{code = .Enter});     i += 1; continue
-		case 0x7f:       append(out, Key_Msg{code = .Backspace}); i += 1; continue
-		case '\t':       append(out, Key_Msg{code = .Tab});       i += 1; continue
-		case ' ':        append(out, Key_Msg{code = .Space, r = ' '}); i += 1; continue
-		}
-
-		// C0 control bytes are Ctrl+letter
-		if b < 0x20 {
-			append(out, Key_Msg{code = .Rune, r = rune(b + 'a' - 1), mods = {.Ctrl}})
+		// 0x00-0x20 and 0x7F: one policy, one place. See decode_c0.
+		if b <= 0x20 || b == 0x7f {
+			append(out, decode_c0(b))
 			i += 1
 			continue
 		}
