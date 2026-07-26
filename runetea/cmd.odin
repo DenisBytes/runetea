@@ -50,9 +50,20 @@ Task_Env :: struct {
 	inflight: ^sync.Wait_Group,  // detached only; nil for pool tasks
 }
 
+// Runs once per pool WORKER at pool startup (thread.Pool's own init_proc
+// hook), not once per TASK -- a worker's OS thread is reused across many
+// tasks, and sigaltstack only needs installing once per thread (FIX 2,
+// final fix-wave report). Without this, a pool worker has no altstack at
+// all: a stack-overflow SIGSEGV on one re-faults on its own exhausted stack
+// and defeats Tier 2 for every Cmd that ever runs on the pool.
+@(private="file")
+pool_worker_install_crash_handlers :: proc(th: ^thread.Thread, user_data: rawptr) {
+	install_crash_handlers()
+}
+
 dispatcher_init :: proc(d: ^Dispatcher, m: ^Mailbox, workers: int) {
 	d.mailbox = m
-	thread.pool_init(&d.pool, context.allocator, max(workers, 1))
+	thread.pool_init(&d.pool, context.allocator, max(workers, 1), init_proc = pool_worker_install_crash_handlers)
 	thread.pool_start(&d.pool)
 }
 
@@ -74,6 +85,28 @@ dispatcher_destroy :: proc(d: ^Dispatcher) {
 	sync.wait_group_wait(&d.inflight)
 }
 
+// Delivers a completed Cmd's result, retrying on a transient Full and
+// giving up on a terminal Closed (FIX 1, final fix-wave report). A dropped
+// result is not acceptable here: `_ = mailbox_send(...)` used to discard it
+// outright whenever the mailbox happened to be full, which for
+// examples/http meant the UI could sit on "Checking..." forever even
+// though the network request had actually completed successfully -- the
+// result was computed and then silently thrown away. run()'s main loop is
+// the sole consumer and keeps draining concurrently while a pool worker or
+// detached Cmd thread is blocked here, so Full is expected to clear; Closed
+// means run() has already torn down and nothing sent from here on could
+// ever be received anyway.
+@(private="file")
+deliver_result :: proc(m: ^Mailbox, msg: any) {
+	for {
+		switch mailbox_send(m, msg) {
+		case .Ok:     return
+		case .Closed: return
+		case .Full:   thread.yield()
+		}
+	}
+}
+
 @(private="file")
 run_cmd_task :: proc(task: thread.Task) {
 	te := cast(^Task_Env)task.data
@@ -93,7 +126,7 @@ run_cmd_task :: proc(task: thread.Task) {
 		// task-10-report.md. `.id` is nil ONLY for a genuinely absent message
 		// (a real `nil` any, or box()'s own allocator-failure return), which
 		// is what this check must key on instead.
-		if msg.id != nil { _ = mailbox_send(te.mailbox, msg) }
+		if msg.id != nil { deliver_result(te.mailbox, msg) }
 	}
 	// Freed here, per-task, rather than accumulated in the Dispatcher and
 	// freed only at dispatcher_destroy: a Dispatcher is meant to live for
@@ -104,6 +137,15 @@ run_cmd_task :: proc(task: thread.Task) {
 
 @(private="file")
 run_cmd_detached :: proc(data: rawptr) {
+	// Per-thread altstack (FIX 2, final fix-wave report), installed as the
+	// first action. A detached Cmd gets a brand-new OS thread every single
+	// dispatch (see dispatch's detached branch below) -- unlike the pool,
+	// there is no reusable worker thread to amortize this over via an
+	// init_proc hook, so it has to happen here, once per invocation.
+	// Without it, a stack-overflow SIGSEGV on a detached Cmd's own thread
+	// re-faults on its own exhausted stack and defeats Tier 2.
+	install_crash_handlers()
+
 	te := cast(^Task_Env)data
 	inflight := te.inflight
 	if te.cmd.procedure != nil {
@@ -111,7 +153,7 @@ run_cmd_detached :: proc(data: rawptr) {
 		if te.cmd.env != nil { free(te.cmd.env, te.cmd.allocator) }
 		// See run_cmd_task's comment: msg.id, not msg, distinguishes "a real
 		// zero-sized Msg" from "genuinely nothing to send".
-		if msg.id != nil { _ = mailbox_send(te.mailbox, msg) }
+		if msg.id != nil { deliver_result(te.mailbox, msg) }
 	}
 	free(te)
 	// Must be the LAST action: dispatcher_destroy's wait_group_wait treats

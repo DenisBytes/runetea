@@ -49,12 +49,37 @@ mailbox_destroy :: proc(m: ^Mailbox, allocator := context.allocator) {
 	m^ = {}
 }
 
-// Returns false if the mailbox is closed or full. Safe from any thread.
-mailbox_send :: proc(m: ^Mailbox, msg: any) -> bool {
+// FULL and CLOSED are deliberately distinct outcomes, not both folded into a
+// single `false` -- see mailbox_send's doc comment for why conflating them
+// was a real bug (FIX 1, final fix-wave report): a producer that treats a
+// momentarily-full mailbox the same as a permanently-closed one gives up
+// and never sends again, even though the consumer is still draining and
+// would have made room a moment later.
+Mailbox_Send_Result :: enum { Ok, Full, Closed }
+
+// Reports Ok, Full, or Closed -- see Mailbox_Send_Result. Safe from any
+// thread.
+//
+// Full is a TRANSIENT condition: the consumer may still be actively
+// draining, and a later send with the same message can succeed. Closed is
+// TERMINAL: the mailbox is being torn down and no future send can ever
+// succeed. Callers that busy-loop retrying on Full must check for Closed on
+// every attempt and give up then, or they risk retrying forever against a
+// mailbox that will never accept anything again. Callers that don't want to
+// retry (e.g. because giving up on Full is an acceptable, documented
+// tradeoff for that call site) must say so explicitly rather than silently
+// discarding via `_ = mailbox_send(...)` -- that spelling was exactly what
+// let a full-vs-closed conflation hide as a silent message drop in more
+// than one call site before this fix.
+mailbox_send :: proc(m: ^Mailbox, msg: any) -> Mailbox_Send_Result {
 	sync.mutex_lock(&m.mutex)
-	if m.closed || m.len == len(m.buf) {
+	if m.closed {
 		sync.mutex_unlock(&m.mutex)
-		return false
+		return .Closed
+	}
+	if m.len == len(m.buf) {
+		sync.mutex_unlock(&m.mutex)
+		return .Full
 	}
 	m.buf[m.tail] = msg
 	m.tail = (m.tail + 1) % len(m.buf)
@@ -66,7 +91,7 @@ mailbox_send :: proc(m: ^Mailbox, msg: any) -> bool {
 	// their sema_wait calls cannot block.
 	sync.sema_post(&m.items)
 	sync.mutex_unlock(&m.mutex)
-	return true
+	return .Ok
 }
 
 // Must be called with m.mutex held. Pops one message off the ring buffer,

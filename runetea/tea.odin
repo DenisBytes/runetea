@@ -172,6 +172,14 @@ Reader_Ctx :: struct {
 @(private="file")
 reader_thread :: proc(th: ^thread.Thread) {
 	rd := cast(^Reader_Ctx)th.data
+
+	// sigaltstack is per-thread (FIX 2, final fix-wave report). run()'s
+	// caller may have already called install_crash_handlers() on the
+	// thread that called run(), but that installs nothing here -- this is
+	// a brand-new OS thread. As the first action, before anything that
+	// could plausibly fault (decode_keys, box, mailbox_send).
+	install_crash_handlers()
+
 	buf: [1024]u8
 	keys := make([dynamic]Key_Msg);  defer delete(keys)
 	pending: [dynamic]u8;            defer delete(pending)
@@ -195,7 +203,27 @@ reader_thread :: proc(th: ^thread.Thread) {
 		for k in keys {
 			// Boxed on the heap, not the frame arena: this crosses a thread
 			// boundary and outlives any single frame.
-			if !mailbox_send(rd.mailbox, box(k, context.allocator)) { return }
+			msg := box(k, context.allocator)
+			// FULL vs CLOSED must be handled differently (FIX 1, final
+			// fix-wave report). The reader reads up to 1024 bytes per
+			// read() and can send in a tight loop, while the main loop does
+			// decode + render + write() per message -- the reader always
+			// wins, and >1000 pasted characters is enough to fill the
+			// 256-slot mailbox. Treating Full the same as Closed (as this
+			// code used to, via a single `if !mailbox_send(...) { return
+			// }`) made the reader exit WITHOUT calling mailbox_close, so the
+			// main loop drained the queued messages and then blocked
+			// forever in mailbox_recv -- no keyboard, no EOF, no error,
+			// unkillable except by an external signal. Full is transient:
+			// the main loop keeps draining concurrently, so spin until it
+			// makes room. Closed is terminal: run() is tearing down and
+			// nothing sent from here on can ever be received.
+			for {
+				result := mailbox_send(rd.mailbox, msg)
+				if result == .Ok { break }
+				if result == .Closed { return }
+				thread.yield()
+			}
 		}
 	}
 }

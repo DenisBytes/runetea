@@ -39,29 +39,40 @@ test_guard_restores_assertion_proc :: proc(t: ^testing.T) {
 }
 
 // Nesting isn't corruption-free -- see guarded()'s doc comment -- but it must
-// still be an observable failure, not silent stack corruption. The inner
-// guarded() call's re-entrancy assert fires through whatever
-// assertion_failure_proc is already installed on this thread, which at that
-// point is still the OUTER call's -- so the violation is actually recovered
-// by the OUTER invocation, never returning control to the inner call site.
+// still be an observable failure, not silent stack corruption. Since FIX 3
+// (final fix-wave report) replaced the assert-based re-entrancy check with
+// an explicit `if g_armed { return ... }`, the INNER guarded() call now
+// returns its own Panic_Info directly to whoever called it (here, the
+// outer body) instead of relying on assertion_failure_proc/longjmp to
+// unwind into the outer call -- so this test captures the inner call's
+// return value directly, rather than asserting on what the outer call
+// propagates.
+Nested_Probe :: struct { inner_ran: bool, inner_info: Panic_Info }
+
 @(test)
-test_guard_nested_call_is_caught_by_outer_recovery :: proc(t: ^testing.T) {
-	info := guarded(proc(ud: rawptr) {
-		_ = guarded(proc(ud2: rawptr) {}, nil)  // never returns here; longjmps out to the outer frame
-		panic("unreachable: nested guarded() should have longjmp'd past this")
-	}, nil)
-	testing.expect(t, info.recovered, "a nested guarded() call must be caught, not silently corrupt state")
-	testing.expect_value(t, info.message, "guarded() does not support nesting on the same thread")
-	delete(info.message)
+test_guard_nested_call_is_rejected_without_running_body :: proc(t: ^testing.T) {
+	probe: Nested_Probe
+	outer := guarded(proc(ud: rawptr) {
+		p := cast(^Nested_Probe)ud
+		p.inner_info = guarded(proc(ud2: rawptr) {
+			(cast(^Nested_Probe)ud2).inner_ran = true
+		}, p)
+	}, &probe)
+
+	testing.expect(t, !outer.recovered, "the outer call's own state must be undisturbed by a rejected nested call")
+	testing.expect(t, probe.inner_info.recovered, "a nested guarded() call must report recovered, not proceed")
+	testing.expect_value(t, probe.inner_info.message, "guarded() does not support nesting on the same thread")
+	delete(probe.inner_info.message)
+	testing.expect(t, !probe.inner_ran, "the nested call's body must never run")
 
 	// g_armed is file-private to guard.odin, so probe indirectly: a second,
 	// ordinary (non-nested) guarded() call must still work normally after
 	// the misuse above, proving g_armed was reset to false and not left
-	// stuck true by the outer call's own longjmp-driven recovery.
+	// stuck true by the rejected nested call or the outer call's own defer.
 	hit := false
 	after := guarded(proc(ud: rawptr) { (cast(^bool)ud)^ = true }, &hit)
-	testing.expect(t, !after.recovered, "guarded() must work normally after recovering from a nesting violation")
-	testing.expect(t, hit, "body should have run on the post-violation call")
+	testing.expect(t, !after.recovered, "guarded() must work normally after rejecting a nested call")
+	testing.expect(t, hit, "body should have run on the post-rejection call")
 }
 
 // Query-only sigaction (act == nil) reads the current disposition into oact

@@ -85,10 +85,13 @@ mb_producer_run :: proc(data: rawptr) {
 		if sync.atomic_load(p.closing) { return }
 		msg := rt.box(Ping_Msg{producer = p.id, seq = j}, context.allocator)
 		attempts := 0
-		for !rt.mailbox_send(p.m, msg) {
-			// False means either "full" (retry -- the consumers below are
-			// actively draining) or "closed" (give up). Bound the retries
-			// so a close mid-flight can never spin a producer forever.
+		for {
+			r := rt.mailbox_send(p.m, msg)
+			if r == .Ok { break }
+			if r == .Closed { return }
+			// Full: retry -- the consumers below are actively draining.
+			// Bound the retries so a close mid-flight can never spin a
+			// producer forever.
 			attempts += 1
 			if sync.atomic_load(p.closing) || attempts > 50000 { return }
 			thread.yield()

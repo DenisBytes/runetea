@@ -83,9 +83,13 @@ view :: proc(m: Model, alloc: mem.Allocator) -> string {
 
 main :: proc() {
 	fd := posix.FD(os.fd(os.stdin))
+	// install_crash_handlers BEFORE term_enter_raw, not after: term_enter_raw
+	// flips raw_active = true before tcsetattr has actually touched the tty,
+	// so a crash landing in that window is only recoverable if a handler
+	// already exists to catch it (see install_crash_handlers' doc comment).
+	rt.install_crash_handlers()
 	if !rt.term_enter_raw(fd) { fmt.eprintln("not a tty"); os.exit(1) }
 	defer rt.term_restore()
-	rt.install_crash_handlers()
 
 	src, ok := rt.input_source_from_fd(fd)
 	if !ok { fmt.eprintln("bad input source"); os.exit(1) }

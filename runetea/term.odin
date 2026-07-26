@@ -60,13 +60,25 @@ term_restore :: proc() {
 	term_restore_c()
 }
 
-// Async-signal-safe: tcsetattr and write(2) only. No allocation, no locks.
+// Async-signal-safe: tcsetattr(2) only. No allocation, no locks.
+//
+// Emits no escape sequences (FIX 5, final fix-wave report). This used to
+// unconditionally write "\e[?1049l\e[?25h" -- leave alt screen, show
+// cursor -- on every exit path, but nothing in this package or its
+// examples ever writes the corresponding entry sequences ("\e[?1049h",
+// "\e[?25l"): render.odin is a naive INLINE rewind renderer (cursor-up +
+// erase-line, see renderer_render), not an alt-screen renderer, and the
+// cursor is never hidden. Restore must undo only what was actually set --
+// right now that is termios raw mode, nothing else. The old unconditional
+// write was an alt-screen EXIT the framework never entered: on
+// xterm-family terminals an unpaired "\e[?1049l" restores a cursor
+// position that was never saved, which is actively wrong output, not
+// merely a harmless no-op. T2/T3 may start hiding the cursor and/or
+// entering the alt screen; this restore must grow to match exactly that
+// when it does, and no more in the meantime.
 term_restore_c :: proc "c" () {
 	if !g_term.raw_active { return }
 	posix.tcsetattr(g_term.fd, .TCSAFLUSH, &g_term.saved)
-	// leave alt screen, show cursor
-	seq := "\e[?1049l\e[?25h"
-	posix.write(g_term.fd, raw_data(seq), len(seq))
 	g_term.raw_active = false
 }
 

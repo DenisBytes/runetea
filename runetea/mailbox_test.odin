@@ -23,7 +23,17 @@ test_mailbox_no_loss_under_4_producers :: proc(t: ^testing.T) {
 		for j in 0 ..< PER { prods[i].vals[j] = i * PER + j }
 		th := thread.create(proc(th: ^thread.Thread) {
 			p := cast(^Prod)th.data
-			for j in 0 ..< PER { _ = mailbox_send(p.m, p.vals[j]) }
+			for j in 0 ..< PER {
+				// This test's cap (4096) comfortably exceeds N_PROD*PER (1000)
+				// total sends, so Full is not expected; retry anyway rather
+				// than assume, and bail on Closed like any well-behaved
+				// producer must (see Mailbox_Send_Result's doc comment).
+				for {
+					r := mailbox_send(p.m, p.vals[j])
+					if r == .Ok || r == .Closed { break }
+					thread.yield()
+				}
+			}
 		})
 		th.data = &prods[i]
 		ts[i] = th
@@ -48,9 +58,9 @@ test_mailbox_reports_full :: proc(t: ^testing.T) {
 	m: Mailbox
 	testing.expect_value(t, mailbox_init(&m, 2), nil)
 	defer mailbox_destroy(&m)
-	testing.expect(t, mailbox_send(&m, 1), "first send should succeed")
-	testing.expect(t, mailbox_send(&m, 2), "second send should succeed")
-	testing.expect(t, !mailbox_send(&m, 3), "third send should report full")
+	testing.expect_value(t, mailbox_send(&m, 1), Mailbox_Send_Result.Ok)
+	testing.expect_value(t, mailbox_send(&m, 2), Mailbox_Send_Result.Ok)
+	testing.expect_value(t, mailbox_send(&m, 3), Mailbox_Send_Result.Full)
 }
 
 @(test)
@@ -77,7 +87,7 @@ test_mailbox_try_recv_keeps_semaphore_in_sync :: proc(t: ^testing.T) {
 	testing.expect_value(t, mailbox_init(&m, 4), nil)
 	defer mailbox_destroy(&m)
 
-	testing.expect(t, mailbox_send(&m, 111), "initial send should succeed")
+	testing.expect_value(t, mailbox_send(&m, 111), Mailbox_Send_Result.Ok)
 
 	msg, ok := mailbox_try_recv(&m)
 	testing.expect(t, ok, "try_recv should drain the buffered message")
@@ -92,7 +102,8 @@ test_mailbox_try_recv_keeps_semaphore_in_sync :: proc(t: ^testing.T) {
 	th := thread.create(proc(th: ^thread.Thread) {
 		d := cast(^Delayed_Send)th.data
 		time.sleep(50 * time.Millisecond)
-		_ = mailbox_send(d.m, d.val)
+		r := mailbox_send(d.m, d.val)
+		assert(r == .Ok, "delayed send has ample room and an open mailbox; must not fail")
 	})
 	th.data = &ds
 	thread.start(th)

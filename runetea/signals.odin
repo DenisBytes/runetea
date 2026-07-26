@@ -42,7 +42,9 @@ Signal_Watcher :: struct {
 	stop:    bool,
 
 	// The watcher's own OS thread handle, captured by the watcher itself as
-	// the very first thing it does and published through `ready`. Every
+	// (almost) the first thing it does -- right after installing its own
+	// per-thread crash-handler altstack, see FIX 2's comment in the thread
+	// body below -- and published through `ready`. Every
 	// wakeup aimed at this watcher -- signal_watcher_stop and this package's
 	// own tests -- targets this handle directly with pthread_kill. See
 	// signal_watcher_stop's doc comment for why that is load-bearing, not a
@@ -75,6 +77,31 @@ Signal_Watcher :: struct {
 // published it through sw.native, so that by the time this call returns,
 // signal_watcher_stop (or anything else) can safely target that thread.
 //
+// Delivers `msg` to `m`, retrying on a transient Full and giving up on a
+// terminal Closed (FIX 1, final fix-wave report). Used for both SIGWINCH and
+// SIGINT/SIGTERM below -- a dropped message is not acceptable for either:
+// silently discarding a resize means a repaint the user is actively looking
+// at (they just resized the window) never happens, and silently discarding
+// an Interrupt_Msg is worse, since it can swallow the user's own Ctrl+C or
+// an operator's kill(1)/systemd stop with no visible effect at all. The
+// watcher thread runs sigwait in an ordinary loop, not a signal handler, so
+// blocking here briefly to retry carries none of async-signal-safety's
+// restrictions -- unlike crash_handler in guard.odin, which must never do
+// this. Retrying is bounded only by the mailbox eventually closing: run()'s
+// main loop is the sole consumer and keeps draining concurrently, so a
+// Full here is expected to clear on its own; Closed means run() has already
+// torn down and nothing sent from here on could ever be received anyway.
+@(private = "file")
+send_or_retry :: proc(m: ^Mailbox, msg: any) {
+	for {
+		switch mailbox_send(m, msg) {
+		case .Ok:     return
+		case .Closed: return
+		case .Full:   thread.yield()
+		}
+	}
+}
+
 // Clear this mask before spawning a child process, or $EDITOR inherits it.
 signal_watcher_start :: proc(sw: ^Signal_Watcher, m: ^Mailbox, tty: posix.FD) {
 	sw.mailbox = m
@@ -96,11 +123,20 @@ signal_watcher_start :: proc(sw: ^Signal_Watcher, m: ^Mailbox, tty: posix.FD) {
 	sw.thread = thread.create(proc(th: ^thread.Thread) {
 		sw := cast(^Signal_Watcher)th.data
 
-		// Publish our own handle before anything else. A signal sent to it
-		// while it is blocked (inherited from the creating thread above)
-		// simply queues as pending on this specific thread -- correctness
-		// does not depend on having reached sigwait yet, only on `ready`
-		// being posted before a caller ever reads sw.native.
+		// Per-thread altstack (FIX 2, final fix-wave report), installed
+		// before anything else on this thread: sigaltstack only takes
+		// effect on the CALLING thread, so whatever install_crash_handlers
+		// call happened on the thread that called signal_watcher_start
+		// covers that thread only, not this brand-new one. Without this,
+		// a stack-overflow SIGSEGV on the watcher thread re-faults on its
+		// own exhausted stack with no altstack to catch it.
+		install_crash_handlers()
+
+		// Publish our own handle next. A signal sent to it while it is
+		// blocked (inherited from the creating thread above) simply queues
+		// as pending on this specific thread -- correctness does not
+		// depend on having reached sigwait yet, only on `ready` being
+		// posted before a caller ever reads sw.native.
 		sw.native = posix.pthread_self()
 		sync.sema_post(&sw.ready)
 
@@ -119,9 +155,9 @@ signal_watcher_start :: proc(sw: ^Signal_Watcher, m: ^Mailbox, tty: posix.FD) {
 			case SIGWINCH:
 				w, h, ok := term_size(sw.tty)
 				if !ok { w, h = 0, 0 }
-				_ = mailbox_send(sw.mailbox, box(Window_Size_Msg{w = w, h = h}, context.allocator))
+				send_or_retry(sw.mailbox, box(Window_Size_Msg{w = w, h = h}, context.allocator))
 			case .SIGINT, .SIGTERM:
-				_ = mailbox_send(sw.mailbox, box(Interrupt_Msg{}, context.allocator))
+				send_or_retry(sw.mailbox, box(Interrupt_Msg{}, context.allocator))
 			case:
 				// SIG_WAKE (signal_watcher_stop's nudge, handled by the loop
 				// condition re-checking sw.stop above) or anything else not
