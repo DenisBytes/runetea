@@ -1080,51 +1080,64 @@ cmd_from :: proc(fn: proc(env: rawptr) -> any, env: $E, alloc: mem.Allocator, de
 }
 
 Dispatcher :: struct {
-	pool:    thread.Pool,
-	mailbox: ^Mailbox,
-	tasks:   [dynamic]^Task_Env,
-	mutex:   sync.Mutex,
+	pool:     thread.Pool,
+	mailbox:  ^Mailbox,
+	inflight: sync.Wait_Group,   // counts detached Cmds not yet finished
 }
 
 Task_Env :: struct {
-	cmd:     Cmd,
-	mailbox: ^Mailbox,
+	cmd:      Cmd,
+	mailbox:  ^Mailbox,
+	inflight: ^sync.Wait_Group,  // detached only; nil for pool tasks
 }
 
 dispatcher_init :: proc(d: ^Dispatcher, m: ^Mailbox, workers: int) {
 	d.mailbox = m
-	d.tasks = make([dynamic]^Task_Env)
 	thread.pool_init(&d.pool, context.allocator, max(workers, 1))
 	thread.pool_start(&d.pool)
 }
 
+// pool_finish/pool_destroy genuinely join every pool worker. But a detached
+// Cmd runs on a self_cleanup thread that core:thread explicitly FORBIDS
+// joining, and is tracked nowhere else. Without inflight, a detached Cmd
+// still running -- or mid mailbox_send -- when this returns lets the caller's
+// next line (typically mailbox_destroy, per its own documented precondition)
+// free the mailbox out from under a live producer: use-after-free on its
+// buffer and mutex. Task 10's run() defers exactly that pair.
 dispatcher_destroy :: proc(d: ^Dispatcher) {
 	thread.pool_finish(&d.pool)
 	thread.pool_destroy(&d.pool)
-	sync.mutex_lock(&d.mutex)
-	for te in d.tasks { free(te) }
-	delete(d.tasks)
-	sync.mutex_unlock(&d.mutex)
+	sync.wait_group_wait(&d.inflight)
 }
 
 @(private="file")
 run_cmd_task :: proc(task: thread.Task) {
 	te := cast(^Task_Env)task.data
-	if te.cmd.procedure == nil { return }
-	msg := te.cmd.procedure(te.cmd.env)
-	if te.cmd.env != nil { free(te.cmd.env, te.cmd.allocator) }
-	if msg != nil { _ = mailbox_send(te.mailbox, msg) }
+	if te.cmd.procedure != nil {
+		msg := te.cmd.procedure(te.cmd.env)
+		if te.cmd.env != nil { free(te.cmd.env, te.cmd.allocator) }
+		if msg != nil { _ = mailbox_send(te.mailbox, msg) }
+	}
+	// Freed per-task, not accumulated in the Dispatcher: a Dispatcher lives
+	// for a whole TUI session, so retaining every completed Task_Env until
+	// shutdown grows without bound.
+	free(te)
 }
 
 @(private="file")
 run_cmd_detached :: proc(data: rawptr) {
 	te := cast(^Task_Env)data
+	inflight := te.inflight        // copy before te is freed
 	if te.cmd.procedure != nil {
 		msg := te.cmd.procedure(te.cmd.env)
 		if te.cmd.env != nil { free(te.cmd.env, te.cmd.allocator) }
 		if msg != nil { _ = mailbox_send(te.mailbox, msg) }
 	}
 	free(te)
+	// MUST be the last action: dispatcher_destroy treats this as proof the
+	// Cmd is entirely done -- including its mailbox_send -- and unblocks a
+	// caller that may destroy the mailbox on its very next line.
+	sync.wait_group_done(inflight)
 }
 
 dispatch :: proc(d: ^Dispatcher, c: Cmd) {
@@ -1132,8 +1145,14 @@ dispatch :: proc(d: ^Dispatcher, c: Cmd) {
 
 	if c.detached {
 		// Elastic overflow: its own thread, self-cleaning, never pool-bound.
+		//
+		// wait_group_add MUST precede the spawn. The detached thread can run
+		// to completion (including its wait_group_done) before this call even
+		// returns; add-after-spawn races dispatcher_destroy into seeing a zero
+		// count that was never incremented for this Cmd.
+		sync.wait_group_add(&d.inflight, 1)
 		te := new(Task_Env)
-		te^ = Task_Env{cmd = c, mailbox = d.mailbox}
+		te^ = Task_Env{cmd = c, mailbox = d.mailbox, inflight = &d.inflight}
 		// init_context MUST be passed. Left at its nil default,
 		// _select_context_for_thread (core/thread/thread.odin:534) hands the new
 		// OS thread runtime.default_context() -- a DIFFERENT context.allocator
@@ -1147,9 +1166,6 @@ dispatch :: proc(d: ^Dispatcher, c: Cmd) {
 
 	te := new(Task_Env)
 	te^ = Task_Env{cmd = c, mailbox = d.mailbox}
-	sync.mutex_lock(&d.mutex)
-	append(&d.tasks, te)
-	sync.mutex_unlock(&d.mutex)
 	thread.pool_add_task(&d.pool, context.allocator, run_cmd_task, te)
 }
 ```
