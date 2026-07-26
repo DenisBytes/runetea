@@ -2534,7 +2534,14 @@ against the kill criteria and states go/no-go for T1."
 
 `virtual.arena_destroy`, `arena.total_used`, `thread.pool_init(pool, allocator, count)`, `strings.split_lines`, and `sync.atomic_load`/`atomic_store` were all confirmed present with the signatures used here.
 
-**Residual risk:** `nbio` was verified on a pipe, not a TTY. Task 6 Step 5 exercises it on a real terminal — that is the first genuinely new information the spike produces.
+**Residual risk — RESOLVED 2026-07-26.** `nbio` was verified on a pipe when this
+plan was written; Task 6 confirmed it on a real character device. `tools/ttycheck`
+opens a genuine pty pair (`posix_openpt`/`grantpt`/`unlockpt`/`ptsname`),
+associates the SLAVE with nbio, and reads bytes written into the master —
+verified with a negative control (skipping raw mode yields a timeout, not a
+false positive). So on Linux/io_uring the answer is YES: nbio hosts a TTY, and
+the platform layer can be built on it rather than on a hand-rolled poll loop.
+Darwin/BSD remain unverified — see §13.4.
 
 ---
 
