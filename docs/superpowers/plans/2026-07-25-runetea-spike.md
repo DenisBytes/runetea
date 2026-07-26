@@ -1134,7 +1134,14 @@ dispatch :: proc(d: ^Dispatcher, c: Cmd) {
 		// Elastic overflow: its own thread, self-cleaning, never pool-bound.
 		te := new(Task_Env)
 		te^ = Task_Env{cmd = c, mailbox = d.mailbox}
-		thread.create_and_start_with_data(rawptr(te), run_cmd_detached, self_cleanup = true)
+		// init_context MUST be passed. Left at its nil default,
+		// _select_context_for_thread (core/thread/thread.odin:534) hands the new
+		// OS thread runtime.default_context() -- a DIFFERENT context.allocator
+		// than the one that allocated te. Freeing te on the other side then
+		// mismatches allocators and SIGSEGVs inside libc free(). The pool path
+		// does not hit this because pool_do_work sets context.allocator =
+		// task.allocator explicitly (thread_pool.odin:363).
+		thread.create_and_start_with_data(rawptr(te), run_cmd_detached, init_context = context, self_cleanup = true)
 		return
 	}
 
@@ -1504,6 +1511,10 @@ signal_watcher_start :: proc(sw: ^Signal_Watcher, m: ^Mailbox, tty: posix.FD) {
 	posix.sigaddset(&set, SIGWINCH)
 	posix.pthread_sigmask(.BLOCK, &set, nil)   // Sig.BLOCK, not .SIG_BLOCK
 
+	// init_context for the same reason as Task 5's detached dispatch: without
+	// it the watcher thread runs under runtime.default_context(), so the
+	// messages it boxes below come from a different allocator than the main
+	// loop's. See core/thread/thread.odin:534.
 	sw.thread = thread.create(proc(th: ^thread.Thread) {
 		sw := cast(^Signal_Watcher)th.data
 		set: posix.sigset_t
@@ -1529,6 +1540,7 @@ signal_watcher_start :: proc(sw: ^Signal_Watcher, m: ^Mailbox, tty: posix.FD) {
 		}
 	})
 	sw.thread.data = sw
+	sw.thread.init_context = context
 	thread.start(sw.thread)
 }
 
