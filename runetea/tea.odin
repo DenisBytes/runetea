@@ -76,6 +76,44 @@ run :: proc(p: ^Program($T), src: ^Input_Source, out: ^strings.Builder, flush_fd
 	}
 	defer mailbox_destroy(&mbox)
 
+	// Signal_Watcher MUST start before any other thread this function
+	// creates (the Dispatcher's pool below, and the reader thread further
+	// down): signal_watcher_start installs the blocked-signal mask on the
+	// CALLING thread, and a thread created before that mask exists does NOT
+	// inherit it -- it keeps the OS default disposition for SIGINT/SIGTERM
+	// and stays killable regardless of whether a watcher is running
+	// elsewhere (signals.odin's own doc comment on signal_watcher_start
+	// documents the empirical proof: one pre-existing unblocked thread was
+	// enough to kill the process 5/5 times via SIGINT's default action even
+	// with a correctly-blocked watcher present). Without this, run()'s
+	// stated premise -- "returns an error rather than dying" -- does not
+	// hold for an EXTERNALLY delivered SIGINT (kill -INT, a supervisor,
+	// another shell): term_enter_raw only clears ISIG, so a *terminal*-
+	// generated Ctrl+C arrives as a raw 0x03 byte through input_read and
+	// never touches this at all, but an external signal hits the OS
+	// default disposition directly and kills the process outright, no
+	// defers run, and the terminal is left raw with the alt screen active.
+	//
+	// Skipped when flush_fd < 0 (no real terminal -- the golden harness and
+	// unit tests over Bytes_Source): there is nothing to protect and no
+	// meaningful external-SIGINT target in that path, and starting a
+	// watcher anyway would block SIGINT/SIGTERM/SIGWINCH/SIGUSR2 on the
+	// CALLING thread for the rest of its life. Under odin test's
+	// ODIN_TEST_THREADS=1 that thread is REUSED across every sequential
+	// test in the run, so the mask would leak into unrelated tests -- the
+	// exact cross-test pollution signals.odin's own SIG_WAKE-vs-SIGUSR1
+	// comment already goes out of its way to avoid.
+	sw: Signal_Watcher
+	if flush_fd >= 0 { signal_watcher_start(&sw, &mbox, flush_fd) }
+	// signal_watcher_stop no-ops on a never-started watcher (sw.running is
+	// false in its zero value), so this is safe unconditionally. It must
+	// run before mailbox_destroy -- the watcher is a mailbox producer, and
+	// mailbox_destroy's precondition requires every producer stopped and
+	// joined first -- which is why this defer is declared here, ahead of
+	// dispatcher_init: LIFO means it fires after dispatcher_destroy but
+	// before mailbox_destroy, exactly where it belongs.
+	defer signal_watcher_stop(&sw)
+
 	disp: Dispatcher
 	dispatcher_init(&disp, &mbox, 4)
 	defer dispatcher_destroy(&disp)
