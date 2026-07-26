@@ -150,6 +150,30 @@ treatment: `View.OnMouse func(MouseMsg) Cmd` (`tea.go:126`) and
 
 ## 6. Concurrency and the event loop
 
+**DECISION REVERSED 2026-07-26 — see `docs/superpowers/nbio-decision.md`.**
+The bet below resolved *true* and the decision is still *no*. nbio can host the
+loop (proven: pty-driven end-to-end, `wake_up` verified three ways with a
+negative control, no conflict with the pool or signal watcher). But:
+
+- The only payoff is Darwin/BSD arriving free from upstream, and that is exactly
+  as unverified now as before — including the specific named landmine
+  (`ultraviolet/poll_bsd.go`: "kqueue returns instantly when polling /dev/tty").
+- On Linux, the only platform verifiable here, it is a net loss: +279 LOC added
+  against ~161 removable, and *more* subtle where it matters most. nbio's
+  single-threaded callback model reintroduces the paste-overflow deadlock class
+  fixed in T0, and the two-thread fix does not port — yielding on the only
+  thread that could drain the mailbox is a self-deadlock. It needs a backlog
+  state machine instead.
+
+What ships is `loop.odin`'s `Fd_Source`: `posix.poll` + blocking `read` on a
+dedicated thread + a self-pipe wake + EINTR retry. `run_nbio` stays in-tree,
+tested and green, as a reference implementation for whoever gets Darwin/BSD
+hardware. A narrower nbio use — **timers only** (`Tick`/`Every`, the frame
+ticker) — carries none of this risk, since timers are not tty-specific, and
+remains recommended.
+
+The original claim, kept for context:
+
 **The nbio event loop *is* RuneTea's event loop.**
 
 ```
