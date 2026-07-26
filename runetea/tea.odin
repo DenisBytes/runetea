@@ -27,6 +27,18 @@ Program :: struct($T: typeid) {
 	view:     proc(model: T, alloc: mem.Allocator) -> string,
 	init_cmd: Cmd,
 	quit:     bool,
+	// Which side of each legacy C0 collision this program wants (see
+	// Legacy_Key in input.odin). The zero value is the sane default, so no
+	// existing program has to say anything. Bubble Tea does NOT expose this --
+	// the flags live one layer below it, in ultraviolet -- so this is a
+	// deliberate addition, not a port artefact.
+	//
+	// Read by the input reader (a separate thread in run(), the loop thread in
+	// run_nbio()) and copied into its context before that thread starts, so it
+	// is write-once-before-run, never mutated while a run is in flight.
+	// program_init deliberately leaves it alone: set it on either side of the
+	// program_init call and both work.
+	legacy:   Legacy_Key_Encoding,
 }
 
 // init_cmd is Bubble Tea's `Init() Cmd`: the command fired once before the
@@ -196,7 +208,7 @@ run :: proc(p: ^Program($T), src: ^Input_Source, out: ^strings.Builder, flush_fd
 	//
 	// The spike reads on a thread rather than through nbio because the loop
 	// still owns rendering; Task 6's nbio path replaces this reader in T1.
-	rd := Reader_Ctx{src = src, mailbox = &rc.mbox}
+	rd := Reader_Ctx{src = src, mailbox = &rc.mbox, legacy = p.legacy}
 	reader := thread.create(reader_thread)
 	reader.data = &rd
 	reader.init_context = context
@@ -229,6 +241,10 @@ Reader_Ctx :: struct {
 	src:     ^Input_Source,
 	mailbox: ^Mailbox,
 	stop:    bool,
+	// Copied from Program.legacy before thread.start, and only read after --
+	// the start is the happens-before edge, so this needs no atomics the way
+	// `stop` does.
+	legacy:  Legacy_Key_Encoding,
 }
 
 @(private="file")
@@ -259,7 +275,7 @@ reader_thread :: proc(th: ^thread.Thread) {
 		append(&pending, ..buf[:n])
 
 		clear(&keys)
-		consumed := decode_keys(pending[:], &keys)
+		consumed := decode_keys(pending[:], &keys, rd.legacy)
 		if consumed > 0 { remove_range(&pending, 0, consumed) }
 
 		for k in keys {

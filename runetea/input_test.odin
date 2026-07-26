@@ -370,24 +370,208 @@ test_esc_o_ambiguity :: proc(t: ^testing.T) {
 }
 
 // decode_c0 is the single place the C0 normalisation policy lives. These
-// assertions pin the CURRENT policy (see decode_c0's doc comment for the
-// alternatives): named keys win and carry no Ctrl flag, so Ctrl+I is
-// indistinguishable from Tab and Ctrl+M from Enter, and 0x08 is Ctrl+h rather
-// than Backspace. If any of these change, that is a deliberate policy change
-// and this test is the place it must be re-decided.
+// assertions pin the DEFAULT policy -- the `{}` flag set, which by construction
+// equals ultraviolet's defaults (see Legacy_Key). Named keys win and carry no
+// Ctrl flag, so Ctrl+I is indistinguishable from Tab and Ctrl+M from Enter.
+// Choosing the other side of any of these collisions is what Legacy_Key_Encoding
+// is for; test_legacy_key_encoding_flags below is where the opt-outs are pinned.
 @(test)
 test_c0_policy :: proc(t: ^testing.T) {
-	testing.expect_value(t, decode_c0('\r'), Key_Msg{code = .Enter})
-	testing.expect_value(t, decode_c0('\n'), Key_Msg{code = .Enter})
-	testing.expect_value(t, decode_c0(0x0d), Key_Msg{code = .Enter})   // ctrl+m == enter
-	testing.expect_value(t, decode_c0('\t'), Key_Msg{code = .Tab})
-	testing.expect_value(t, decode_c0(0x09), Key_Msg{code = .Tab})     // ctrl+i == tab
-	testing.expect_value(t, decode_c0(' '),  Key_Msg{code = .Space, r = ' '})
-	testing.expect_value(t, decode_c0(0x7f), Key_Msg{code = .Backspace})
-	// 0x08 is Ctrl+h, NOT Backspace -- the classic ambiguity, left as-is.
-	testing.expect_value(t, decode_c0(0x08), Key_Msg{code = .Rune, r = 'h', mods = {.Ctrl}})
-	testing.expect_value(t, decode_c0(0x03), Key_Msg{code = .Rune, r = 'c', mods = {.Ctrl}})
-	testing.expect_value(t, decode_c0(0x1a), Key_Msg{code = .Rune, r = 'z', mods = {.Ctrl}})
+	testing.expect_value(t, decode_c0('\r', {}), Key_Msg{code = .Enter})
+	testing.expect_value(t, decode_c0(0x0d, {}), Key_Msg{code = .Enter})   // ctrl+m == enter
+	// LF is Ctrl+J, NOT a second spelling of Enter: term.odin clears ICRNL, so
+	// a real Enter arrives as 0x0D and a 0x0A that shows up genuinely is Ctrl+J.
+	// This used to report Enter, which silently stole Ctrl+J from every app.
+	testing.expect_value(t, decode_c0('\n', {}), Key_Msg{code = .Rune, r = 'j', mods = {.Ctrl}})
+	// NUL is Ctrl+Space (r left empty: Ctrl+Space produces no text). This used
+	// to fall through the b+0x60 arithmetic onto '`', which is neither '@'
+	// (0x40) nor ' ' (0x20) -- just a wrong rune.
+	testing.expect_value(t, decode_c0(0x00, {}), Key_Msg{code = .Space, mods = {.Ctrl}})
+	testing.expect_value(t, decode_c0('\t', {}), Key_Msg{code = .Tab})
+	testing.expect_value(t, decode_c0(0x09, {}), Key_Msg{code = .Tab})     // ctrl+i == tab
+	testing.expect_value(t, decode_c0(0x1b, {}), Key_Msg{code = .Escape})  // ctrl+[ == escape
+	testing.expect_value(t, decode_c0(' ',  {}), Key_Msg{code = .Space, r = ' '})
+	testing.expect_value(t, decode_c0(0x7f, {}), Key_Msg{code = .Backspace})
+	// 0x08 is Ctrl+h, NOT Backspace, unless .Backspace says otherwise.
+	testing.expect_value(t, decode_c0(0x08, {}), Key_Msg{code = .Rune, r = 'h', mods = {.Ctrl}})
+	testing.expect_value(t, decode_c0(0x03, {}), Key_Msg{code = .Rune, r = 'c', mods = {.Ctrl}})
+	testing.expect_value(t, decode_c0(0x1a, {}), Key_Msg{code = .Rune, r = 'z', mods = {.Ctrl}})
+	// FS..US take the 0x40 offset, not the 0x60 letter offset -- they are
+	// Ctrl+punctuation, not Ctrl+letter. The letter offset used to land these
+	// on '|' '}' '~' and DEL, none of which the user pressed. Ctrl+\ is the
+	// one that bites: it is a real, commonly-bound key.
+	testing.expect_value(t, decode_c0(0x1c, {}), Key_Msg{code = .Rune, r = '\\', mods = {.Ctrl}})
+	testing.expect_value(t, decode_c0(0x1d, {}), Key_Msg{code = .Rune, r = ']',  mods = {.Ctrl}})
+	testing.expect_value(t, decode_c0(0x1e, {}), Key_Msg{code = .Rune, r = '^',  mods = {.Ctrl}})
+	testing.expect_value(t, decode_c0(0x1f, {}), Key_Msg{code = .Rune, r = '_',  mods = {.Ctrl}})
+	// The boundary either side of the 0x1B hole: 0x1A keeps the letter offset
+	// (asserted above as 'z'), 0x1C switches to the punctuation offset. An
+	// off-by-one in the range check would break exactly one of these two.
+	testing.expect_value(t, decode_c0(0x1b, {}), Key_Msg{code = .Escape})
+}
+
+// ---------------------------------------------------------------------------
+// T1-I: Legacy_Key_Encoding.
+// ---------------------------------------------------------------------------
+
+// Every flag, both ways, through the FULL decoder (not just decode_c0) so the
+// plumbing is covered too, and with `consumed` asserted so a flag cannot
+// accidentally change how many bytes a sequence eats.
+//
+// The `clear` column doubles as the proof that the zero value is the sane
+// default: it is the same table that would be written for a decoder with no
+// flags at all.
+@(test)
+test_legacy_key_encoding_flags :: proc(t: ^testing.T) {
+	Case :: struct {
+		name:      string,
+		flag:      Legacy_Key,
+		seq:       string,
+		off, on:   Key_Msg,
+	}
+	cases := [?]Case{
+		{"ctrl+at",    .Ctrl_At,            "\x00",
+			{code = .Space, mods = {.Ctrl}},  {code = .Rune, r = '@', mods = {.Ctrl}}},
+		{"ctrl+i",     .Ctrl_I,             "\t",
+			{code = .Tab},                    {code = .Rune, r = 'i', mods = {.Ctrl}}},
+		{"ctrl+m",     .Ctrl_M,             "\r",
+			{code = .Enter},                  {code = .Rune, r = 'm', mods = {.Ctrl}}},
+		{"ctrl+[",     .Ctrl_Open_Bracket,  "\e",
+			{code = .Escape},                 {code = .Rune, r = '[', mods = {.Ctrl}}},
+		// One flag, two bytes: with it set the Backspace KEY is 0x08, which
+		// frees 0x7F to be Delete. See decode_c0 for why this deviates from
+		// ultraviolet, which leaves 0x08 as ctrl+h even with the flag on.
+		{"backspace/BS",  .Backspace, "\x08",
+			{code = .Rune, r = 'h', mods = {.Ctrl}}, {code = .Backspace}},
+		{"backspace/DEL", .Backspace, "\x7f",
+			{code = .Backspace},              {code = .Delete}},
+		{"find",       .Find,   "\e[1~",
+			{code = .Home},                   {code = .Find}},
+		{"select",     .Select, "\e[4~",
+			{code = .End},                    {code = .Select}},
+		// The flags reach the modified forms too, not just the bare ones.
+		{"find+ctrl",  .Find,   "\e[1;5~",
+			{code = .Home, mods = {.Ctrl}},   {code = .Find, mods = {.Ctrl}}},
+		{"select+alt", .Select, "\e[4;3~",
+			{code = .End, mods = {.Alt}},     {code = .Select, mods = {.Alt}}},
+	}
+
+	out := make([dynamic]Key_Msg); defer delete(out)
+	for c in cases {
+		for on in ([?]bool{false, true}) {
+			legacy: Legacy_Key_Encoding
+			if on { legacy = {c.flag} }
+			want := c.on if on else c.off
+
+			clear(&out)
+			n := decode_keys(transmute([]u8)c.seq, &out, legacy)
+			testing.expectf(t, n == len(c.seq), "%s (set=%v): consumed %d, want %d",
+				c.name, on, n, len(c.seq))
+			if !testing.expectf(t, len(out) == 1, "%s (set=%v): emitted %d keys, want 1",
+				c.name, on, len(out)) { continue }
+			testing.expectf(t, out[0] == want, "%s (set=%v): got %v, want %v",
+				c.name, on, out[0], want)
+		}
+	}
+
+	// A flag must move ONLY its own byte. Turn every flag on at once and check
+	// that the bytes nobody claimed are untouched -- this is what would catch a
+	// stray fallthrough between the switch arms.
+	all := Legacy_Key_Encoding{.Ctrl_At, .Ctrl_I, .Ctrl_M, .Ctrl_Open_Bracket,
+	                           .Backspace, .Find, .Select}
+	testing.expect_value(t, decode_c0(0x03, all), Key_Msg{code = .Rune, r = 'c', mods = {.Ctrl}})
+	testing.expect_value(t, decode_c0('\n', all), Key_Msg{code = .Rune, r = 'j', mods = {.Ctrl}})
+	testing.expect_value(t, decode_c0(' ',  all), Key_Msg{code = .Space, r = ' '})
+
+	clear(&out)
+	n := decode_keys(transmute([]u8)string("\e[2~\e[3~\e[7~\e[8~"), &out, all)
+	testing.expect_value(t, n, 16)
+	testing.expect_value(t, len(out), 4)
+	testing.expect_value(t, out[0], Key_Msg{code = .Insert})
+	testing.expect_value(t, out[1], Key_Msg{code = .Delete})
+	// 7~/8~ are rxvt's Home/End and are NOT the Find/Select keys: ultraviolet
+	// leaves them unconditional, and so do we.
+	testing.expect_value(t, out[2], Key_Msg{code = .Home})
+	testing.expect_value(t, out[3], Key_Msg{code = .End})
+}
+
+// THE TRAP. Ctrl_Open_Bracket must rename a RESOLVED Escape and nothing else.
+// ESC is intercepted above the C0 gate because it introduces sequences, so a
+// naive implementation that returns ctrl+[ the moment it sees 0x1b destroys
+// every arrow key, every function key, and Alt+<anything> at once -- and each
+// of those failures looks like an unrelated bug at the call site.
+//
+// Every assertion below is run with the flag SET. Only the two lone-Escape
+// resolutions may change shape.
+@(test)
+test_ctrl_open_bracket_leaves_sequences_alone :: proc(t: ^testing.T) {
+	L := Legacy_Key_Encoding{.Ctrl_Open_Bracket}
+	ctrl_bracket := Key_Msg{code = .Rune, r = '[', mods = {.Ctrl}}
+	out := make([dynamic]Key_Msg); defer delete(out)
+
+	// Sequences: byte-identical results to the flag-clear decoder.
+	Seq :: struct { seq: string, want: Key_Msg }
+	for c in ([?]Seq{
+		{"\e[A",     {code = .Up}},
+		{"\eOP",     {code = .F1}},
+		{"\e[1;5A",  {code = .Up, mods = {.Ctrl}}},
+		{"\e[3~",    {code = .Delete}},
+		{"\eOA",     {code = .Up}},
+		{"\ea",      {code = .Rune, r = 'a', mods = {.Alt}}},   // Alt+a, not ctrl+[ then 'a'
+		{"\e[",      {}},                                       // held back, emits nothing
+	}) {
+		clear(&out)
+		n := decode_keys(transmute([]u8)c.seq, &out, L)
+		nwant := len(c.seq)
+		kwant := 1
+		if c.seq == "\e[" { nwant, kwant = 0, 0 }   // the hold-back case
+		testing.expectf(t, n == nwant, "%q: consumed %d, want %d", c.seq, n, nwant)
+		if !testing.expectf(t, len(out) == kwant, "%q: emitted %d keys, want %d (%v)",
+			c.seq, len(out), kwant, out[:]) { continue }
+		if kwant == 1 {
+			testing.expectf(t, out[0] == c.want, "%q: got %v, want %v", c.seq, out[0], c.want)
+		}
+	}
+
+	// The two places an Escape is actually RESOLVED -- these, and only these,
+	// change shape.
+	clear(&out)
+	n := decode_keys([]u8{0x1b}, &out, L)
+	testing.expect_value(t, n, 1)
+	testing.expect_value(t, len(out), 1)
+	testing.expect_value(t, out[0], ctrl_bracket)
+
+	clear(&out)
+	n = decode_keys([]u8{0x1b, 0x1b}, &out, L)
+	testing.expect_value(t, n, 2)
+	testing.expect_value(t, len(out), 2)
+	testing.expect_value(t, out[0], ctrl_bracket)
+	testing.expect_value(t, out[1], ctrl_bracket)
+
+	// A complete sequence followed by a lone trailing ESC: the sequence must
+	// still decode normally, and only the tail becomes ctrl+[.
+	clear(&out)
+	n = decode_keys(transmute([]u8)string("\e[A\e"), &out, L)
+	testing.expect_value(t, n, 4)
+	testing.expect_value(t, len(out), 2)
+	testing.expect_value(t, out[0], Key_Msg{code = .Up})
+	testing.expect_value(t, out[1], ctrl_bracket)
+
+	// And the hold-back contract itself is untouched: every proper prefix of a
+	// real sequence still holds back completely, with the flag set. This is the
+	// same property test_split_at_every_byte_boundary runs with the flag clear.
+	for seq in ([?]string{"\e[1;5A", "\e[15~", "\eO2P"}) {
+		b := transmute([]u8)seq
+		for k in 2 ..< len(b) {
+			// "\eO" alone is the documented Alt+O resolution, not a hold-back
+			// (see decode_keys' doc comment); the flag does not touch it either.
+			if k == 2 && b[1] == 'O' { continue }
+			clear(&out)
+			n = decode_keys(b[:k], &out, L)
+			testing.expectf(t, n == 0 && len(out) == 0,
+				"%q[:%d]: got n=%d %v, want a complete hold-back", seq, k, n, out[:])
+		}
+	}
 }
 
 // A modifier parameter out of range must not be forced into a modifier set:

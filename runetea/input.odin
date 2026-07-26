@@ -16,7 +16,51 @@ Key_Code :: enum u8 {
 	Up, Down, Right, Left,
 	Home, End, Page_Up, Page_Down, Insert, Delete,
 	F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12,
+	// VT220 keys that modern keyboards dropped. Only ever produced with the
+	// matching Legacy_Key flag set; by default CSI 1~ / CSI 4~ are Home/End.
+	// APPENDED, per the rule above -- putting them next to Home/End where they
+	// "belong" would shift the F-key block and silently mis-decode every
+	// function key.
+	Find, Select,
 }
+
+// The legacy-encoding collisions, one flag per collision.
+//
+// Terminals collapse distinct keypresses onto the same byte: Ctrl+I and Tab are
+// both 0x09, Ctrl+M and Enter are both 0x0D, Ctrl+[ and Escape are both 0x1B.
+// No decoder can separate them from the byte alone -- that is what the Kitty
+// keyboard protocol and modifyOtherKeys exist for. What a decoder CAN do is let
+// the application say which side of each collision it wants, which is what this
+// is: ultraviolet's LegacyKeyEncoding (decoder.go), ported.
+//
+// THE ZERO VALUE IS THE SANE DEFAULT. Every flag is an opt-OUT of the modern
+// reading in favour of the historical one, and `{}` reproduces ultraviolet's
+// documented defaults exactly:
+//
+//   flag              clear (default)              set
+//   ----------------- ---------------------------- ----------------------------
+//   Ctrl_At           0x00 -> Ctrl+Space           0x00 -> Ctrl+@
+//   Ctrl_I            0x09 -> Tab                  0x09 -> Ctrl+i
+//   Ctrl_M            0x0D -> Enter                0x0D -> Ctrl+m
+//   Ctrl_Open_Bracket 0x1B -> Escape               0x1B -> Ctrl+[
+//   Backspace         0x08 Ctrl+h, 0x7F Backspace  0x08 Backspace, 0x7F Delete
+//   Find              CSI 1~ -> Home               CSI 1~ -> Find
+//   Select            CSI 4~ -> End                CSI 4~ -> Select
+//
+// Bubble Tea itself does NOT expose these (its whole source has zero references
+// to LegacyKeyEncoding); they live only in ultraviolet, the layer below it.
+// RuneTea surfacing them on Program is a deliberate, cheap improvement over the
+// thing being ported, not an accident of the port.
+Legacy_Key :: enum u8 {
+	Ctrl_At,            // 0x00 -> ctrl+@ instead of ctrl+space
+	Ctrl_I,             // 0x09 -> ctrl+i instead of Tab
+	Ctrl_M,             // 0x0D -> ctrl+m instead of Enter
+	Ctrl_Open_Bracket,  // 0x1B -> ctrl+[ instead of Escape
+	Backspace,          // the Backspace key sends 0x08, not 0x7F
+	Find,               // CSI 1~ -> Find instead of Home
+	Select,             // CSI 4~ -> Select instead of End
+}
+Legacy_Key_Encoding :: bit_set[Legacy_Key; u8]
 
 // Meta is the 4th xterm modifier bit (see xterm_mods). It is NOT the same as
 // Alt on every terminal -- most Unix terminals send ESC-prefixed bytes for Alt
@@ -55,41 +99,85 @@ utf8_lead_len :: proc(b: u8) -> int {
 
 // THE C0 NORMALISATION POLICY, in one place on purpose.
 //
-// Applies to the bytes 0x00-0x20 and 0x7F. Three policies are defensible, and
-// terminals/toolkits differ on which they pick:
+// Applies to the bytes 0x00-0x20 and 0x7F. Named keys win by default and carry
+// no Ctrl flag: Enter, Tab, Space, Escape and Backspace are reported as
+// themselves; every other C0 byte becomes Rune + {.Ctrl}. That is ultraviolet's
+// default table (key_table.go's buildKeysTable, and parseControl's fallback),
+// and it never reports a modifier the user did not press -- an app checking
+// `key.mods == {}` on a real Tab keypress is right to expect an empty set.
 //
-//   (a) Named keys win, and carry no Ctrl flag. Enter, Tab, Space and
-//       Backspace are reported as themselves; every other C0 byte becomes
-//       Rune + {.Ctrl}. Ctrl+I is therefore indistinguishable from Tab, and
-//       Ctrl+M from Enter, because on the wire they ARE the same byte -- no
-//       decoder without the Kitty protocol or modifyOtherKeys can separate
-//       them.
-//   (b) Named keys ALSO carry {.Ctrl} (0x09 -> Tab + {.Ctrl}), so an app that
-//       binds Ctrl+I can at least see the flag. Costs: every `key.mods == {}`
-//       check on Tab/Enter in user code breaks, and the flag is a lie for the
-//       overwhelmingly common case of a real Tab keypress.
-//   (c) 0x08 (BS, Ctrl+H) -> Backspace instead of Rune 'h' + {.Ctrl}, since
-//       some terminals and most serial lines send 0x08 for the Backspace key
-//       where xterm sends 0x7F. Costs: Ctrl+H becomes unbindable, and which
-//       byte Backspace sends is a terminfo (kbs) question this decoder does
-//       not consult.
+// Where a byte is genuinely ambiguous, `legacy` decides -- see Legacy_Key for
+// the full table and for why its zero value is the right default. This proc is
+// the ONLY place those decisions are made, which is the whole reason it exists
+// as a proc rather than as switch arms inlined in decode_keys; ESC is routed
+// back through here (decode_keys resolves an Escape by calling decode_c0(0x1b))
+// so Ctrl_Open_Bracket cannot drift out of sync with the rest.
 //
-// (a) IS WHAT IS IMPLEMENTED, unchanged from the pre-T1-H decoder. It is a
-// deliberate, revisitable choice, not an oversight: it matches xterm's default
-// wire behaviour and Bubble Tea's own default, and it never reports a modifier
-// the user did not press. Changing it means editing this one proc -- that is
-// the whole reason it exists as a proc rather than as switch arms inlined in
-// decode_keys. input_test.odin's test_c0_policy pins the current answer.
-decode_c0 :: proc(b: u8) -> Key_Msg {
+// The b + 'a' - 1 fallback is b + 0x60, ultraviolet's own arithmetic for
+// SOH..SUB (0x01-0x1A): 0x03 -> 'c', 0x0A -> 'j' (LF is Ctrl+J, NOT Enter --
+// only CR is Enter, and term.odin clears ICRNL precisely so Enter still arrives
+// as 0x0D), 0x1A -> 'z'.
+//
+decode_c0 :: proc(b: u8, legacy: Legacy_Key_Encoding) -> Key_Msg {
 	switch b {
-	case '\r', '\n': return Key_Msg{code = .Enter}
-	case '\t':       return Key_Msg{code = .Tab}
-	case ' ':        return Key_Msg{code = .Space, r = ' '}
-	case 0x7f:       return Key_Msg{code = .Backspace}
+	// NUL. Both Ctrl+Space and Ctrl+@ produce it -- the ANSI encoding has one
+	// byte for two keypresses -- and ultraviolet's default names it Ctrl+Space.
+	// (It used to fall through to the arithmetic below, which lands on '`':
+	// neither '@' (0x40) nor ' ' (0x20), just wrong.)
+	case 0x00:
+		if .Ctrl_At in legacy { return Key_Msg{code = .Rune, r = '@', mods = {.Ctrl}} }
+		// No `r = ' '`: r carries the TEXT the keypress produces, and Ctrl+Space
+		// produces none. Mirrors ultraviolet, where plain SP has Text " " and
+		// Ctrl+Space has none.
+		return Key_Msg{code = .Space, mods = {.Ctrl}}
+	// BS. Which byte the Backspace key sends is a terminfo (kbs) question this
+	// decoder does not consult, so it is a flag instead: see Legacy_Key.
+	//
+	// DELIBERATE DEVIATION FROM ULTRAVIOLET, which is self-contradictory here.
+	// Its flagBackspace doc says "the driver will send a BS (0x08) instead of a
+	// DEL (0x7F) when the Backspace key is pressed", but BOTH of its code paths
+	// (key_table.go's `string(byte(ansi.BS)): {Code: 'h', Mod: ModCtrl}` and
+	// decoder.go's parseControl `case ansi.BS`) leave 0x08 as Ctrl+h
+	// unconditionally, and only flip 0x7F from Backspace to Delete. With the
+	// flag set, ultraviolet can therefore never report Backspace AT ALL -- the
+	// two code paths agree with each other and both contradict the flag's stated
+	// purpose. RuneTea implements the coherent reading: with the flag set, 0x08
+	// IS the Backspace key and 0x7F is Delete.
+	case 0x08:
+		if .Backspace in legacy { return Key_Msg{code = .Backspace} }
+		return Key_Msg{code = .Rune, r = 'h', mods = {.Ctrl}}
+	case '\t':
+		if .Ctrl_I in legacy { return Key_Msg{code = .Rune, r = 'i', mods = {.Ctrl}} }
+		return Key_Msg{code = .Tab}
+	case '\r':
+		if .Ctrl_M in legacy { return Key_Msg{code = .Rune, r = 'm', mods = {.Ctrl}} }
+		return Key_Msg{code = .Enter}
+	// ESC only reaches here via decode_keys' escape resolution (the raw byte is
+	// intercepted earlier so it can introduce a sequence) and via direct calls.
+	case 0x1b:
+		if .Ctrl_Open_Bracket in legacy { return Key_Msg{code = .Rune, r = '[', mods = {.Ctrl}} }
+		return Key_Msg{code = .Escape}
+	case ' ':
+		return Key_Msg{code = .Space, r = ' '}
+	case 0x7f:
+		if .Backspace in legacy { return Key_Msg{code = .Delete} }
+		return Key_Msg{code = .Backspace}
 	}
-	// 0x00 lands on '`' (0x00 + 'a' - 1 == 0x60), matching the ctrl+@ /
-	// ctrl+space convention closely enough for a byte nothing generates
-	// deliberately.
+	// The remaining C0 bytes are Ctrl+<key>, but the offset is NOT uniform and
+	// getting that wrong mis-names four real keys.
+	//
+	// SOH..SUB (0x01-0x1A) are Ctrl+a..Ctrl+z: the terminal strips bit 6 from
+	// the LOWERCASE letter, so adding 0x60 back recovers it.
+	//
+	// FS..US (0x1C-0x1F) are Ctrl+\ Ctrl+] Ctrl+^ Ctrl+_ -- punctuation, not
+	// letters. Those live at 0x5C-0x5F, so the offset is 0x40, not 0x60.
+	// Applying the letter offset to them lands on 0x7C-0x7F: '|' '}' '~' and
+	// DEL, none of which is a key the user pressed, and Ctrl+\ in particular is
+	// a real binding (it is SIGQUIT's key on a cooked tty). ESC (0x1B) sits
+	// between the two ranges and is handled by its own arm above.
+	if b >= 0x1c && b <= 0x1f {
+		return Key_Msg{code = .Rune, r = rune(b + 0x40), mods = {.Ctrl}}
+	}
 	return Key_Msg{code = .Rune, r = rune(b + 'a' - 1), mods = {.Ctrl}}
 }
 
@@ -158,12 +246,16 @@ csi_params :: proc(p: []u8) -> (params: [CSI_MAX_PARAMS]int, count: int, ok: boo
 // 9, 10, 16, 22, 27 and 30 are unassigned; 25/26/28/29/31-34 are F13-F20,
 // which Key_Code does not carry, so they report ok = false and get cleanly
 // ignored rather than being folded onto some nearby F-key.
-csi_tilde_code :: proc(param: int) -> (code: Key_Code, ok: bool) {
+csi_tilde_code :: proc(param: int, legacy: Legacy_Key_Encoding) -> (code: Key_Code, ok: bool) {
 	switch param {
-	case 1:  return .Home, true       // "find" on VT220 keyboards
+	case 1:                           // "find" on VT220 keyboards
+		if .Find in legacy { return .Find, true }
+		return .Home, true
 	case 2:  return .Insert, true
 	case 3:  return .Delete, true
-	case 4:  return .End, true        // "select" on VT220 keyboards
+	case 4:                           // "select" on VT220 keyboards
+		if .Select in legacy { return .Select, true }
+		return .End, true
 	case 5:  return .Page_Up, true
 	case 6:  return .Page_Down, true
 	case 7:  return .Home, true       // rxvt/urxvt
@@ -202,13 +294,13 @@ csi_letter_code :: proc(final: u8) -> (code: Key_Code, ok: bool) {
 // ok = false means "complete, but not a key this decoder understands" -- the
 // caller consumes the sequence and emits nothing. It never means "incomplete";
 // incompleteness is decided by the caller before this proc is reached.
-csi_decode :: proc(p: []u8, has_intermed: bool, final: u8) -> (key: Key_Msg, ok: bool) {
+csi_decode :: proc(p: []u8, has_intermed: bool, final: u8, legacy: Legacy_Key_Encoding) -> (key: Key_Msg, ok: bool) {
 	if has_intermed { return {}, false }
 	params, count := csi_params(p) or_return
 
 	if final == '~' {
 		if count == 0 || count > 2 { return {}, false }
-		code := csi_tilde_code(params[0]) or_return
+		code := csi_tilde_code(params[0], legacy) or_return
 		if count == 1 { return Key_Msg{code = code}, true }
 		mods := xterm_mods(params[1]) or_return
 		return Key_Msg{code = code, mods = mods}, true
@@ -349,12 +441,24 @@ ss3_decode :: proc(mod_digits: []u8, gl: u8) -> (key: Key_Msg, ok: bool) {
 // shape from every other uppercase letter would be a trap for anyone writing
 // a key binding.
 //
+// LEGACY FLAGS AND THE ESC PATH (the trap). `legacy` reaches decode_c0 at the
+// C0 gate below and csi_decode for CSI 1~/4~. Ctrl_Open_Bracket is the odd one
+// out: ESC is intercepted HERE, above the C0 gate, because it also introduces
+// sequences. So the flag applies at exactly the two points where an Escape is
+// RESOLVED -- the lone-ESC-at-end-of-buffer case and the double-ESC case, both
+// of which call decode_c0(0x1b, legacy) instead of building a Key_Msg inline,
+// so there is one answer, not three. It must NOT touch the hold-back decisions,
+// the ESC [ / ESC O grammars, or the Alt+key path: where a sequence ends is
+// decided by the BYTES, and renaming a resolved Escape cannot change that.
+// Getting this wrong silently breaks every escape sequence, so
+// test_ctrl_open_bracket_leaves_sequences_alone pins it specifically.
+//
 // A second ESC arriving immediately after the first ("\e\e", e.g. a user
 // double-tapping Escape in a modal/vim-like UI) is likewise not ambiguous:
 // it is treated as a real Escape keypress, and the second ESC byte is left
 // for the next loop iteration to resolve on its own terms -- as a lone
 // trailing Escape, as the start of a new sequence, or as another double-ESC.
-decode_keys :: proc(data: []u8, out: ^[dynamic]Key_Msg) -> (consumed: int) {
+decode_keys :: proc(data: []u8, out: ^[dynamic]Key_Msg, legacy: Legacy_Key_Encoding = {}) -> (consumed: int) {
 	i := 0
 	for i < len(data) {
 		b := data[i]
@@ -365,7 +469,7 @@ decode_keys :: proc(data: []u8, out: ^[dynamic]Key_Msg) -> (consumed: int) {
 				// real Escape or the start of a sequence still in flight. The
 				// spike resolves it as Escape; a timer-based disambiguation is
 				// T1 work (spec §12).
-				append(out, Key_Msg{code = .Escape})
+				append(out, decode_c0(0x1b, legacy))
 				return i + 1
 			}
 			if data[i + 1] == '[' {
@@ -394,7 +498,7 @@ decode_keys :: proc(data: []u8, out: ^[dynamic]Key_Msg) -> (consumed: int) {
 					i += 2
 					continue
 				}
-				if key, ok := csi_decode(data[ps:pe], pe != j, final); ok {
+				if key, ok := csi_decode(data[ps:pe], pe != j, final, legacy); ok {
 					append(out, key)
 				}
 				// Whether decoded or not, the sequence is consumed as ONE unit
@@ -431,7 +535,7 @@ decode_keys :: proc(data: []u8, out: ^[dynamic]Key_Msg) -> (consumed: int) {
 			if data[i + 1] == 0x1b {
 				// Double Escape: resolve the first as a real Escape keypress
 				// and leave the second ESC byte for the next iteration.
-				append(out, Key_Msg{code = .Escape})
+				append(out, decode_c0(0x1b, legacy))
 				i += 1
 				continue
 			}
@@ -446,7 +550,7 @@ decode_keys :: proc(data: []u8, out: ^[dynamic]Key_Msg) -> (consumed: int) {
 
 		// 0x00-0x20 and 0x7F: one policy, one place. See decode_c0.
 		if b <= 0x20 || b == 0x7f {
-			append(out, decode_c0(b))
+			append(out, decode_c0(b, legacy))
 			i += 1
 			continue
 		}

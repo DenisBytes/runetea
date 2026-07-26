@@ -102,6 +102,7 @@ run_nbio :: proc(p: ^Program($T), fd: posix.FD, out: ^strings.Builder, flush_fd:
 
 	rc: Nbio_Read_Ctx
 	rc.mailbox = &mbox
+	rc.legacy  = p.legacy
 	h, aerr := nbio.associate_handle(uintptr(fd))
 	if aerr != nil { return Terminal_Error{detail = "nbio associate_handle failed"} }
 	rc.handle = h
@@ -171,6 +172,7 @@ Nbio_Read_Ctx :: struct {
 	buf:         [1024]u8,
 	pending:     [dynamic]u8,        // undecoded tail (partial escape/UTF-8 sequence)
 	keys:        [dynamic]Key_Msg,   // scratch, reused every callback
+	legacy:      Legacy_Key_Encoding, // copy of Program.legacy; see its comment
 	// Boxed (via context.allocator), not raw Key_Msg -- box()'s own MESSAGE
 	// OWNERSHIP CONTRACT (arena.odin) requires anything that reaches the
 	// mailbox to be a real box() allocation, not an implicit `any` pointing
@@ -214,7 +216,7 @@ nbio_on_read :: proc(op: ^nbio.Operation) {
 	n := op.read.read
 	append(&rc.pending, ..rc.buf[:n])
 	clear(&rc.keys)
-	consumed := decode_keys(rc.pending[:], &rc.keys)
+	consumed := decode_keys(rc.pending[:], &rc.keys, rc.legacy)
 	if consumed > 0 { remove_range(&rc.pending, 0, consumed) }
 
 	// Boxed here, once per key, via context.allocator -- same convention as
