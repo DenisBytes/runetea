@@ -32,19 +32,32 @@ Cmd :: struct {
 	// for why registering a timer doesn't fit run_cmd_task/run_cmd_detached's
 	// "exactly one result per dispatch" shape.
 	timer: ^Timer_Handle,
+
+	// Non-nil ONLY for a Cmd produced by batch()/sequence() (batch.odin) --
+	// same bypass pattern as `timer` immediately above, for the same reason:
+	// a batch/sequence Cmd doesn't run a single procedure/env pair at all, it
+	// coordinates a whole heap-owned list of child Cmds, which doesn't fit
+	// run_cmd_task/run_cmd_detached's "exactly one result per dispatch" shape
+	// either. See batch.odin's own top-of-file comment and
+	// docs/superpowers/batch-sequence-decision.md for why this couldn't be a
+	// Msg (BatchMsg([]Cmd), Go's own shape) instead: box()'s MESSAGE
+	// OWNERSHIP CONTRACT (arena.odin) rejects any Msg with a slice field, and
+	// []Cmd is exactly that.
+	compose: ^Compose_Spec,
 }
 
 cmd_nil :: proc() -> Cmd { return Cmd{} }
 
-// c.timer == nil is part of this check, not just c.procedure == nil: a Cmd
-// produced by tick()/every() (timer.odin) has procedure == nil by
-// construction (it never runs through run_cmd_task/run_cmd_detached at
-// all -- see dispatch()'s own special case below), so checking procedure
-// alone would misreport every such Cmd as nil. That matters beyond
-// symmetry: apply() and run() (tea.odin) both guard their dispatch() call
-// with `if !cmd_is_nil(cmd)`, so a wrong answer here would silently drop
-// every Tick/Every before dispatch() ever saw it.
-cmd_is_nil :: proc(c: Cmd) -> bool { return c.procedure == nil && c.timer == nil }
+// c.timer == nil and c.compose == nil are part of this check, not just
+// c.procedure == nil: a Cmd produced by tick()/every() (timer.odin) or by
+// batch()/sequence() (batch.odin) has procedure == nil by construction (it
+// never runs through run_cmd_task/run_cmd_detached at all -- see dispatch()'s
+// own special cases below), so checking procedure alone would misreport
+// every such Cmd as nil. That matters beyond symmetry: apply() and run()
+// (tea.odin) both guard their dispatch() call with `if !cmd_is_nil(cmd)`, so
+// a wrong answer here would silently drop every Tick/Every/batch/sequence
+// before dispatch() ever saw it.
+cmd_is_nil :: proc(c: Cmd) -> bool { return c.procedure == nil && c.timer == nil && c.compose == nil }
 
 // Heap-clones `env` so the Cmd can outlive the caller's frame.
 //
@@ -134,6 +147,17 @@ Task_Env :: struct {
 	wake:      proc(rawptr),      // copied from Dispatcher.wake at dispatch time
 	wake_data: rawptr,
 	cancel:    ^Cancel_Token,     // copied from &Dispatcher.cancel at dispatch time -- see Cancel_Token's own doc comment
+
+	// Non-nil ONLY when this dispatch is itself a CHILD of a batch()/
+	// sequence() coordinator (batch.odin's compose_dispatch) -- nil for every
+	// top-level dispatch() call, which is the overwhelming majority. Signaled
+	// (wait_group_done) exactly once, as one of this task's last actions,
+	// regardless of outcome (delivered, orphaned, or panicked) -- this is how
+	// a compose coordinator learns "this child is done" without round-
+	// tripping the child's own result back through anything: the coordinator
+	// only ever needs to know WHEN, never WHAT. See batch.odin's own doc
+	// comment for the full design.
+	done: ^sync.Wait_Group,
 }
 
 // Runs once per pool WORKER at pool startup (thread.Pool's own init_proc
@@ -502,6 +526,9 @@ run_cmd_guarded :: proc(cmd: Cmd, cancel: ^Cancel_Token) -> any {
 @(private="file")
 run_cmd_task :: proc(task: thread.Task) {
 	te := cast(^Task_Env)task.data
+	// Captured before free(te) below invalidates te itself -- same reason
+	// run_cmd_detached's own `inflight := te.inflight` capture exists.
+	done := te.done
 	if te.cmd.procedure != nil {
 		msg := run_cmd_guarded(te.cmd, te.cancel)
 		// msg.id != nil, NOT msg != nil: Odin's `any == nil` compares by the
@@ -542,6 +569,10 @@ run_cmd_task :: proc(task: thread.Task) {
 	// the whole session of a long-running TUI, so retaining every completed
 	// task's Task_Env until shutdown grows without bound across the run.
 	free(te)
+	// See Task_Env.done's own doc comment -- signaled after every other
+	// action this task will ever take, so a compose coordinator waiting on
+	// it never wakes early relative to this child's own delivery/cleanup.
+	if done != nil { sync.wait_group_done(done) }
 }
 
 @(private="file")
@@ -557,6 +588,7 @@ run_cmd_detached :: proc(data: rawptr) {
 
 	te := cast(^Task_Env)data
 	inflight := te.inflight
+	done := te.done   // captured before free(te) below, same reason as `inflight` above
 	if te.cmd.procedure != nil {
 		msg := run_cmd_guarded(te.cmd, te.cancel)
 		// See run_cmd_task's comment: msg.id, not msg, distinguishes "a real
@@ -572,6 +604,12 @@ run_cmd_detached :: proc(data: rawptr) {
 		}
 	}
 	free(te)
+	// See Task_Env.done's own doc comment. Signaled BEFORE inflight below,
+	// not after -- a compose coordinator waiting on `done` has no stake in
+	// this Dispatcher's own inflight bookkeeping, so there is no ordering
+	// requirement between the two beyond "both eventually happen"; inflight
+	// keeps its documented "must be the LAST action" position regardless.
+	if done != nil { sync.wait_group_done(done) }
 	// Must be the LAST action: dispatcher_destroy's wait_group_wait treats
 	// this as proof the Cmd is entirely done, including its mailbox_send and
 	// its own te free, and unblocks a caller that may destroy the mailbox on
@@ -580,6 +618,28 @@ run_cmd_detached :: proc(data: rawptr) {
 }
 
 dispatch :: proc(d: ^Dispatcher, c: Cmd) {
+	dispatch_ex(d, c, nil)
+}
+
+// The real body of dispatch(), extended with one internal-only parameter:
+// `done`, non-nil ONLY when this call is itself dispatching a CHILD of a
+// batch()/sequence() coordinator (batch.odin's compose_dispatch). Every
+// external call site (apply()/run() in tea.odin, loop_nbio.odin, every test
+// in cmd_test.odin) goes through the plain `dispatch` wrapper above, which
+// always passes nil -- ordinary top-level dispatch behavior is completely
+// unchanged.
+//
+// `done`, when non-nil, is signaled (wait_group_done) EXACTLY once no matter
+// which branch below runs, including the two immediate-return cases (timer,
+// nil Cmd) that have no Task_Env of their own to carry it. This is what lets
+// a compose coordinator dispatch an arbitrary child -- ordinary Cmd, nested
+// batch()/sequence(), even a raw Tick/Every -- through this exact same
+// proc, uniformly, and learn "this child is done" without needing a second,
+// parallel dispatch path: see batch.odin's own top-of-file comment for the
+// full design and docs/superpowers/batch-sequence-decision.md for why that
+// uniformity is the point, not an incidental simplification.
+@(private = "package")
+dispatch_ex :: proc(d: ^Dispatcher, c: Cmd, done: ^sync.Wait_Group) {
 	// Tick/Every (timer.odin) bypass everything below: registering an nbio
 	// timeout is a microsecond-fast, non-blocking call, so routing it
 	// through a pool worker would only add latency and hold a worker slot
@@ -590,10 +650,34 @@ dispatch :: proc(d: ^Dispatcher, c: Cmd) {
 	// unused for such a Cmd (left zeroed by tick()/every()).
 	if c.timer != nil {
 		timer_dispatch(d, c.timer)
+		// Fire-and-forget from a composing coordinator's point of view: a
+		// Tick/Every nested inside batch()/sequence() is registered exactly
+		// as if it had been returned directly from update(), but does NOT
+		// gate the coordinator's own completion/ordering -- an Every in
+		// particular never completes at all, so "wait for it" has no
+		// sensible meaning here. See batch-sequence-decision.md's honest
+		// accounting of this scope limit.
+		if done != nil { sync.wait_group_done(done) }
 		return
 	}
 
-	if cmd_is_nil(c) { return }
+	// batch()/sequence() (batch.odin) bypass everything below too, for the
+	// same class of reason: a compose Cmd has no single procedure/env pair
+	// to run through run_cmd_task/run_cmd_detached, it coordinates a whole
+	// list of children. compose_dispatch below always converts this into a
+	// SYNTHETIC detached Cmd and recurses into this exact same proc, so it
+	// still ultimately runs through the ordinary detached branch below --
+	// see compose_dispatch's own doc comment (batch.odin) for why that reuse
+	// is deliberate, not incidental.
+	if c.compose != nil {
+		compose_dispatch(d, c.compose, done)
+		return
+	}
+
+	if cmd_is_nil(c) {
+		if done != nil { sync.wait_group_done(done) }
+		return
+	}
 
 	if c.detached {
 		// Elastic overflow: its own thread, self-cleaning, never pool-bound.
@@ -624,12 +708,12 @@ dispatch :: proc(d: ^Dispatcher, c: Cmd) {
 		// seeing a zero count that was never incremented for this Cmd.
 		sync.wait_group_add(&d.inflight, 1)
 		te := new(Task_Env)
-		te^ = Task_Env{cmd = c, mailbox = d.mailbox, inflight = &d.inflight, wake = d.wake, wake_data = d.wake_data, cancel = &d.cancel}
+		te^ = Task_Env{cmd = c, mailbox = d.mailbox, inflight = &d.inflight, wake = d.wake, wake_data = d.wake_data, cancel = &d.cancel, done = done}
 		thread.create_and_start_with_data(rawptr(te), run_cmd_detached, init_context = context, self_cleanup = true)
 		return
 	}
 
 	te := new(Task_Env)
-	te^ = Task_Env{cmd = c, mailbox = d.mailbox, wake = d.wake, wake_data = d.wake_data, cancel = &d.cancel}
+	te^ = Task_Env{cmd = c, mailbox = d.mailbox, wake = d.wake, wake_data = d.wake_data, cancel = &d.cancel, done = done}
 	thread.pool_add_task(&d.pool, context.allocator, run_cmd_task, te)
 }

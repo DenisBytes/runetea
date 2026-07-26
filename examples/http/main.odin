@@ -17,18 +17,36 @@ import rt "../../runetea"
 // blocking Cmd. Record the TLS gap in the findings; it is a v1.0 concern, not
 // a spike one.
 //
-// Overridable via RT_HTTP_HOST/RT_HTTP_PORT so the SAME binary can be pointed
-// at a deliberately stalled local server for the quit-latency demonstration
-// in docs/superpowers/cancellation-decision.md (tools/stallserver) without a
-// second copy of this example. Defaults to the original hardcoded target.
-HOST :: "example.com"
-PORT :: 80
+// batch() DEMONSTRATION (docs/superpowers/batch-sequence-decision.md): this
+// example now checks TWO hosts CONCURRENTLY via a single `rt.batch(...)` Cmd
+// returned from Init, rather than firing one Cmd -- the whole point of this
+// file existing in its extended form. Both checks start together; whichever
+// finishes first updates its own line immediately, and the program only
+// quits once BOTH are done (or the user quits manually) -- results arrive in
+// whatever order the network actually returns them, exactly batch()'s
+// documented "no ordering guarantee" contract, made visible on a real
+// terminal instead of only in a unit test.
+//
+// Overridable via RT_HTTP_HOST/RT_HTTP_PORT (host 1) and RT_HTTP_HOST2/
+// RT_HTTP_PORT2 (host 2) so the SAME binary can be pointed at a deliberately
+// stalled local server for the quit-latency demonstration in
+// docs/superpowers/cancellation-decision.md (tools/stallserver) without a
+// second copy of this example. Defaults to two distinct real hosts so the
+// concurrency is genuine, not simulated.
+HOST  :: "example.com"
+PORT  :: 80
+HOST2 :: "example.org"
+PORT2 :: 80
 
 // Go: `func checkServer() tea.Msg { ... }` -- a closure over nothing.
-// RuneTea: an explicit env struct, because Odin has no closures.
-Check_Env :: struct { host: string, port: int }
+// RuneTea: an explicit env struct, because Odin has no closures. `idx`
+// (0 or 1) is new for the batch() extension -- it is how a Status_Msg/Err_Msg
+// tells update() WHICH of the two concurrent checks it belongs to, since
+// batch() gives no ordering guarantee about which one's result arrives
+// first.
+Check_Env :: struct { host: string, port: int, idx: int }
 
-Status_Msg :: struct { code: int }
+Status_Msg :: struct { idx: int, code: int }
 
 // Msg_Text, not string: box()'s MESSAGE OWNERSHIP CONTRACT (runetea/
 // arena.odin) requires every boxed Msg to be POD, and check_server runs on a
@@ -36,7 +54,7 @@ Status_Msg :: struct { code: int }
 // reads this message -- so `reason` cannot be a bare `string` pointing at a
 // separate fmt.aprintf allocation the way it did before the T1
 // message-ownership decision (docs/superpowers/message-ownership-decision.md).
-Err_Msg :: struct { reason: rt.Msg_Text }
+Err_Msg :: struct { idx: int, reason: rt.Msg_Text }
 
 // check_server is THE concrete victim this fix targets (spike-findings.md
 // addendum item 5): net.recv_tcp had no timeout at all, so a stalled host
@@ -57,6 +75,9 @@ Err_Msg :: struct { reason: rt.Msg_Text }
 //     which is exactly what the short timeout above creates room for. This
 //     is what makes this Cmd notice a user quit within ~RECV_POLL instead of
 //     waiting out the full RECV_MAX_WAIT regardless of what the user does.
+//     Doubly relevant now that check_server runs as a batch() child: quitting
+//     mid-check must not leave either host's Cmd running longer than it
+//     would standalone.
 RECV_POLL     :: 200 * time.Millisecond
 RECV_MAX_WAIT :: 30 * time.Second   // hard cap even if the user never quits and the host never replies
 
@@ -65,7 +86,7 @@ check_server :: proc(env: rawptr, cancel: ^rt.Cancel_Token) -> any {
 
 	sock, derr := net.dial_tcp_from_hostname_with_port_override(e.host, e.port)
 	if derr != nil {
-		return rt.box(Err_Msg{reason = rt.msg_text_fmt("dial: %v", derr)}, context.allocator)
+		return rt.box(Err_Msg{idx = e.idx, reason = rt.msg_text_fmt("dial: %v", derr)}, context.allocator)
 	}
 	defer net.close(sock)
 
@@ -81,7 +102,7 @@ check_server :: proc(env: rawptr, cancel: ^rt.Cancel_Token) -> any {
 
 	req := fmt.tprintf("GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", e.host)
 	if _, serr := net.send_tcp(sock, transmute([]u8)req); serr != nil {
-		return rt.box(Err_Msg{reason = rt.msg_text_fmt("send: %v", serr)}, context.allocator)
+		return rt.box(Err_Msg{idx = e.idx, reason = rt.msg_text_fmt("send: %v", serr)}, context.allocator)
 	}
 
 	buf: [1024]u8
@@ -93,7 +114,7 @@ check_server :: proc(env: rawptr, cancel: ^rt.Cancel_Token) -> any {
 		// iteration RECV_POLL's short timeout exists to create, see this
 		// proc's own doc comment above.
 		if rt.cancel_requested(cancel) {
-			return rt.box(Err_Msg{reason = rt.msg_text_from("cancelled")}, context.allocator)
+			return rt.box(Err_Msg{idx = e.idx, reason = rt.msg_text_from("cancelled")}, context.allocator)
 		}
 		n, rerr = net.recv_tcp(sock, buf[:])
 		if rerr == nil { break }
@@ -113,14 +134,14 @@ check_server :: proc(env: rawptr, cancel: ^rt.Cancel_Token) -> any {
 		if rerr == .Would_Block {
 			waited += RECV_POLL
 			if waited >= RECV_MAX_WAIT {
-				return rt.box(Err_Msg{reason = rt.msg_text_from("recv: timed out waiting for a reply")}, context.allocator)
+				return rt.box(Err_Msg{idx = e.idx, reason = rt.msg_text_from("recv: timed out waiting for a reply")}, context.allocator)
 			}
 			continue
 		}
-		return rt.box(Err_Msg{reason = rt.msg_text_fmt("recv: %v", rerr)}, context.allocator)
+		return rt.box(Err_Msg{idx = e.idx, reason = rt.msg_text_fmt("recv: %v", rerr)}, context.allocator)
 	}
 	if n < 12 {
-		return rt.box(Err_Msg{reason = rt.msg_text_fmt("recv: short read (%d bytes)", n)}, context.allocator)
+		return rt.box(Err_Msg{idx = e.idx, reason = rt.msg_text_fmt("recv: short read (%d bytes)", n)}, context.allocator)
 	}
 
 	// "HTTP/1.1 200 OK" -- the status code is bytes 9..12
@@ -130,17 +151,17 @@ check_server :: proc(env: rawptr, cancel: ^rt.Cancel_Token) -> any {
 		code = code * 10 + int(c - '0')
 	}
 	if code == 0 {
-		return rt.box(Err_Msg{reason = rt.msg_text_from("unparseable status line")}, context.allocator)
+		return rt.box(Err_Msg{idx = e.idx, reason = rt.msg_text_from("unparseable status line")}, context.allocator)
 	}
-	return rt.box(Status_Msg{code = code}, context.allocator)
+	return rt.box(Status_Msg{idx = e.idx, code = code}, context.allocator)
 }
 
-// host/port, not the HOST/PORT constants directly: view() needs to reflect
-// whatever main() actually dialed, which may be the RT_HTTP_HOST/RT_HTTP_PORT
-// override -- see main()'s own comment. Model is Cmd env's cousin, not a Msg
-// (never passed to box()), so a bare `string` field is fine here, unlike
-// Err_Msg's Msg_Text above.
-Model :: struct { host: string, port: int, status: int, err: string, done: bool }
+// One slot per concurrent check. Cmd env's cousin, not a Msg (never passed
+// to box()), so a bare `string` field is fine here, unlike Err_Msg's
+// Msg_Text above.
+Check_Slot :: struct { host: string, port: int, status: int, err: string, done: bool }
+
+Model :: struct { checks: [2]Check_Slot }
 
 update :: proc(m: Model, msg: any, alloc: mem.Allocator) -> (Model, rt.Cmd) {
 	m := m
@@ -150,25 +171,39 @@ update :: proc(m: Model, msg: any, alloc: mem.Allocator) -> (Model, rt.Cmd) {
 			return m, rt.quit_cmd()
 		}
 	case Status_Msg:
-		m.status = v.code; m.done = true
-		return m, rt.quit_cmd()
+		m.checks[v.idx].status = v.code
+		m.checks[v.idx].done = true
+		if all_checks_done(m) { return m, rt.quit_cmd() }
 	case Err_Msg:
 		// The ONLY way to get a `string` out of a Msg_Text is
 		// rt.msg_text_clone, and it always allocates a fresh, independent
 		// copy (msg.odin) -- required here specifically: run()'s loop frees
 		// this Err_Msg right after update() returns (apply(), tea.odin), so
 		// anything retained in the model must not alias the box's storage.
-		m.err = rt.msg_text_clone(v.reason, context.allocator)
-		m.done = true
-		return m, rt.quit_cmd()
+		m.checks[v.idx].err = rt.msg_text_clone(v.reason, context.allocator)
+		m.checks[v.idx].done = true
+		if all_checks_done(m) { return m, rt.quit_cmd() }
 	}
 	return m, rt.cmd_nil()
 }
 
+all_checks_done :: proc(m: Model) -> bool {
+	for c in m.checks { if !c.done { return false } }
+	return true
+}
+
 view :: proc(m: Model, alloc: mem.Allocator) -> string {
-	if m.err != "" { return fmt.aprintf("error: %s\n", m.err, allocator = alloc) }
-	if m.done      { return fmt.aprintf("http://%s:%d -> %d\n", m.host, m.port, m.status, allocator = alloc) }
-	return fmt.aprintf("Checking http://%s:%d ...\n", m.host, m.port, allocator = alloc)
+	sb := strings.builder_make(alloc)
+	for c in m.checks {
+		if c.err != "" {
+			fmt.sbprintfln(&sb, "http://%s:%d -> error: %s", c.host, c.port, c.err)
+		} else if c.done {
+			fmt.sbprintfln(&sb, "http://%s:%d -> %d", c.host, c.port, c.status)
+		} else {
+			fmt.sbprintfln(&sb, "http://%s:%d -> checking...", c.host, c.port)
+		}
+	}
+	return strings.to_string(sb)
 }
 
 main :: proc() {
@@ -187,24 +222,41 @@ main :: proc() {
 
 	b := strings.builder_make(); defer strings.builder_destroy(&b)
 
-	// Overridable target -- see HOST/PORT's own doc comment above. Read once
-	// here, not baked into check_server: this is the ONLY thing that changes
-	// to point this exact binary at tools/stallserver for the quit-latency
-	// demonstration in docs/superpowers/cancellation-decision.md.
-	host := HOST
-	port := PORT
-	if v := os.get_env("RT_HTTP_HOST", context.allocator); v != "" { host = v }
+	// Overridable targets -- see HOST/PORT/HOST2/PORT2's own doc comment
+	// above. Read once here, not baked into check_server: this is the ONLY
+	// thing that changes to point this exact binary at tools/stallserver for
+	// the quit-latency demonstration in docs/superpowers/cancellation-
+	// decision.md.
+	host1, port1 := HOST, PORT
+	if v := os.get_env("RT_HTTP_HOST", context.allocator); v != "" { host1 = v }
 	if v := os.get_env("RT_HTTP_PORT", context.allocator); v != "" {
-		if n, ok := strconv.parse_int(v); ok { port = n }
+		if n, ok := strconv.parse_int(v); ok { port1 = n }
+	}
+	host2, port2 := HOST2, PORT2
+	if v := os.get_env("RT_HTTP_HOST2", context.allocator); v != "" { host2 = v }
+	if v := os.get_env("RT_HTTP_PORT2", context.allocator); v != "" {
+		if n, ok := strconv.parse_int(v); ok { port2 = n }
 	}
 
-	// The initial Cmd. Go: `Init() Cmd { return checkServer }` -- one
-	// identifier, because checkServer is already a closure of the right type.
-	// RuneTea: cmd_from + a heap-cloned env struct that had to be declared.
-	init := rt.cmd_from(check_server, Check_Env{host = host, port = port}, context.allocator)
+	// THE batch() demonstration: both checks are handed to update()'s
+	// Init Cmd together, as a single rt.batch(...) -- from update()'s point
+	// of view this is exactly one Cmd, same as returning check1 alone would
+	// have been, but it runs check1 and check2 CONCURRENTLY, and either one's
+	// result reaches update() the moment it completes, independent of the
+	// other. Go: `Init() Cmd { return checkServer }` -- one identifier,
+	// because checkServer is already a closure of the right type. RuneTea:
+	// cmd_from + a heap-cloned env struct per check, composed with batch().
+	cmds := []rt.Cmd{
+		rt.cmd_from(check_server, Check_Env{host = host1, port = port1, idx = 0}, context.allocator),
+		rt.cmd_from(check_server, Check_Env{host = host2, port = port2, idx = 1}, context.allocator),
+	}
+	init := rt.batch(cmds, context.allocator)
 
 	p: rt.Program(Model)
-	rt.program_init(&p, Model{host = host, port = port}, update, view, init)
+	rt.program_init(&p, Model{checks = {
+		0 = Check_Slot{host = host1, port = port1},
+		1 = Check_Slot{host = host2, port = port2},
+	}}, update, view, init)
 
 	if err := rt.run(&p, &src, &b, fd); err != nil { fmt.eprintln("error:", err) }
 }

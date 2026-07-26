@@ -65,6 +65,7 @@ main :: proc() {
 	phase_program_nbio()
 	phase_dispatcher_reap()
 	phase_timers()
+	phase_batch_sequence()
 	fmt.printfln("=== racecheck: all phases completed without crashing (%v) ===", time.since(start))
 }
 
@@ -829,4 +830,210 @@ phase_timers :: proc() {
 
 	fmt.printfln("  timers: %d create/destroy rounds completed (%d drivers x %d Ticks + %d never-stopped Everys per round), %d total fires drained before each round's teardown",
 		TIMER_ROUNDS, TIMER_DRIVERS, TIMER_TICK_PER_ROUND, TIMER_EVERY_PER_ROUND, total_fires)
+}
+
+// --- Phase H: batch()/sequence() (runetea/batch.odin) --------------------
+//
+// All-new concurrency this task's own work adds: a compose Cmd (batch()/
+// sequence()) always converts into a SYNTHETIC detached Cmd (batch.odin's
+// compose_dispatch), which then runs entirely on its own dedicated OS
+// thread and, from there, calls back into dispatch_ex for each of its own
+// children -- ordinary Cmds, Tick/Every, or ANOTHER compose Cmd (nesting).
+// This phase hammers exactly that machinery at volume, deliberately on a
+// pool narrower than the number of concurrent coordinators, with real
+// nesting (batch-of-sequence, sequence-of-batch) and a fraction of leaves
+// panicking (reusing Cmd_Result/run_cmd_guarded's existing panic-recovery
+// proof from phase B, now exercised through the NEW compose_dispatch/
+// dispatch_ex `done` Wait_Group path instead of only the plain pool/detached
+// paths phase B already covers).
+//
+// Two sub-phases, matching two DIFFERENT things worth proving under TSan:
+//
+//   H1 (settled): dispatch every coordinator, then drain the mailbox to the
+//   EXACT expected leaf count before tearing down. Non-vacuous exact-count
+//   accounting is possible here specifically because nothing races
+//   cancellation against the fan-out -- every dispatched leaf is guaranteed
+//   to run to completion and deliver exactly one message (normal or
+//   Panicked_Msg), so a lost/duplicated/miscounted result under real
+//   concurrent nested coordination would show up as a hard count mismatch,
+//   not a vague "probably fine".
+//
+//   H2 (adversarial teardown): dispatch a fresh batch of coordinators and
+//   call dispatcher_destroy IMMEDIATELY, with a concurrent drainer racing
+//   it -- mirroring phase B's own shape exactly. UNLIKE phase B, this
+//   phase's own Cmds (via compose_run_batch/compose_run_sequence) actively
+//   check cancel_requested and ABANDON not-yet-dispatched children the
+//   instant they notice it -- a genuine, deliberate behavioral difference
+//   from a plain Cmd (which only reacts to cancellation if its own body
+//   polls for it, per Cancel_Token's own cooperative-only contract). That
+//   means the exact leaf count delivered here is NOT deterministic (some
+//   coordinators may abandon most or all of their own children before ever
+//   dispatching them, exactly as batch-sequence-decision.md documents) --
+//   so H2 asserts only what actually matters for teardown safety: bounded
+//   return time, no crash, no hang. See batch_test.odin's own
+//   test_run_returns_promptly_with_a_nested_batch_and_sequence_both_mid_flight
+//   for the same lesson learned directly (an earlier version of THAT test
+//   asserted an exact count and hung the whole suite).
+BS_POOL_WORKERS :: 3           // deliberately narrow
+BS_COORDINATORS :: 40          // multiple of 4; ~13x the pool width
+BS_PANIC_EVERY  :: 17
+
+Leaf_Env :: struct { id: int }
+
+leaf_cmd_run :: proc(env: rawptr, cancel: ^rt.Cancel_Token) -> any {
+	e := cast(^Leaf_Env)env
+	if e.id % BS_PANIC_EVERY == 0 { panic("racecheck: batch/sequence leaf exploded") }
+	if e.id % 5 == 0 { time.sleep(500 * time.Microsecond) }
+	return rt.box(Cmd_Result{id = e.id}, context.allocator)
+}
+
+bs_next_leaf :: proc(next_id: ^int, alloc: mem.Allocator) -> rt.Cmd {
+	id := next_id^
+	next_id^ += 1
+	return rt.cmd_from(leaf_cmd_run, Leaf_Env{id = id}, alloc)
+}
+
+// Four shapes, cycled by (coordinator index % 4):
+//   0: batch{leaf, leaf, leaf}                        -- 3 leaves, flat
+//   1: sequence{leaf, leaf, leaf}                      -- 3 leaves, flat
+//   2: batch{leaf, sequence{leaf, leaf}, leaf}          -- 4 leaves, nested sequence-in-batch
+//   3: sequence{leaf, batch{leaf, leaf}, leaf}          -- 4 leaves, nested batch-in-sequence
+// Every id comes from bs_next_leaf, which hands out a contiguous 0..N-1
+// range regardless of shape -- so the FINAL next_id value after building all
+// BS_COORDINATORS coordinators is exactly the total leaf count, and the
+// exact expected-panic count is computable from it alone (ceil(N / BS_PANIC_EVERY),
+// since ids 0..N-1 are all used exactly once each).
+bs_make_shape :: proc(shape: int, next_id: ^int, alloc: mem.Allocator) -> rt.Cmd {
+	switch shape {
+	case 0:
+		cmds := make([]rt.Cmd, 3, alloc)
+		for i in 0 ..< 3 { cmds[i] = bs_next_leaf(next_id, alloc) }
+		c := rt.batch(cmds, alloc)
+		delete(cmds, alloc)
+		return c
+	case 1:
+		cmds := make([]rt.Cmd, 3, alloc)
+		for i in 0 ..< 3 { cmds[i] = bs_next_leaf(next_id, alloc) }
+		c := rt.sequence(cmds, alloc)
+		delete(cmds, alloc)
+		return c
+	case 2:
+		inner := make([]rt.Cmd, 2, alloc)
+		inner[0] = bs_next_leaf(next_id, alloc)
+		inner[1] = bs_next_leaf(next_id, alloc)
+		seq := rt.sequence(inner, alloc)
+		delete(inner, alloc)
+
+		outer := make([]rt.Cmd, 3, alloc)
+		outer[0] = bs_next_leaf(next_id, alloc)
+		outer[1] = seq
+		outer[2] = bs_next_leaf(next_id, alloc)
+		c := rt.batch(outer, alloc)
+		delete(outer, alloc)
+		return c
+	case:
+		inner := make([]rt.Cmd, 2, alloc)
+		inner[0] = bs_next_leaf(next_id, alloc)
+		inner[1] = bs_next_leaf(next_id, alloc)
+		bch := rt.batch(inner, alloc)
+		delete(inner, alloc)
+
+		outer := make([]rt.Cmd, 3, alloc)
+		outer[0] = bs_next_leaf(next_id, alloc)
+		outer[1] = bch
+		outer[2] = bs_next_leaf(next_id, alloc)
+		c := rt.sequence(outer, alloc)
+		delete(outer, alloc)
+		return c
+	}
+}
+
+phase_batch_sequence :: proc() {
+	fmt.println("--- phase H: batch()/sequence() (nested coordinators outnumbering the pool) ---")
+	phase_batch_sequence_settled()
+	phase_batch_sequence_teardown()
+}
+
+phase_batch_sequence_settled :: proc() {
+	fmt.println("  H1: settled (drain to the exact expected leaf count, then destroy) -- exact accounting through nested batch()/sequence() coordination")
+
+	m: rt.Mailbox
+	if err := rt.mailbox_init(&m, 512); err != nil {
+		fmt.eprintln("mailbox_init failed:", err)
+		os.exit(1)
+	}
+
+	d: rt.Dispatcher
+	rt.dispatcher_init(&d, &m, BS_POOL_WORKERS)
+
+	next_id := 0
+	for i in 0 ..< BS_COORDINATORS {
+		c := bs_make_shape(i % 4, &next_id, context.allocator)
+		rt.dispatch(&d, c)
+	}
+	expected := next_id
+
+	panic_count := 0
+	for i in 0 ..< expected {
+		msg, ok := rt.mailbox_recv(&m)
+		if !ok {
+			fmt.eprintfln("  FAIL: mailbox closed early, got %d/%d leaf results", i, expected)
+			os.exit(1)
+		}
+		if _, is_panic := msg.(rt.Panicked_Msg); is_panic { panic_count += 1 }
+	}
+
+	rt.dispatcher_destroy(&d) // should return promptly: every coordinator and every leaf already finished
+	rt.mailbox_destroy(&m)
+
+	expected_panics := (expected + BS_PANIC_EVERY - 1) / BS_PANIC_EVERY
+	if panic_count != expected_panics {
+		fmt.eprintfln("  FAIL: expected %d Panicked_Msg leaf results, got %d", expected_panics, panic_count)
+		os.exit(1)
+	}
+
+	fmt.printfln("  H1: %d coordinators (batch/sequence, some 2-deep nested), %d pool workers -> %d leaf results received exactly, %d of those panicked (expected %d) -- guarded panics survive the new compose_dispatch/dispatch_ex `done` path",
+		BS_COORDINATORS, BS_POOL_WORKERS, expected, panic_count, expected_panics)
+}
+
+// See this file's own phase_dispatcher (Phase B) for the identical
+// concurrent-drainer-races-destroy shape; Dispatch_Drainer is reused
+// verbatim from there.
+phase_batch_sequence_teardown :: proc() {
+	fmt.println("  H2: adversarial teardown (dispatcher_destroy called immediately after dispatch, concurrent drainer, coordinators + children mid-flight)")
+
+	m: rt.Mailbox
+	if err := rt.mailbox_init(&m, 512); err != nil {
+		fmt.eprintln("mailbox_init failed:", err)
+		os.exit(1)
+	}
+
+	recv_count: int
+	panic_count: int
+	drainer_state := Dispatch_Drainer{m = &m, count = &recv_count, panic_count = &panic_count}
+	drainer := thread.create_and_start_with_data(&drainer_state, dispatch_drainer_run, init_context = context)
+
+	d: rt.Dispatcher
+	rt.dispatcher_init(&d, &m, BS_POOL_WORKERS)
+
+	next_id := 1_000_000 // cosmetic offset, no collision concern (separate mailbox from H1)
+	for i in 0 ..< BS_COORDINATORS {
+		c := bs_make_shape(i % 4, &next_id, context.allocator)
+		rt.dispatch(&d, c)
+	}
+
+	start := time.now()
+	rt.dispatcher_destroy(&d)
+	elapsed := time.since(start)
+
+	rt.mailbox_close(&m)
+	thread.join(drainer); thread.destroy(drainer)
+
+	if elapsed > 2 * time.Second {
+		fmt.eprintfln("  FAIL: dispatcher_destroy took %v with batch/sequence coordinators mid-flight -- should be bounded (cancellation propagates to un-started children/steps immediately), not stalling", elapsed)
+		os.exit(1)
+	}
+
+	fmt.printfln("  H2: dispatcher_destroy returned in %v with coordinators/children mid-flight (%d leaf results delivered before mailbox closed -- not asserted exact: compose's own eager cancellation legitimately abandons some un-started children/steps, see this phase's own doc comment)",
+		elapsed, recv_count)
 }
