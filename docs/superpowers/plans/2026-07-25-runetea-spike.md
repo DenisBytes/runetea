@@ -1793,6 +1793,20 @@ Key_Code :: enum u8 {
 	Up, Down, Right, Left,
 }
 
+// Expected byte length of a UTF-8 sequence from its lead byte. Invalid lead
+// bytes (0x80-0xBF orphan continuations, 0xF8-0xFF) return 1 so they are
+// consumed immediately rather than held back forever -- holding back on a byte
+// that can never complete would WEDGE Task 10's reader thread.
+utf8_lead_len :: proc(b: u8) -> int {
+	switch {
+	case b < 0x80:              return 1
+	case b >= 0xC0 && b < 0xE0: return 2
+	case b >= 0xE0 && b < 0xF0: return 3
+	case b >= 0xF0 && b < 0xF8: return 4
+	case:                       return 1
+	}
+}
+
 Modifier  :: enum u8 { Ctrl, Alt, Shift }
 Modifiers :: bit_set[Modifier; u8]
 
@@ -1822,22 +1836,55 @@ decode_keys :: proc(data: []u8, out: ^[dynamic]Key_Msg) -> (consumed: int) {
 				return i + 1
 			}
 			if data[i + 1] == '[' {
-				if i + 2 >= len(data) { return i }   // incomplete: hold back
-				code: Key_Code
-				switch data[i + 2] {
-				case 'A': code = .Up
-				case 'B': code = .Down
-				case 'C': code = .Right
-				case 'D': code = .Left
-				case:
-					i += 3   // unrecognised CSI: skip it
+				// CSI grammar: ESC [ <params 0x30-0x3F>* <intermediates
+				// 0x20-0x2F>* <final 0x40-0x7E>. Scan to the final byte
+				// WITHOUT interpreting parameters -- that is enough to know
+				// where the sequence ENDS, which is all we need to hold it
+				// back or skip it cleanly. What a parameterised sequence
+				// MEANS stays T1/T4. Without this, "\e[5~" leaks a phantom
+				// '~' and a split "\e[1" + ";5C" leaks three garbage runes.
+				j := i + 2
+				for j < len(data) && data[j] >= 0x30 && data[j] <= 0x3F { j += 1 }
+				for j < len(data) && data[j] >= 0x20 && data[j] <= 0x2F { j += 1 }
+				if j >= len(data) { return i }   // final byte not here yet
+				final := data[j]
+				if final < 0x40 || final > 0x7E {
+					i += 2   // malformed: drop the introducer and resync
 					continue
 				}
-				append(out, Key_Msg{code = code})
-				i += 3
+				seq_len := j - i + 1
+				if seq_len == 3 {
+					code: Key_Code
+					matched := true
+					switch final {
+					case 'A': code = .Up
+					case 'B': code = .Down
+					case 'C': code = .Right
+					case 'D': code = .Left
+					case:     matched = false
+					}
+					if matched {
+						append(out, Key_Msg{code = code})
+						i += seq_len
+						continue
+					}
+				}
+				// Complete but unsupported: consume as ONE unit, emit nothing.
+				// Cleanly ignoring an unknown key is correct; leaking its bytes
+				// as text is not.
+				i += seq_len
+				continue
+			}
+			if data[i + 1] == 0x1b {
+				// Double Escape: emit one Escape, leave the second ESC for the
+				// next iteration. Otherwise one of two presses is silently lost.
+				append(out, Key_Msg{code = .Escape})
+				i += 1
 				continue
 			}
 			// ESC followed by a printable byte == Alt+key
+			need := utf8_lead_len(data[i + 1])
+			if i + 1 + need > len(data) { return i }   // incomplete UTF-8
 			r, w := utf8.decode_rune(data[i + 1:])
 			append(out, Key_Msg{code = .Rune, r = r, mods = {.Alt}})
 			i += 1 + w
@@ -1858,8 +1905,14 @@ decode_keys :: proc(data: []u8, out: ^[dynamic]Key_Msg) -> (consumed: int) {
 			continue
 		}
 
+		// utf8.decode_rune's width CANNOT signal "incomplete": it returns
+		// (RUNE_ERROR, 1) for a truncated lead byte and width 0 only for an
+		// EMPTY slice, which the loop invariant makes impossible. Checking
+		// `w == 0` is dead code, and lets any non-ASCII rune split across a
+		// read boundary through as two U+FFFD keypresses.
+		need := utf8_lead_len(b)
+		if i + need > len(data) { return i }   // incomplete UTF-8: hold back
 		r, w := utf8.decode_rune(data[i:])
-		if w == 0 { return i }   // incomplete UTF-8: hold back
 		append(out, Key_Msg{code = .Rune, r = r})
 		i += w
 	}
