@@ -27,6 +27,17 @@ renderer_render :: proc(r: ^Renderer, view: string) {
 
 	lines := strings.split_lines(view)
 	defer delete(lines)
+	// A trailing "\n" in view is a terminator, not content: split_lines yields
+	// one trailing empty element for it ("a\nb\n" -> ["a","b",""]), which would
+	// otherwise paint a permanent, silent extra blank row every frame. Drop
+	// exactly one -- a second "\n" ("a\n\n" -> ["a","",""]) IS content (one
+	// real blank line) and must survive, matching wc -l / editor semantics.
+	// Must come after the defer above: Odin evaluates defer arguments at the
+	// defer statement, so the original full-length slice is still what gets
+	// freed even though `lines` is reassigned to a shorter view below.
+	if len(lines) > 1 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
 	for line in lines {
 		strings.write_string(r.out, line)
 		strings.write_string(r.out, "\r\n")    // raw mode: OPOST is off
