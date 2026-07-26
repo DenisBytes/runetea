@@ -1286,14 +1286,18 @@ import "core:sys/posix"
 // The seam also isolates the one unvalidated platform risk: if nbio's kqueue
 // path misbehaves on Darwin /dev/tty, a posix.poll implementation drops in here
 // without touching anything above.
+// `woken` is a THIRD return value, deliberately separate from `ok`, so a
+// shutdown wake can never be confused with EOF. Overloading (0,false) for both
+// would make Task 10 report a clean quit as "input died".
 Input_Source :: struct {
 	self:  rawptr,
-	read:  proc(self: rawptr, buf: []u8) -> (n: int, ok: bool),
+	read:  proc(self: rawptr, buf: []u8) -> (n: int, ok: bool, woken: bool),
 	close: proc(self: rawptr),
+	wake:  proc(self: rawptr),
 }
 
-input_read :: proc(src: ^Input_Source, buf: []u8) -> (n: int, ok: bool) {
-	if src.read == nil { return 0, false }
+input_read :: proc(src: ^Input_Source, buf: []u8) -> (n: int, ok: bool, woken: bool) {
+	if src.read == nil { return 0, false, false }
 	return src.read(src.self, buf)
 }
 
@@ -1301,24 +1305,83 @@ input_close :: proc(src: ^Input_Source) {
 	if src.close != nil { src.close(src.self) }
 }
 
+// Unblocks a thread parked in input_read. Safe to call from another thread:
+// every Fd_Source field is set once at construction and never mutated, and a
+// 1-byte pipe write is atomic per POSIX.
+input_wake :: proc(src: ^Input_Source) {
+	if src.wake != nil { src.wake(src.self) }
+}
+
 // --- fd-backed ---
 
-Fd_Source :: struct { fd: posix.FD }
+Fd_Source :: struct { fd, wake_r, wake_w: posix.FD }
 
 input_source_from_fd :: proc(fd: posix.FD) -> (Input_Source, bool) {
 	if fd < 0 { return {}, false }
+	wake_fds: [2]posix.FD
+	if posix.pipe(&wake_fds) != .OK { return {}, false }
+
+	// wake_r MUST be non-blocking. The drain loop reads until empty, and with
+	// a blocking fd the read that drains the LAST byte blocks waiting for the
+	// next one (wake_w stays open for the source's lifetime) -- an outright
+	// deadlock.
+	flags := posix.fcntl(wake_fds[0], .GETFL)
+	if flags < 0 || posix.fcntl(wake_fds[0], .SETFL, transmute(posix.O_Flags)flags + {.NONBLOCK}) < 0 {
+		posix.close(wake_fds[0]); posix.close(wake_fds[1])
+		return {}, false
+	}
+
 	s := new(Fd_Source)
-	s.fd = fd
-	return Input_Source{
-		self  = s,
-		read  = proc(self: rawptr, buf: []u8) -> (n: int, ok: bool) {
-			s := cast(^Fd_Source)self
+	s.fd, s.wake_r, s.wake_w = fd, wake_fds[0], wake_fds[1]
+	return Input_Source{self = s, read = fd_source_read, close = fd_source_close, wake = fd_source_wake}, true
+}
+
+// posix.read/posix.poll are bare libc bindings with NO EINTR retry. A tty read
+// interrupted by a signal returns -1/EINTR -- normal, not an error. Task 7's
+// SIGWINCH watcher fires repeatedly while a user drags a window edge, so
+// without these retries the first resize silently kills input for the whole
+// run. Retry here rather than masking signals on this thread: masking would be
+// a fragile, undocumented coupling to thread-creation order.
+@(private="file")
+fd_source_read :: proc(self: rawptr, buf: []u8) -> (n: int, ok: bool, woken: bool) {
+	s := cast(^Fd_Source)self
+	for {
+		pfds := [2]posix.pollfd{{fd = s.fd, events = {.IN}}, {fd = s.wake_r, events = {.IN}}}
+		pres := posix.poll(&pfds[0], posix.nfds_t(len(pfds)), -1)
+		if pres < 0 {
+			if posix.errno() == .EINTR { continue }
+			return 0, false, false
+		}
+		if pfds[1].revents & {.IN, .HUP, .ERR} != {} {
+			// Drain every queued byte, or several wakes landing before the
+			// reader is scheduled fire a spurious wake on a later read.
+			drain: [64]u8
+			for { if posix.read(s.wake_r, raw_data(drain[:]), len(drain)) <= 0 { break } }
+			return 0, false, true
+		}
+		if pfds[0].revents & {.IN, .HUP, .ERR, .NVAL} != {} {
 			got := posix.read(s.fd, raw_data(buf), len(buf))
-			if got < 0 { return 0, false }
-			return int(got), got > 0
-		},
-		close = proc(self: rawptr) { free(cast(^Fd_Source)self) },
-	}, true
+			if got < 0 {
+				if posix.errno() == .EINTR { continue }
+				return 0, false, false
+			}
+			return int(got), got > 0, false
+		}
+	}
+}
+
+@(private="file")
+fd_source_close :: proc(self: rawptr) {
+	s := cast(^Fd_Source)self
+	posix.close(s.wake_r); posix.close(s.wake_w)   // the data fd is caller-owned
+	free(s)
+}
+
+@(private="file")
+fd_source_wake :: proc(self: rawptr) {
+	s := cast(^Fd_Source)self
+	b := [1]u8{0}
+	posix.write(s.wake_w, raw_data(b[:]), 1)
 }
 
 // --- byte-slice backed ---
@@ -1330,14 +1393,17 @@ input_source_from_bytes :: proc(data: []u8) -> Input_Source {
 	s.data = data
 	return Input_Source{
 		self  = s,
-		read  = proc(self: rawptr, buf: []u8) -> (n: int, ok: bool) {
+		read  = proc(self: rawptr, buf: []u8) -> (n: int, ok: bool, woken: bool) {
 			s := cast(^Bytes_Source)self
-			if s.pos >= len(s.data) { return 0, false }
+			if s.pos >= len(s.data) { return 0, false, false }
 			n = copy(buf, s.data[s.pos:])
 			s.pos += n
-			return n, n > 0
+			return n, n > 0, false
 		},
 		close = proc(self: rawptr) { free(cast(^Bytes_Source)self) },
+		// Never blocks, so waking it is a no-op -- but the proc must exist so
+		// callers need no special-casing.
+		wake  = proc(self: rawptr) {},
 	}
 }
 ```
