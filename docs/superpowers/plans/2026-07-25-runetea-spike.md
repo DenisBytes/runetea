@@ -2043,6 +2043,16 @@ renderer_render :: proc(r: ^Renderer, view: string) {
 
 	lines := strings.split_lines(view)
 	defer delete(lines)
+	// split_lines("a\nb\n") -> ["a","b",""] -- a trailing separator yields a
+	// trailing EMPTY element, which would paint a permanent blank row every
+	// frame. Views idiomatically end in "\n" (Bubble Tea's own examples do),
+	// so this is the common case. Drop exactly ONE: a trailing newline is a
+	// terminator, a second one is real content ("a\n\n" keeps one blank line).
+	// Must come AFTER the defer -- Odin evaluates defer args at the defer
+	// statement, so the original full-length slice is still what gets freed.
+	if len(lines) > 1 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
 	for line in lines {
 		strings.write_string(r.out, line)
 		strings.write_string(r.out, "\r\n")    // raw mode: OPOST is off
