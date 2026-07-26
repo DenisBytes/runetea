@@ -242,9 +242,90 @@ key_cases := [?]Key_Case{
 	{"\eO5A", {{code = .Up, mods = {.Ctrl}}, {}}, 1},
 	{"\eO2P", {{code = .F1, mods = {.Shift}}, {}}, 1},
 
+	// -- T1-J: Kitty keyboard protocol, CSI <code> [;<mods>[:<ev>]] u ---
+	//
+	// These live in THIS table on purpose: it is what subjects them to
+	// test_split_at_every_byte_boundary, and a Kitty sequence is longer than
+	// anything else here (up to 12 bytes), so it is the best hold-back
+	// exercise in the file.
+	//
+	// THE WHOLE POINT of the protocol is the pairs below: each legacy
+	// collision becomes two distinct byte sequences.
+	{"\e[9u",     {{code = .Tab},   {}}, 1},   // Tab
+	{"\e[105;5u", {{code = .Rune, r = 'i', mods = {.Ctrl}}, {}}, 1},   // ...vs Ctrl+i
+	{"\e[13u",    {{code = .Enter}, {}}, 1},   // Enter
+	{"\e[109;5u", {{code = .Rune, r = 'm', mods = {.Ctrl}}, {}}, 1},   // ...vs Ctrl+m
+	{"\e[27u",    {{code = .Escape},{}}, 1},   // Escape
+	{"\e[91;5u",  {{code = .Rune, r = '[', mods = {.Ctrl}}, {}}, 1},   // ...vs Ctrl+[
+	{"\e[8u",     {{code = .Backspace}, {}}, 1},
+	{"\e[104;5u", {{code = .Rune, r = 'h', mods = {.Ctrl}}, {}}, 1},   // ...vs Ctrl+h
+	{"\e[127u",   {{code = .Backspace}, {}}, 1},
+
+	// Plain and modified text keys.
+	{"\e[97u",    {{code = .Rune, r = 'a'}, {}}, 1},
+	{"\e[97;5u",  {{code = .Rune, r = 'a', mods = {.Ctrl}}, {}}, 1},
+	{"\e[97;3u",  {{code = .Rune, r = 'a', mods = {.Alt}}, {}}, 1},
+	{"\e[97;7u",  {{code = .Rune, r = 'a', mods = {.Ctrl, .Alt}}, {}}, 1},
+	{"\e[97;8u",  {{code = .Rune, r = 'a', mods = {.Ctrl, .Alt, .Shift}}, {}}, 1},
+	{"\e[32u",    {{code = .Space, r = ' '}, {}}, 1},
+	{"\e[0u",     {{code = .Space, mods = {.Ctrl}}, {}}, 1},   // Ctrl+Space, no text
+
+	// THE KITTY BITMASK IS NOT THE XTERM BITMASK. Bit 8 is Super in Kitty
+	// (Meta in xterm) and bit 32 is Meta in Kitty (nothing in xterm). Decode
+	// these with xterm_mods and both lines below flip: ;9u would gain .Meta
+	// and ;33u would lose it. That is the non-vacuity lever for kitty_mods.
+	{"\e[97;9u",  {{code = .Rune, r = 'a'}, {}}, 1},            // Super: no member, dropped
+	{"\e[97;33u", {{code = .Rune, r = 'a', mods = {.Meta}}, {}}, 1},
+	{"\e[97;65u", {{code = .Rune, r = 'a'}, {}}, 1},            // CapsLock: dropped
+	{"\e[97;129u",{{code = .Rune, r = 'a'}, {}}, 1},            // NumLock: dropped
+
+	// Event types (the ':' sub-parameter on the modifier field).
+	{"\e[97;1:1u", {{kind = .Press,   code = .Rune, r = 'a'}, {}}, 1},
+	{"\e[97;1:2u", {{kind = .Repeat,  code = .Rune, r = 'a'}, {}}, 1},
+	{"\e[97;1:3u", {{kind = .Release, code = .Rune, r = 'a'}, {}}, 1},
+	{"\e[97;5:3u", {{kind = .Release, code = .Rune, r = 'a', mods = {.Ctrl}}, {}}, 1},
+	{"\e[57352;5:2u", {{kind = .Repeat, code = .Up, mods = {.Ctrl}}, {}}, 1},
+
+	// Functional keycodes: the 57344+ private-use block.
+	{"\e[57344u", {{code = .Escape},    {}}, 1},
+	{"\e[57345u", {{code = .Enter},     {}}, 1},
+	{"\e[57346u", {{code = .Tab},       {}}, 1},
+	{"\e[57347u", {{code = .Backspace}, {}}, 1},
+	{"\e[57348u", {{code = .Insert},    {}}, 1},
+	{"\e[57349u", {{code = .Delete},    {}}, 1},
+	{"\e[57350u", {{code = .Left},      {}}, 1},
+	{"\e[57351u", {{code = .Right},     {}}, 1},
+	{"\e[57352u", {{code = .Up},        {}}, 1},
+	{"\e[57353u", {{code = .Down},      {}}, 1},
+	{"\e[57354u", {{code = .Page_Up},   {}}, 1},
+	{"\e[57355u", {{code = .Page_Down}, {}}, 1},
+	{"\e[57356u", {{code = .Home},      {}}, 1},
+	{"\e[57357u", {{code = .End},       {}}, 1},
+	{"\e[57364u", {{code = .F1},        {}}, 1},
+	{"\e[57375u", {{code = .F12},       {}}, 1},
+	{"\e[57352;5u", {{code = .Up, mods = {.Ctrl}}, {}}, 1},
+
+	// Alternate key reporting: <key>:<shifted>:<base-layout>. The shifted
+	// codepoint is what the keypress actually produces, so it wins for `r`;
+	// the base-layout codepoint has nowhere to go and is dropped.
+	{"\e[97:65;2u",    {{code = .Rune, r = 'A', mods = {.Shift}}, {}}, 1},
+	{"\e[97:65:97;2u", {{code = .Rune, r = 'A', mods = {.Shift}}, {}}, 1},
+	{"\e[97::97u",     {{code = .Rune, r = 'a'}, {}}, 1},   // empty shifted sub-param
+
+	// Text-as-codepoints, the third field. One codepoint populates `r`.
+	{"\e[97;;98u",   {{code = .Rune, r = 'b'}, {}}, 1},
+	{"\e[97;1:1;98u",{{code = .Rune, r = 'b'}, {}}, 1},
+	// ...several do not: Key_Msg.r is ONE rune and there is nowhere to put the
+	// rest, so the text field is ignored wholesale and `r` falls back to the
+	// key code. Documented in kitty_decode; deliberately not a silent truncation.
+	{"\e[97;;98:99u", {{code = .Rune, r = 'a'}, {}}, 1},
+
 	// -- two sequences back to back -------------------------------------
 	{"\e[A\e[1;5D", {{code = .Up}, {code = .Left, mods = {.Ctrl}}}, 2},
 	{"\eOA\e[5~",   {{code = .Up}, {code = .Page_Up}}, 2},
+	// Kitty and legacy bytes in ONE buffer must both decode (T1-J req. 7).
+	{"\e[97;5u\e[A", {{code = .Rune, r = 'a', mods = {.Ctrl}}, {code = .Up}}, 2},
+	{"\e[A\e[97u",   {{code = .Up}, {code = .Rune, r = 'a'}}, 2},
 }
 
 @(test)
@@ -310,7 +391,11 @@ test_split_at_every_byte_boundary :: proc(t: ^testing.T) {
 			}
 		}
 	}
-	testing.expectf(t, checked >= 100, "only %d split points exercised -- table shrank?", checked)
+	// Floor raised from 100 to 500 when T1-J added the Kitty block (531 split
+	// points at the time of writing, up from 186). The floor exists so deleting
+	// a chunk of the table cannot quietly make this test vacuous, so it has to
+	// track the table's actual size.
+	testing.expectf(t, checked >= 500, "only %d split points exercised -- table shrank?", checked)
 }
 
 // A complete sequence followed by a partial one: the complete prefix must be
@@ -574,11 +659,197 @@ test_ctrl_open_bracket_leaves_sequences_alone :: proc(t: ^testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// T1-J: Kitty keyboard protocol.
+// ---------------------------------------------------------------------------
+
+// THE DISPATCH TRAP. 'u' is now a key final byte, but four other `CSI ... u`
+// forms share it and none of them is a keypress:
+//   CSI ? <flags> u   the Kitty flags-query REPLY
+//   CSI = <flags> ; <mode> u   set flags
+//   CSI > <flags> u   push flags
+//   CSI < <n> u       pop flags
+// All four carry a private prefix byte (0x3C-0x3F) where a digit belongs, and
+// all four must stay cleanly ignored -- consumed whole, nothing emitted --
+// exactly as they were before 'u' meant anything. A decoder that reads the
+// prefix byte as part of a parameter would report the flags word as a keypress.
+@(test)
+test_kitty_non_key_csi_u_forms_are_ignored :: proc(t: ^testing.T) {
+	out := make([dynamic]Key_Msg); defer delete(out)
+	for seq in ([?]string{
+		"\e[?1u", "\e[?0u", "\e[?31u",     // flags reply
+		"\e[=1u", "\e[=5;1u", "\e[=0;3u",  // set flags
+		"\e[>1u", "\e[>0u",                // push flags
+		"\e[<1u", "\e[<u",                 // pop flags
+		"\e[u",                            // no parameters at all
+	}) {
+		clear(&out)
+		n := decode_keys(transmute([]u8)seq, &out)
+		testing.expectf(t, n == len(seq), "%q: consumed %d, want %d", seq, n, len(seq))
+		testing.expectf(t, len(out) == 0, "%q: emitted %d keys, want 0 (%v)",
+			seq, len(out), out[:])
+	}
+}
+
+// Requirement 4: functional keys with no Key_Code member follow the decoder's
+// established policy -- consume the whole sequence, emit nothing. Never leak
+// the digits as garbage runes, and never fold them onto some nearby key.
+@(test)
+test_kitty_unmapped_functional_keys_are_ignored :: proc(t: ^testing.T) {
+	out := make([dynamic]Key_Msg); defer delete(out)
+	for seq in ([?]string{
+		"\e[57358u",    // CapsLock
+		"\e[57359u",    // ScrollLock
+		"\e[57360u",    // NumLock
+		"\e[57361u",    // PrintScreen
+		"\e[57362u",    // Pause
+		"\e[57363u",    // Menu
+		"\e[57376u",    // F13
+		"\e[57398u",    // F35
+		"\e[57399u",    // Keypad 0
+		"\e[57427u",    // Keypad Begin
+		"\e[57428u",    // MediaPlay
+		"\e[57441u",    // LeftShift (a lone modifier keypress)
+		"\e[57452u",    // RightMeta
+		"\e[57454u",    // IsoLevel5Shift
+		"\e[57441;1:3u",// LeftShift release -- still nothing
+		"\e[63743u",    // top of the BMP private-use area, unassigned by Kitty
+	}) {
+		clear(&out)
+		n := decode_keys(transmute([]u8)seq, &out)
+		testing.expectf(t, n == len(seq), "%q: consumed %d, want %d", seq, n, len(seq))
+		testing.expectf(t, len(out) == 0, "%q: emitted %d keys, want 0 (%v)",
+			seq, len(out), out[:])
+	}
+}
+
+// Press is the ZERO VALUE of Key_Kind and must stay that way: every legacy
+// path builds a Key_Msg without naming `kind`, so a reordered enum would
+// silently relabel every keypress in the decoder as a release.
+@(test)
+test_key_kind_press_is_the_zero_value :: proc(t: ^testing.T) {
+	testing.expect_value(t, Key_Kind{}, Key_Kind.Press)
+	testing.expect_value(t, Key_Msg{}.kind, Key_Kind.Press)
+
+	out := make([dynamic]Key_Msg); defer delete(out)
+	decode_keys(transmute([]u8)string("a\e[A\r"), &out)
+	testing.expect_value(t, len(out), 3)
+	for k in out { testing.expect_value(t, k.kind, Key_Kind.Press) }
+}
+
+// Legacy_Key_Encoding must NOT reach the Kitty path. The flags exist to
+// arbitrate a collision the legacy byte encoding forces; Kitty removes the
+// collision outright (Tab is 9, Ctrl+i is 105 with the Ctrl bit), so honouring
+// them here would re-introduce the ambiguity the protocol just eliminated --
+// and would make Ctrl+i and Tab indistinguishable again for no reason.
+@(test)
+test_kitty_ignores_legacy_flags :: proc(t: ^testing.T) {
+	all := Legacy_Key_Encoding{.Ctrl_At, .Ctrl_I, .Ctrl_M, .Ctrl_Open_Bracket,
+	                           .Backspace, .Find, .Select}
+	out := make([dynamic]Key_Msg); defer delete(out)
+	Case :: struct { seq: string, want: Key_Msg }
+	for c in ([?]Case{
+		{"\e[9u",   {code = .Tab}},
+		{"\e[13u",  {code = .Enter}},
+		{"\e[27u",  {code = .Escape}},
+		{"\e[0u",   {code = .Space, mods = {.Ctrl}}},
+		{"\e[8u",   {code = .Backspace}},
+		{"\e[127u", {code = .Backspace}},
+	}) {
+		for legacy in ([?]Legacy_Key_Encoding{{}, all}) {
+			clear(&out)
+			n := decode_keys(transmute([]u8)c.seq, &out, legacy)
+			testing.expectf(t, n == len(c.seq), "%q (%v): consumed %d, want %d",
+				c.seq, legacy, n, len(c.seq))
+			if !testing.expectf(t, len(out) == 1, "%q (%v): emitted %d keys, want 1",
+				c.seq, legacy, len(out)) { continue }
+			testing.expectf(t, out[0] == c.want, "%q (%v): got %v, want %v",
+				c.seq, legacy, out[0], c.want)
+		}
+	}
+}
+
+// Sub-parameter acceptance is SCOPED TO THE 'u' FINAL, deliberately. Every
+// other final byte still rejects ':' outright, which is what keeps SGR mouse
+// reports, DECRPM replies and the Kitty legacy-key extension on the
+// cleanly-ignored path rather than in some half-parsed state. Pinning it here
+// so widening csi_params later is a conscious act with a failing test attached.
+@(test)
+test_subparams_are_rejected_outside_csi_u :: proc(t: ^testing.T) {
+	out := make([dynamic]Key_Msg); defer delete(out)
+	for seq in ([?]string{
+		"\e[1;5:3A",   // Kitty's event-type extension on a legacy arrow key
+		"\e[3;5:3~",   // ...and on a tilde key
+		"\e[1:2A",
+		"\e[<0;10:5M", // SGR mouse with a stray sub-parameter
+	}) {
+		clear(&out)
+		n := decode_keys(transmute([]u8)seq, &out)
+		testing.expectf(t, n == len(seq), "%q: consumed %d, want %d", seq, n, len(seq))
+		testing.expectf(t, len(out) == 0, "%q: emitted %d keys, want 0 (%v)",
+			seq, len(out), out[:])
+	}
+}
+
+// Kitty parameter edges. Complete sequences, so always fully consumed; the
+// question is only whether anything is emitted.
+@(test)
+test_kitty_parameter_edges :: proc(t: ^testing.T) {
+	out := make([dynamic]Key_Msg); defer delete(out)
+	Case :: struct { seq: string, nwant: int, want: Key_Msg }
+	for c in ([?]Case{
+		// mod == 1 is "no modifiers" (the encoding is 1+mask), mod == 0 is not
+		// a valid modifier parameter at all.
+		{"\e[97;1u", 1, {code = .Rune, r = 'a'}},
+		// A PRESENT-BUT-EMPTY key code defaults to 1, per the spec's "CSI
+		// number ; modifiers u" default and ultraviolet's Param(1). Key code 1
+		// is SOH, which lands in the WezTerm C0-compatibility band as Ctrl+a.
+		// Asserted rather than quietly ignored because it is a spec rule this
+		// decoder chose to honour, not an accident -- no terminal sends it, and
+		// deviating from the reference here would be an undocumented surprise.
+		{"\e[;5u",   1, {code = .Rune, r = 'a', mods = {.Ctrl}}},
+		{"\e[97;0u", 0, {}},
+		{"\e[97;u",  1, {code = .Rune, r = 'a'}},   // empty mods field == default
+		{"\e[97;257u", 0, {}},                      // 1+mask tops out at 256
+		// An unknown event type is not a reason to drop a real keypress.
+		{"\e[97;1:9u", 1, {code = .Rune, r = 'a'}},
+		{"\e[97;1:u",  1, {code = .Rune, r = 'a'}},
+		// A fourth ';' field is not part of the grammar.
+		{"\e[97;1;98;99u", 0, {}},
+		// Surrogates and out-of-range codepoints are not scalar values.
+		{"\e[55296u", 0, {}},
+		{"\e[1114112u", 0, {}},
+		// More sub-parameters than Kitty_Params can store. The count still has
+		// to be right -- that is what tells a one-codepoint text field from a
+		// multi-codepoint one -- even though the values past the third are
+		// dropped on the floor.
+		{"\e[97;;98:99:100:101u", 1, {code = .Rune, r = 'a'}},
+		{"\e[97:65:97:98;2u",     1, {code = .Rune, r = 'A', mods = {.Shift}}},
+		// Non-ASCII text keys survive intact.
+		{"\e[233u", 1, {code = .Rune, r = 'é'}},
+		{"\e[128169u", 1, {code = .Rune, r = '💩'}},
+	}) {
+		clear(&out)
+		n := decode_keys(transmute([]u8)c.seq, &out)
+		testing.expectf(t, n == len(c.seq), "%q: consumed %d, want %d", c.seq, n, len(c.seq))
+		if !testing.expectf(t, len(out) == c.nwant, "%q: emitted %d keys, want %d (%v)",
+			c.seq, len(out), c.nwant, out[:]) { continue }
+		if c.nwant == 1 {
+			testing.expectf(t, out[0] == c.want, "%q: got %v, want %v", c.seq, out[0], c.want)
+		}
+	}
+}
+
 // A modifier parameter out of range must not be forced into a modifier set:
 // the sequence is complete, so it is consumed, but nothing is emitted.
-// Bits above 8 (Kitty's Hyper/Super/CapsLock/NumLock) are masked off rather
-// than mis-reported -- CSI 1;33A is Up with CapsLock, which this decoder
-// reports as plain Up.
+// Bits above 8 are masked off rather than mis-reported: this is the LEGACY
+// xterm parameter, whose defined bits stop at 8 (Meta), so CSI 1;33A is Up
+// with some modifier xterm never named and decodes as plain Up.
+//
+// (The comment here used to call bit 32 "Kitty's CapsLock". That was wrong on
+// both counts -- Kitty's CapsLock is bit 64, its bit 32 is Meta -- and this is
+// the legacy parameter anyway, not the Kitty one. See kitty_mods for the real
+// Kitty table and test_decode_key_table's "\e[97;33u" for its behaviour.)
 @(test)
 test_modifier_edges :: proc(t: ^testing.T) {
 	out := make([dynamic]Key_Msg); defer delete(out)
@@ -595,7 +866,7 @@ test_modifier_edges :: proc(t: ^testing.T) {
 	testing.expect_value(t, n, 6)
 	testing.expect_value(t, len(out), 0)
 
-	// Kitty's CapsLock bit (0x20) masked off, not mis-reported.
+	// A bit xterm never defined, masked off rather than mis-reported.
 	clear(&out)
 	n = decode_keys(transmute([]u8)string("\e[1;33A"), &out)
 	testing.expect_value(t, n, 7)

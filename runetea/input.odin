@@ -2,7 +2,16 @@ package runetea
 
 import "core:unicode/utf8"
 
-Key_Kind :: enum u8 { Press, Release }
+// Press MUST stay the zero value: every legacy decode path builds a Key_Msg
+// without naming `kind`, so reordering this enum would silently relabel every
+// keypress the decoder produces. Repeat is APPENDED for that reason, even
+// though "Press, Repeat, Release" reads better -- test_key_kind_press_is_the
+// _zero_value pins it.
+//
+// Repeat only ever occurs under the Kitty keyboard protocol with event types
+// enabled; the legacy encoding has no way to express "the terminal's key
+// auto-repeat fired" and reports a repeat as an ordinary Press.
+Key_Kind :: enum u8 { Press, Release, Repeat }
 
 // Collapsed vocabulary: Bubble Tea matches six key/mouse types by method set,
 // which Odin cannot express. One struct with a discriminant instead (spec §9).
@@ -187,12 +196,16 @@ decode_c0 :: proc(b: u8, legacy: Legacy_Key_Encoding) -> Key_Msg {
 // letter we recognise, say) from being forced into a plausible-looking
 // modifier set.
 //
-// Bits above 8 -- Kitty's Hyper (16), Super (32), CapsLock (64), NumLock (128)
-// -- are MASKED OFF, deliberately: Modifiers has no member for them, and
-// mapping them onto the four we do have would report a modifier the user did
-// not press. CSI 1;33A (Up with CapsLock latched) therefore decodes as plain
-// Up, which is a lossy but honest answer. Decoding them properly is Kitty
-// keyboard protocol work, which is out of T1-H's scope.
+// Bits above 8 are MASKED OFF, deliberately: Modifiers has no member for them,
+// and mapping them onto the four we do have would report a modifier the user
+// did not press. CSI 1;33A therefore decodes as plain Up, which is a lossy but
+// honest answer.
+//
+// THIS IS NOT THE KITTY BITMASK -- see kitty_mods, which is a different
+// function of the same-shaped number. Bit 8 here is Meta (xterm's meaning);
+// bit 8 in Kitty is Super and Meta moves to bit 32. Sharing one proc between
+// the two encodings would mis-name a modifier on every Kitty event that has
+// one, which is precisely why there are two.
 xterm_mods :: proc(param: int) -> (mods: Modifiers, ok: bool) {
 	if param < 1 || param > 256 { return {}, false }
 	mask := param - 1
@@ -213,10 +226,22 @@ CSI_MAX_PARAMS :: 4
 // Returns ok = false -- meaning "not a sequence this decoder assigns meaning
 // to", NOT "malformed" -- for anything with a private prefix byte
 // ('<' '=' '>' '?', i.e. mouse reports, DECRPM, Kitty flag queries) or a ':'
-// sub-parameter separator (Kitty's key:shifted:base form). All of those are
-// out of T1-H's scope and must fall through to the cleanly-ignored path with
-// their byte length intact, which the caller computes independently of this
-// proc.
+// sub-parameter separator. Those must fall through to the cleanly-ignored path
+// with their byte length intact, which the caller computes independently of
+// this proc.
+//
+// THE ':' REJECTION IS LOAD-BEARING AND STAYS. T1-J added Kitty CSI-u decoding,
+// which does need sub-parameters -- but it got its OWN parser (kitty_params),
+// reached only from the 'u' final byte, rather than this one being widened.
+// Sub-parameters appear in plenty of non-key sequences (SGR colour with
+// `38:2::r:g:b`, DECRPM replies, Kitty's own event-type extension on legacy
+// arrow keys, `CSI 1;5:3A`), and every one of them currently lands on the
+// cleanly-ignored path BECAUSE of this rejection. Accepting ':' here would
+// silently promote them to "parsed", where the sub-parameter values would be
+// read as though they were ';'-separated parameters -- e.g. `CSI 1;5:3A` would
+// become Ctrl+Up with the release flag thrown away. Scoping the new grammar to
+// the one final byte that defines it keeps that impossible by construction.
+// test_subparams_are_rejected_outside_csi_u pins it.
 csi_params :: proc(p: []u8) -> (params: [CSI_MAX_PARAMS]int, count: int, ok: bool) {
 	for k in 0 ..< CSI_MAX_PARAMS { params[k] = -1 }
 	if len(p) == 0 { return params, 0, true }
@@ -286,6 +311,258 @@ csi_letter_code :: proc(final: u8) -> (code: Key_Code, ok: bool) {
 	return .Rune, false
 }
 
+// ---------------------------------------------------------------------------
+// T1-J: the Kitty keyboard protocol, DECODE SIDE ONLY.
+//
+// Wire format, all three fields optional past the first:
+//
+//   CSI <key> [: <shifted> : <base-layout>] [; <mods> [: <event-type>]]
+//             [; <text-codepoint> [: <text-codepoint>]*] u
+//
+// The point of the protocol is that it REMOVES the legacy collisions rather
+// than arbitrating them the way Legacy_Key_Encoding does: Tab is CSI 9 u and
+// Ctrl+I is CSI 105;5 u, Enter is CSI 13 u and Ctrl+M is CSI 109;5 u, Escape
+// is CSI 27 u and Ctrl+[ is CSI 91;5 u. They are simply different byte strings,
+// so nothing here consults `legacy` -- doing so would put back the ambiguity
+// the terminal just went to the trouble of eliminating.
+//
+// NOTHING ENABLES THIS YET, and that is safe: no terminal emits CSI-u key
+// events unless asked to (the enabling sequence and its teardown are a separate
+// task, deliberately kept away from the async-signal-safe restore path). Until
+// then this code is inert, because the only CSI-u forms a terminal sends
+// unbidden are the flag-report replies, and those all carry a private prefix
+// byte that kitty_params rejects.
+// ---------------------------------------------------------------------------
+
+// The Kitty modifier parameter is 1 + a bitmask, same shape as xterm's and a
+// DIFFERENT function -- getting this wrong is the single easiest way to ship a
+// plausible-looking decoder that names the wrong modifier:
+//
+//   bit    1     2    4     8      16     32    64        128
+//   Kitty  Shift Alt  Ctrl  Super  Hyper  Meta  CapsLock  NumLock
+//   xterm  Shift Alt  Ctrl  Meta   --     --    --        --
+//
+// Super, Hyper, CapsLock and NumLock are MASKED OFF for the same reason
+// xterm_mods masks off its high bits: Modifiers has no member for them, and
+// folding Super onto Meta (which the shared bit position invites) would report
+// a modifier the user did not press. So Ctrl+Super+a decodes as Ctrl+a: lossy,
+// but never wrong about what it does report.
+//
+// Out of range is rejected rather than clamped, matching xterm_mods, so a
+// sequence carrying a nonsense modifier field is cleanly ignored instead of
+// being forced into a plausible-looking key event.
+kitty_mods :: proc(param: int) -> (mods: Modifiers, ok: bool) {
+	if param < 1 || param > 256 { return {}, false }
+	mask := param - 1
+	if mask &  1 != 0 { mods += {.Shift} }
+	if mask &  2 != 0 { mods += {.Alt} }
+	if mask &  4 != 0 { mods += {.Ctrl} }
+	if mask & 32 != 0 { mods += {.Meta} }
+	return mods, true
+}
+
+// Is `code` a codepoint that can stand as a Key_Msg.r? Excludes the C0/DEL
+// controls (which have their own named codes), the UTF-16 surrogate range and
+// anything past U+10FFFF (neither is a Unicode scalar value, so rune(code)
+// would be a lie), and the BMP private-use area -- that last one is Kitty's
+// functional-key space, and letting a keycode fall through to "printable rune"
+// would turn an unmapped F13 into a garbage glyph instead of the documented
+// clean ignore.
+kitty_printable :: proc(code: int) -> bool {
+	switch {
+	case code < 0x20 || code == 0x7f:         return false
+	case code > 0x10ffff:                     return false
+	case code >= 0xd800 && code <= 0xdfff:    return false   // surrogates
+	case code >= 0xe000 && code <= 0xf8ff:    return false   // Kitty functional-key PUA
+	}
+	return true
+}
+
+// The unicode-key-code -> Key_Msg mapping. ok = false means "a real Kitty key
+// this decoder has no vocabulary for": the caller consumes the sequence and
+// emits nothing, per the decoder's standing policy for unsupported keys.
+//
+// Three bands:
+//   0x00-0x1F, 0x7F -- NOT spec-conformant (a compliant terminal sends the
+//     functional codes below), but WezTerm and others send the historical C0
+//     byte, so ultraviolet carries a table for them and so do we. The values
+//     match decode_c0's arithmetic exactly (0x01-0x1A take the 0x60 letter
+//     offset, 0x1C-0x1F the 0x40 punctuation offset) so the two paths cannot
+//     drift -- with ONE deliberate difference: 0x08 is Backspace here, not
+//     Ctrl+h. Under Kitty, Ctrl+h is 104;5 and cannot collide with it, so
+//     there is no ambiguity left for Legacy_Key.Backspace to arbitrate.
+//   0x20-0x10FFFF -- an ordinary text key, reported as itself.
+//   57344+ (0xE000+) -- the functional keys. Only the ones Key_Code carries
+//     are mapped; F13-F35, the keypad block, the media keys and the lone
+//     modifier keypresses (57441-57454, which a terminal sends when the user
+//     merely TAPS Shift) are cleanly ignored. Adding Key_Code members for them
+//     is a vocabulary change, not a decoder change, and is not T1-J's job.
+kitty_key_code :: proc(code: int) -> (key: Key_Msg, ok: bool) {
+	switch code {
+	case 0:     return Key_Msg{code = .Space, mods = {.Ctrl}}, true   // Ctrl+Space produces no text
+	case 8:     return Key_Msg{code = .Backspace}, true
+	case 9:     return Key_Msg{code = .Tab}, true
+	case 13:    return Key_Msg{code = .Enter}, true
+	case 27:    return Key_Msg{code = .Escape}, true
+	case 32:    return Key_Msg{code = .Space, r = ' '}, true
+	case 127:   return Key_Msg{code = .Backspace}, true
+
+	case 57344: return Key_Msg{code = .Escape}, true
+	case 57345: return Key_Msg{code = .Enter}, true
+	case 57346: return Key_Msg{code = .Tab}, true
+	case 57347: return Key_Msg{code = .Backspace}, true
+	case 57348: return Key_Msg{code = .Insert}, true
+	case 57349: return Key_Msg{code = .Delete}, true
+	case 57350: return Key_Msg{code = .Left}, true
+	case 57351: return Key_Msg{code = .Right}, true
+	case 57352: return Key_Msg{code = .Up}, true
+	case 57353: return Key_Msg{code = .Down}, true
+	case 57354: return Key_Msg{code = .Page_Up}, true
+	case 57355: return Key_Msg{code = .Page_Down}, true
+	case 57356: return Key_Msg{code = .Home}, true
+	case 57357: return Key_Msg{code = .End}, true
+	}
+	// The C0 ranges, as if-checks rather than switch ranges: 8/9/13/27 sit
+	// inside 1..=26 and Odin rejects a switch whose cases overlap.
+	if code >= 1  && code <= 26 { return Key_Msg{code = .Rune, r = rune(code + 0x60), mods = {.Ctrl}}, true }
+	if code >= 28 && code <= 31 { return Key_Msg{code = .Rune, r = rune(code + 0x40), mods = {.Ctrl}}, true }
+	// F1-F12. Contiguous by construction -- see Key_Code's comment on why the
+	// F-block's order is load-bearing.
+	if code >= 57364 && code <= 57375 {
+		return Key_Msg{code = Key_Code(int(Key_Code.F1) + code - 57364)}, true
+	}
+	if !kitty_printable(code) { return {}, false }
+	return Key_Msg{code = .Rune, r = rune(code)}, true
+}
+
+// Kitty's parameter grid: up to KITTY_MAX_FIELDS ';'-separated fields, each
+// with ':'-separated sub-parameters. Values are -1 when the slot is present but
+// empty ("\e[97;;98u" has an empty modifier field), which is NOT the same as 0.
+//
+// `nsub` counts sub-parameters even past what `v` can store, because the text
+// field's COUNT is what decides whether it is usable (see kitty_decode).
+KITTY_MAX_FIELDS :: 3
+KITTY_MAX_SUBS   :: 3
+
+Kitty_Params :: struct {
+	v:      [KITTY_MAX_FIELDS][KITTY_MAX_SUBS]int,
+	nsub:   [KITTY_MAX_FIELDS]int,
+	nfield: int,
+}
+
+// Parses the parameter-byte run of a `CSI ... u`. ok = false means "not a
+// Kitty key event"; the caller consumes the sequence whole and emits nothing.
+//
+// THE PRIVATE-PREFIX REJECTION IS THE WHOLE REASON THIS IS SAFE TO RUN
+// UNCONDITIONALLY. Every non-key CSI-u form carries a prefix byte where a digit
+// belongs -- CSI ? <flags> u (the flags-query reply, which a terminal sends of
+// its own accord), CSI = <flags> ; <mode> u, CSI > <flags> u, CSI < <n> u --
+// and the default arm below rejects all four along with anything else that is
+// not a digit, ';' or ':'. Reading the prefix byte as part of a parameter would
+// report a terminal's flags word as a keypress.
+//
+// An empty parameter run is likewise not a key: bare `CSI u` has no keycode.
+kitty_params :: proc(p: []u8) -> (kp: Kitty_Params, ok: bool) {
+	for f in 0 ..< KITTY_MAX_FIELDS {
+		for s in 0 ..< KITTY_MAX_SUBS { kp.v[f][s] = -1 }
+	}
+	if len(p) == 0 { return kp, false }
+	kp.nfield  = 1
+	kp.nsub[0] = 1
+	f, s := 0, 0
+	for c in p {
+		switch {
+		case c >= '0' && c <= '9':
+			// Sub-parameters past what `v` holds still advance nsub (above);
+			// their digits are simply dropped, since nothing reads them.
+			if s >= KITTY_MAX_SUBS { continue }
+			d := int(c - '0')
+			val := kp.v[f][s]
+			if val < 0 { val = 0 }
+			// Bounded by the largest legal Unicode scalar value, not by the
+			// three digits csi_params allows: the text field carries real
+			// codepoints and U+10FFFF is seven of them. Checking before the
+			// multiply keeps the accumulator far from overflow.
+			if val > 0x10ffff { return kp, false }
+			kp.v[f][s] = val * 10 + d
+		case c == ':':
+			s += 1
+			kp.nsub[f] = s + 1
+		case c == ';':
+			f += 1
+			if f >= KITTY_MAX_FIELDS { return kp, false }
+			kp.nfield  = f + 1
+			kp.nsub[f] = 1
+			s = 0
+		case:
+			return kp, false
+		}
+	}
+	return kp, true
+}
+
+// Decodes a COMPLETE `CSI <params> u` into a key event. See the block comment
+// above for the wire format.
+//
+// TEXT CODEPOINTS AND THE ONE-RUNE LIMIT (requirement 5, answered honestly).
+// The third field is the text the keypress produces, as one or more codepoints;
+// Key_Msg.r is a single rune. When the field carries exactly one codepoint it
+// becomes `r`. When it carries SEVERAL -- which is real for IMEs and for
+// combining sequences, e.g. a dead-key composition arriving as base + combining
+// mark -- the field is ignored WHOLESALE and `r` falls back to the key code.
+// That is a deliberate choice over truncating to the first codepoint: a
+// truncated "é" that arrives as 'e' + U+0301 would silently become a plain 'e'
+// that the application cannot tell from a real 'e' keypress, whereas falling
+// back to the key code at least reports the physical key honestly. Carrying
+// multi-codepoint text properly needs a `text` field on Key_Msg (a Msg_Text
+// style inline buffer, since Msg types must stay POD -- see arena.odin's
+// is_pod check), which is a vocabulary change and not T1-J's job.
+kitty_decode :: proc(p: []u8) -> (key: Key_Msg, ok: bool) {
+	kp := kitty_params(p) or_return
+
+	// Field 0 sub 0: the unicode key code. CSI u's documented default is 1.
+	code := kp.v[0][0]
+	if code < 0 { code = 1 }
+	key = kitty_key_code(code) or_return
+
+	// Field 0 sub 1: the SHIFTED codepoint, sub 2: the base-layout codepoint.
+	// The shifted one wins for `r` because it is what the keypress actually
+	// produces -- Shift+a arrives as 97:65 and must read as 'A', not 'a'.
+	// The base-layout codepoint (what the same physical key would be on a
+	// PC-101 US layout) has nowhere to live in Key_Msg and is dropped; it is
+	// parsed only so its presence cannot shift the field indices.
+	if key.code == .Rune && kp.nsub[0] >= 2 && kitty_printable(kp.v[0][1]) {
+		key.r = rune(kp.v[0][1])
+	}
+
+	// Field 1 sub 0: modifiers. UNIONED with whatever the key code already
+	// implied (the C0 band arrives carrying .Ctrl) rather than assigned, so a
+	// terminal that sends `CSI 1 u` for Ctrl+a without a modifier field still
+	// reports Ctrl.
+	if kp.nfield >= 2 {
+		m := kp.v[1][0]
+		if m < 0 { m = 1 }                 // present but empty == unmodified
+		key.mods += kitty_mods(m) or_return
+		// Field 1 sub 1: the event type. Absent means press; an unrecognised
+		// value also means press, since a key the terminal reports is a key the
+		// user touched and dropping it would be worse than mislabelling it.
+		if kp.nsub[1] >= 2 {
+			switch kp.v[1][1] {
+			case 2: key.kind = .Repeat
+			case 3: key.kind = .Release
+			}
+		}
+	}
+
+	// Field 2: the text. See this proc's doc comment for the multi-codepoint
+	// answer. Only overrides a .Rune key: a functional key's text field (if a
+	// terminal ever sent one) has no rune to override.
+	if kp.nfield >= 3 && kp.nsub[2] == 1 && key.code == .Rune && kitty_printable(kp.v[2][0]) {
+		key.r = rune(kp.v[2][0])
+	}
+	return key, true
+}
+
 // Decodes one COMPLETE CSI whose parameter bytes are `p` and whose final byte
 // is `final`. `has_intermed` says whether any intermediate byte (0x20-0x2F)
 // was present; every key form this decoder knows has none, so an intermediate
@@ -296,6 +573,18 @@ csi_letter_code :: proc(final: u8) -> (code: Key_Code, ok: bool) {
 // incompleteness is decided by the caller before this proc is reached.
 csi_decode :: proc(p: []u8, has_intermed: bool, final: u8, legacy: Legacy_Key_Encoding) -> (key: Key_Msg, ok: bool) {
 	if has_intermed { return {}, false }
+
+	// 'u' is the Kitty keyboard protocol's dispatch point, and it is routed
+	// BEFORE csi_params on purpose: the Kitty grammar has ':' sub-parameters
+	// that csi_params rejects by design (see its comment for why that rejection
+	// stays). kitty_params is the only parser in this file that accepts them,
+	// and 'u' is the only final byte that reaches it.
+	//
+	// The non-key CSI-u forms (CSI ? / = / > / < ... u -- flag reply, set, push,
+	// pop) are rejected inside kitty_params by its private-prefix arm, so they
+	// stay cleanly ignored exactly as they were before 'u' meant anything.
+	if final == 'u' { return kitty_decode(p) }
+
 	params, count := csi_params(p) or_return
 
 	if final == '~' {
@@ -362,16 +651,36 @@ ss3_decode :: proc(mod_digits: []u8, gl: u8) -> (key: Key_Msg, ok: bool) {
 // Vocabulary: printable runes; C0 control bytes per decode_c0's policy;
 // Enter/Tab/Space/Backspace/Escape; arrows, Home, End, Page_Up, Page_Down,
 // Insert, Delete and F1-F12 in their CSI-tilde, CSI-letter and SS3 encodings;
-// and xterm modifier parameters (Shift/Alt/Ctrl/Meta) on all of those.
+// xterm modifier parameters (Shift/Alt/Ctrl/Meta) on all of those; and the
+// Kitty keyboard protocol's CSI-u key events, including press/repeat/release
+// event types and the alternate-key and text sub-parameter forms.
+//
+// NOTHING TURNS KITTY ON YET. Decoding it is unconditional and inert: a
+// terminal never emits CSI-u key events unless the application asks for them,
+// and the enabling sequence plus its teardown are a separate task, deliberately
+// kept out of this one so they land nowhere near the async-signal-safe restore
+// path in term.odin.
 //
 // DOCUMENTED LIMITATIONS -- each of these is a separate future unit, and each
 // is CLEANLY IGNORED here (consumed whole, nothing emitted) rather than
 // leaking bytes as garbage runes:
 //   - mouse reporting (X10, SGR: CSI M ..., CSI < ... M/m);
 //   - bracketed paste (CSI 200~ / CSI 201~ and the text between them);
-//   - the Kitty keyboard protocol (CSI u, CSI ? <flags> u, and the ':'
-//     sub-parameter form), including its Hyper/Super/CapsLock/NumLock
-//     modifier bits -- see xterm_mods for why those are masked off;
+//   - the Kitty keyboard protocol's NON-key CSI-u forms: the flags reply
+//     (CSI ? <flags> u) and the set/push/pop requests (CSI = / > / < ... u).
+//     Those are terminal state, not keypresses, and want a Msg vocabulary this
+//     decoder does not have;
+//   - Kitty's Super/Hyper/CapsLock/NumLock modifier bits, which Modifiers has
+//     no member for -- see kitty_mods for why they are masked rather than
+//     folded onto Meta;
+//   - Kitty's event-type extension on the LEGACY key encodings
+//     (CSI 1;5:3 A, CSI 3;5:3 ~), which needs ':' sub-parameters on final bytes
+//     other than 'u'. See csi_params for why that rejection is load-bearing and
+//     was not widened; this is the one thing the Kitty-enabling task will have
+//     to revisit, since a terminal with event types on reports modified arrow
+//     and tilde keys in exactly this form;
+//   - Kitty functional keys Key_Code has no member for: F13-F35, the whole
+//     keypad block, the media keys, and the lone modifier keypresses;
 //   - focus in/out (CSI I / CSI O);
 //   - keypad/DECKPAM keys (ESC O M/X/j-y) and Begin (CSI E / ESC O E);
 //   - Shift+Tab (CSI Z) and rxvt's lowercase-letter arrow forms;
