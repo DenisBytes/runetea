@@ -1,0 +1,105 @@
+package main
+
+import "core:fmt"
+import "core:mem"
+import "core:net"
+import "core:os"
+import "core:strings"
+import "core:sys/posix"
+import rt "../../runetea"
+
+// The Go original fetches https://charm.sh/. Odin core has TCP and DNS
+// (core:net) but NO TLS -- core:crypto ships primitives, not the protocol --
+// and the plan forbids third-party dependencies. So this does a real HTTP/1.1
+// GET over plain http://, which exercises genuine network latency and a real
+// blocking Cmd. Record the TLS gap in the findings; it is a v1.0 concern, not
+// a spike one.
+HOST :: "example.com"
+PORT :: 80
+
+// Go: `func checkServer() tea.Msg { ... }` -- a closure over nothing.
+// RuneTea: an explicit env struct, because Odin has no closures.
+Check_Env :: struct { host: string, port: int }
+
+Status_Msg :: struct { code: int }
+Err_Msg    :: struct { reason: string }
+
+check_server :: proc(env: rawptr) -> any {
+	e := cast(^Check_Env)env
+
+	sock, derr := net.dial_tcp_from_hostname_with_port_override(e.host, e.port)
+	if derr != nil {
+		return rt.box(Err_Msg{reason = fmt.aprintf("dial: %v", derr)}, context.allocator)
+	}
+	defer net.close(sock)
+
+	req := fmt.tprintf("GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", e.host)
+	if _, serr := net.send_tcp(sock, transmute([]u8)req); serr != nil {
+		return rt.box(Err_Msg{reason = fmt.aprintf("send: %v", serr)}, context.allocator)
+	}
+
+	buf: [1024]u8
+	n, rerr := net.recv_tcp(sock, buf[:])
+	if rerr != nil || n < 12 {
+		return rt.box(Err_Msg{reason = fmt.aprintf("recv: %v", rerr)}, context.allocator)
+	}
+
+	// "HTTP/1.1 200 OK" -- the status code is bytes 9..12
+	code := 0
+	for c in buf[9:12] {
+		if c < '0' || c > '9' { break }
+		code = code * 10 + int(c - '0')
+	}
+	if code == 0 {
+		return rt.box(Err_Msg{reason = "unparseable status line"}, context.allocator)
+	}
+	return rt.box(Status_Msg{code = code}, context.allocator)
+}
+
+Model :: struct { status: int, err: string, done: bool }
+
+update :: proc(m: Model, msg: any, alloc: mem.Allocator) -> (Model, rt.Cmd) {
+	m := m
+	switch v in msg {
+	case rt.Key_Msg:
+		if v.code == .Rune && (v.r == 'q' || (v.r == 'c' && .Ctrl in v.mods)) {
+			return m, rt.quit_cmd()
+		}
+	case Status_Msg:
+		m.status = v.code; m.done = true
+		return m, rt.quit_cmd()
+	case Err_Msg:
+		m.err = v.reason; m.done = true
+		return m, rt.quit_cmd()
+	}
+	return m, rt.cmd_nil()
+}
+
+view :: proc(m: Model, alloc: mem.Allocator) -> string {
+	if m.err != "" { return fmt.aprintf("error: %s\n", m.err, allocator = alloc) }
+	if m.done      { return fmt.aprintf("http://%s -> %d\n", HOST, m.status, allocator = alloc) }
+	return fmt.aprintf("Checking http://%s ...\n", HOST, allocator = alloc)
+}
+
+main :: proc() {
+	fd := posix.FD(os.fd(os.stdin))
+	if !rt.term_enter_raw(fd) { fmt.eprintln("not a tty"); os.exit(1) }
+	defer rt.term_restore()
+	rt.install_crash_handlers()
+
+	src, ok := rt.input_source_from_fd(fd)
+	if !ok { fmt.eprintln("bad input source"); os.exit(1) }
+	defer rt.input_close(&src)
+
+	b := strings.builder_make(); defer strings.builder_destroy(&b)
+
+	// The initial Cmd. Go: `Init() Cmd { return checkServer }` -- one
+	// identifier, because checkServer is already a closure of the right type.
+	// RuneTea: cmd_from + a heap-cloned env struct that had to be declared.
+	init := rt.cmd_from(check_server, Check_Env{host = HOST, port = PORT}, context.allocator)
+
+	p: rt.Program(Model)
+	rt.program_init(&p, Model{}, update, view, init)
+
+	if err := rt.run(&p, &src, &b, fd); err != nil { fmt.eprintln("error:", err) }
+}
