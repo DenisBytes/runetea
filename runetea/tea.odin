@@ -119,7 +119,19 @@ run :: proc(p: ^Program($T), src: ^Input_Source, out: ^strings.Builder, flush_fd
 	defer dispatcher_destroy(&disp)
 
 	r: Renderer
-	renderer_init(&r, out)
+	// term_size(flush_fd) is only meaningful when flush_fd is a real tty (the
+	// only case flush_fd >= 0 covers -- see flush_frame's doc comment above).
+	// With flush_fd < 0 (the golden harness, unit tests) there is no fd to
+	// query at all, so width stays 0/unknown and the renderer's rewind falls
+	// back to exactly its pre-fix, one-row-per-logical-line behavior -- see
+	// rows_for_line in width.odin for why that is deliberate, not a gap. A
+	// failed ioctl (term_size ok=false, e.g. a pty with no size ever set)
+	// degrades the same way: initial_w stays 0.
+	initial_w := 0
+	if flush_fd >= 0 {
+		if w, _, ok := term_size(flush_fd); ok { initial_w = w }
+	}
+	renderer_init(&r, out, initial_w)
 
 	// Initial paint, then the init Cmd -- in that order, so an app whose first
 	// action is asynchronous still shows its loading state immediately.
@@ -270,6 +282,18 @@ apply :: proc(p: ^Program($T), msg: any, fa: ^Frame_Arena, disp: ^Dispatcher, r:
 
 	if _, is_quit := msg.(Quit_Msg); is_quit { p.quit = true; return nil }
 	if _, is_int := msg.(Interrupt_Msg); is_int { return Interrupted_Error{} }
+
+	// Window_Size_Msg updates the renderer's width for FUTURE rewinds (see
+	// renderer_set_width's doc comment on why last_rows itself is untouched
+	// here) and then falls through to the user's own update() below, same as
+	// any other message -- unlike Quit/Interrupt above, a resize is not
+	// terminal to the loop and Bubble Tea apps commonly react to it for their
+	// own layout. ws.w == 0 is signals.odin's own "term_size lookup failed"
+	// sentinel (SIGWINCH fired but the ioctl came back empty) -- ignored here
+	// so a bad lookup can't clobber a previously-known-good width.
+	if ws, is_resize := msg.(Window_Size_Msg); is_resize && ws.w > 0 {
+		renderer_set_width(r, ws.w)
+	}
 
 	step := Step(T){p = p, msg = msg, alloc = frame_allocator(fa)}
 	info := guarded(proc(ud: rawptr) {
