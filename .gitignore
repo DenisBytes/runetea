@@ -20,4 +20,5 @@
 /tools/*/crashcheck
 /tools/*/msgcheck
 /tools/*/nbiocheck
+/tools/*/ttycheck
 /tools/*/golden
