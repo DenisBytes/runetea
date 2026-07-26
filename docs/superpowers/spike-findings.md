@@ -65,8 +65,20 @@ tty-hello. ANSWER: YES", 5/5 stable runs, Linux/io_uring backend. A negative con
 (skip the raw-mode call) correctly reports a timeout rather than a false positive,
 proving the probe is not vacuous.
 
-Surprise found along the way: `loop.odin`'s `Fd_Source` (the production wrapper around
-this, used by `run()`'s reader thread) originally treated `EINTR` on `poll`/`read` as
+**IMPORTANT SCOPE CORRECTION (added after the whole-branch review).** The above proves
+`core:nbio` *can* read a real character device. It does **not** prove nbio can host the
+event loop, and the shipped framework does not use nbio at all: `import "core:nbio"`
+appears only in `tools/nbiocheck` and `tools/ttycheck`, never in `runetea/`. What ships
+is `loop.odin`'s `Fd_Source` — a hand-rolled `posix.poll` + blocking `read` on a
+dedicated thread + a self-pipe wake. That is not a wrapper around nbio; it shares zero
+code with it, and it is structurally a miniature of the `cancelreader` the design
+(spec §6) promised nbio would delete. Spec §14.2 required BOTH the nbio path and the
+`posix.poll` fallback built behind one interface and both tested on Linux; only the
+fallback shipped. **"The nbio event loop is RuneTea's event loop" remains an open bet
+and should be the first thing T1 either lands or abandons.**
+
+Surprise found along the way: `loop.odin`'s `Fd_Source` (the shipped input path, used by
+`run()`'s reader thread) originally treated `EINTR` on `poll`/`read` as
 fatal, and had no way to cancel a thread blocked inside a read — both fixed in Task 6
 (EINTR retry on both syscalls; a self-owned non-blocking wake pipe polled alongside the
 data fd, exposed as `input_wake`). Both fixes were proven non-vacuous by reverting each
@@ -372,3 +384,47 @@ short-circuits without a further render — hence the repeated `count: 2` as the
 and final frame. Every escape sequence present (`\r` as line terminator, `ESC [ 1 A`,
 `ESC [ 2 K`) is exactly what `render.odin`'s rewind-and-repaint design is documented to
 emit; nothing unexpected is in the file.
+
+
+---
+
+## Addendum — findings from the whole-branch review (added after §1-§8 were written)
+
+The per-task reviews could not see these; a final cross-cutting pass found them.
+Four were fixed in the closing fix wave; five are T1 design inputs. Recorded here
+because §1-§8 read as a closing argument and omitted them.
+
+**Fixed in the closing fix wave (commit `a0149d6`):**
+
+1. **CRITICAL, and it would have shipped.** `mailbox_send` returned `false` for both
+   *closed* and *full*, and the reader treated both as terminal — returning WITHOUT
+   closing the mailbox, so the main loop blocked forever in `mailbox_recv`. Pasting
+   ~1000 characters into `examples/simple` was enough. Measured: 300 and 500 chars
+   fine, 1000 hangs. Now returns a three-way result; the reader retries on Full and
+   exits only on Closed. Verified: 2000- and 8000-char pastes exit cleanly.
+2. `sigaltstack` is per-thread — pool workers, detached Cmds, the watcher and the
+   reader had none, so Tier 2 was false on three of four thread classes.
+3. `guarded()`'s nesting guard was an `assert`, stripped by `-disable-assert`.
+4. Both examples called `install_crash_handlers` *after* `term_enter_raw`, and the
+   framework emitted an alt-screen exit (`\e[?1049l`) it never entered.
+
+**Open — T1 design inputs, NOT defects in the bet:**
+
+5. `run()` cannot return until the slowest in-flight Cmd finishes, and nothing can
+   cancel one. Measured: one 2-second Cmd → quit takes 2.000s. `examples/http` has no
+   socket timeout, so a stalled host freezes the UI with the terminal still raw.
+6. The renderer rewinds *logical* lines, not *physical* rows. Any line wider than the
+   terminal wraps and the rewind under-counts, corrupting the display progressively.
+   `term_size()` exists and the renderer never consults it. The golden harness
+   therefore certifies only short lines.
+7. Tier 1 (`guarded`) wraps `update` only — `view` and Cmd bodies run unguarded.
+8. Message ownership is undefined and `examples/http` has already committed to an
+   answer (it stores a pool-allocated string straight into the model). Decide
+   borrow-vs-own **before** T1 writes more examples.
+9. See the nbio scope correction in §2.
+
+**LOC, measured correctly.** §8's 1404 counts comments. Stripped: **714 lines of code
+against the ~900 target — 21% under.** 555 lines (40%) are comments, some of which now
+describe architectures the code does not implement and need a correctness pass. The
+real T1 planning input is that the *verification apparatus* (1140 test LOC + ~1100 LOC
+of `tools/` harnesses) cost roughly 3x the framework itself.
