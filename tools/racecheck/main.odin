@@ -63,6 +63,7 @@ main :: proc() {
 	phase_signals()
 	phase_program()
 	phase_program_nbio()
+	phase_dispatcher_reap()
 	fmt.printfln("=== racecheck: all phases completed without crashing (%v) ===", time.since(start))
 }
 
@@ -203,7 +204,7 @@ Cmd_Result :: struct { id: int }
 
 Pool_Env :: struct { id: int }
 
-pool_cmd_run :: proc(env: rawptr) -> any {
+pool_cmd_run :: proc(env: rawptr, cancel: ^rt.Cancel_Token) -> any {
 	e := cast(^Pool_Env)env
 	// Stagger completion so a meaningful fraction are still running when the
 	// dispatch loop below reaches dispatcher_destroy.
@@ -213,7 +214,7 @@ pool_cmd_run :: proc(env: rawptr) -> any {
 
 Detached_Env :: struct { id: int }
 
-detached_cmd_run :: proc(env: rawptr) -> any {
+detached_cmd_run :: proc(env: rawptr, cancel: ^rt.Cancel_Token) -> any {
 	e := cast(^Detached_Env)env
 	if e.id % 5 == 0 { time.sleep(time.Millisecond) }
 	return rt.box(Cmd_Result{id = e.id}, context.allocator)
@@ -404,7 +405,7 @@ race_view :: proc(m: Race_Model, alloc: mem.Allocator) -> string {
 	return fmt.aprintf("n=%d", m.n, allocator = alloc)
 }
 
-race_async_quit :: proc(env: rawptr) -> any {
+race_async_quit :: proc(env: rawptr, cancel: ^rt.Cancel_Token) -> any {
 	time.sleep(2 * time.Millisecond)
 	return rt.box(rt.Quit_Msg{}, context.allocator)
 }
@@ -548,4 +549,95 @@ phase_program_nbio :: proc() {
 
 	fmt.printfln("  program_nbio: %d full run_nbio() cycles completed (%d async-Cmd quits with no keypress, %d keypress-driven quits)",
 		RACE_PROGRAM_ITERS, (RACE_PROGRAM_ITERS + 1) / 2, RACE_PROGRAM_ITERS / 2)
+}
+
+// --- Phase F: dispatcher_reap --------------------------------------------
+//
+// Phases B/D/E already exercise dispatcher_reap indirectly through run()
+// (T1's fast-quit fix, cmd.odin/tea.odin) -- this phase targets it directly,
+// with a MIX of grace periods and Cmd durations chosen specifically to force
+// BOTH of its outcomes under real concurrency: some Cmds finish within the
+// grace period (the effectively-synchronous case that avoids the allocator-
+// rotation hazard docs/superpowers/cancellation-decision.md describes), and
+// some deliberately OUTLIVE it, forcing the true async-detach path where the
+// reaper thread keeps running well after dispatcher_reap has already
+// returned to its caller and a brand new Reap_Ctx for the NEXT iteration is
+// already in flight. That second case is the one that actually matters for
+// "no UAF" -- it is the only one where anything survives past the call that
+// owns it, and it is exactly what caught the real heap-use-after-free this
+// file's grace-period design was built around (see cmd.odin's Grace_Signal
+// and the decision doc's account of that bug). Also exercises Cancel_Token:
+// a subset of dispatched Cmds poll cancel_requested and race
+// dispatcher_reap's own cancel_token_fire.
+RD_ITERS :: 150
+RD_GRACE :: 5 * time.Millisecond
+
+Rd_Env :: struct {
+	sleep:       time.Duration,
+	cancel_poll: bool,
+	completed:   ^int,   // atomic; owned by phase_dispatcher_reap, NOT by the Reap_Ctx a given Cmd runs under -- must outlive it regardless of when that Cmd's own reaper thread finishes
+}
+
+rd_cmd_run :: proc(env: rawptr, cancel: ^rt.Cancel_Token) -> any {
+	e := cast(^Rd_Env)env
+	if e.cancel_poll {
+		waited: time.Duration
+		for waited < e.sleep {
+			if rt.cancel_requested(cancel) { break }
+			time.sleep(200 * time.Microsecond)
+			waited += 200 * time.Microsecond
+		}
+	} else {
+		time.sleep(e.sleep)
+	}
+	sync.atomic_add(e.completed, 1)
+	return rt.box(Cmd_Result{id = 0}, context.allocator)
+}
+
+phase_dispatcher_reap :: proc() {
+	fmt.println("--- phase F: dispatcher_reap (direct, mixed grace outcomes, cancellation) ---")
+
+	completed: int
+	for i in 0 ..< RD_ITERS {
+		// Heap-owned exactly the way tea.odin's run() does it -- see
+		// Reap_Ctx's own doc comment (cmd.odin) for why this must be heap,
+		// not a stack local, once dispatcher_reap can hand it to a
+		// background thread that may still be running after this loop has
+		// moved on to its next iteration (or phase_dispatcher_reap itself
+		// has returned).
+		rc := new(rt.Reap_Ctx)
+		if err := rt.mailbox_init(&rc.mbox, 8); err != nil {
+			fmt.eprintln("mailbox_init failed:", err)
+			os.exit(1)
+		}
+		rt.dispatcher_init(&rc.disp, &rc.mbox, 2)
+
+		env: Rd_Env
+		switch i % 3 {
+		case 0: env = Rd_Env{sleep = 30 * time.Millisecond, completed = &completed}                        // outlives RD_GRACE -- forces async-detach
+		case 1: env = Rd_Env{sleep = 20 * time.Millisecond, cancel_poll = true, completed = &completed}    // races cancel_token_fire against the poll loop
+		case:   env = Rd_Env{sleep = 0, completed = &completed}                                             // finishes inside RD_GRACE
+		}
+		rt.dispatch(&rc.disp, rt.cmd_from(rd_cmd_run, env, context.allocator))
+
+		rt.dispatcher_reap(rc, RD_GRACE)
+		// Deliberately does NOT touch rc again after this, on any path --
+		// matching dispatcher_reap's own documented precondition. Whether
+		// this call finished synchronously or detached, the next loop
+		// iteration immediately starts a NEW, independent Reap_Ctx/Dispatcher
+		// pool concurrently with whatever this one's reaper thread is still
+		// doing -- exactly the overlap that stresses allocator/thread
+		// lifetime the most.
+	}
+
+	// Give any reaper threads that outlived their own iteration's grace
+	// period (the i%3==0 and slow i%3==1 cases above) a chance to actually
+	// finish and post to `completed` before this phase -- and eventually the
+	// whole process -- exits, so TSan's observation window covers them and
+	// the printed count below is meaningful rather than a race against
+	// process exit.
+	time.sleep(500 * time.Millisecond)
+
+	fmt.printfln("  dispatcher_reap: %d/%d Cmds completed (async-detach, cancellation, and in-grace outcomes all exercised)",
+		sync.atomic_load(&completed), RD_ITERS)
 }

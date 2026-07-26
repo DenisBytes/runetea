@@ -49,7 +49,7 @@ test_run_nbio_quits_from_an_async_init_cmd_with_no_keypress :: proc(t: ^testing.
 	Idle :: struct {}
 	idle_update :: proc(m: Idle, msg: any, alloc: mem.Allocator) -> (Idle, Cmd) { return m, cmd_nil() }
 	idle_view   :: proc(m: Idle, alloc: mem.Allocator) -> string { return "" }
-	quit_now    :: proc(env: rawptr) -> any { return box(Quit_Msg{}, context.allocator) }
+	quit_now    :: proc(env: rawptr, cancel: ^Cancel_Token) -> any { return box(Quit_Msg{}, context.allocator) }
 
 	fds: [2]posix.FD
 	testing.expect(t, posix.pipe(&fds) == .OK, "pipe should succeed")

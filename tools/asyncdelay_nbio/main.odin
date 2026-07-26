@@ -18,7 +18,7 @@ import rt "../../runetea"
 
 Ready_Msg :: struct { value: int }
 
-slow_cmd :: proc(env: rawptr) -> any {
+slow_cmd :: proc(env: rawptr, cancel: ^rt.Cancel_Token) -> any {
 	time.sleep(300 * time.Millisecond)
 	return rt.box(Ready_Msg{value = 42}, context.allocator)
 }

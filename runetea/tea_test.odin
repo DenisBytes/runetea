@@ -84,7 +84,7 @@ test_program_quits_from_an_async_init_cmd_with_no_keypress :: proc(t: ^testing.T
 	Idle :: struct {}
 	idle_update :: proc(m: Idle, msg: any, alloc: mem.Allocator) -> (Idle, Cmd) { return m, cmd_nil() }
 	idle_view   :: proc(m: Idle, alloc: mem.Allocator) -> string { return "" }
-	quit_now    :: proc(env: rawptr) -> any { return box(Quit_Msg{}, context.allocator) }
+	quit_now    :: proc(env: rawptr, cancel: ^Cancel_Token) -> any { return box(Quit_Msg{}, context.allocator) }
 
 	fds: [2]posix.FD
 	testing.expect(t, posix.pipe(&fds) == .OK, "pipe should succeed")
@@ -183,4 +183,81 @@ test_run_survives_a_mailbox_overflow :: proc(t: ^testing.T) {
 	strings.builder_destroy(&h.b)
 
 	testing.expect(t, h.err == nil, "run should exit cleanly once the transiently-full mailbox drains")
+}
+
+// THE structural fix this whole change exists to make (T1,
+// docs/superpowers/cancellation-decision.md): run() must return promptly
+// even while a Cmd is still running, instead of blocking in dispatcher_destroy
+// until that Cmd finishes -- the addendum's measured "one 2-second Cmd in
+// flight -> quit takes 2.000s". This end-to-end test pins the fix at run()'s
+// own public boundary, not just at dispatcher_reap's level (cmd_test.odin
+// already covers that directly) -- dispatches a 300ms Cmd on the first
+// keypress, quits on the second, and asserts run() returns in well under
+// 300ms. Non-vacuous: verified by temporarily reverting tea.odin's
+// `defer dispatcher_reap(rc, QUIT_GRACE)` back to the original
+// `defer dispatcher_destroy(&disp)` + `defer mailbox_destroy(&mbox)` pair and
+// re-running -- elapsed then measures >= 300ms and the assertion below fails,
+// exactly as expected (see docs/superpowers/cancellation-decision.md for the
+// actual recorded numbers, before and after).
+Slow_Quit_Env :: struct { finished: ^sync.Sema }
+
+slow_quit_cmd_run :: proc(env: rawptr, cancel: ^Cancel_Token) -> any {
+	e := cast(^Slow_Quit_Env)env
+	time.sleep(300 * time.Millisecond)
+	// Signaled purely so this TEST can wait deterministically for the Cmd to
+	// actually finish before returning -- see the test's own trailing
+	// comment. The Msg itself is expected to be discarded: by the time this
+	// Cmd resolves, run() has long since quit and closed the mailbox.
+	sync.sema_post(e.finished)
+	return box(Empty_Result{}, context.allocator)
+}
+
+Slow_Quit_Model :: struct { armed: bool, finished: ^sync.Sema }
+
+slow_quit_update :: proc(m: Slow_Quit_Model, msg: any, alloc: mem.Allocator) -> (Slow_Quit_Model, Cmd) {
+	m := m
+	if _, is_key := msg.(Key_Msg); is_key {
+		if !m.armed {
+			m.armed = true
+			return m, cmd_from(slow_quit_cmd_run, Slow_Quit_Env{finished = m.finished}, context.allocator)
+		}
+		return m, quit_cmd()
+	}
+	return m, cmd_nil()
+}
+
+slow_quit_view :: proc(m: Slow_Quit_Model, alloc: mem.Allocator) -> string { return "" }
+
+@(test)
+test_run_returns_promptly_with_a_slow_cmd_still_in_flight :: proc(t: ^testing.T) {
+	finished: sync.Sema
+
+	// "aq": 'a' dispatches the 300ms Cmd (first keypress), 'q' quits
+	// (second) -- both already queued by the reader thread well before the
+	// Cmd has any chance to finish, so it is still genuinely running when
+	// run()'s main loop breaks out on Quit_Msg.
+	src := input_source_from_bytes(transmute([]u8)string("aq"))
+	defer input_close(&src)
+	b := strings.builder_make(); defer strings.builder_destroy(&b)
+
+	p: Program(Slow_Quit_Model)
+	program_init(&p, Slow_Quit_Model{finished = &finished}, slow_quit_update, slow_quit_view)
+
+	start := time.now()
+	err := run(&p, &src, &b)
+	elapsed := time.since(start)
+
+	testing.expect(t, err == nil, "run should exit cleanly")
+	testing.expectf(t, elapsed < 200 * time.Millisecond,
+		"run() should return well before its 300ms Cmd finishes (QUIT_GRACE is 100ms) -- took %v", elapsed)
+
+	// Let the Cmd itself finish, and give the trailing background teardown
+	// (dispatcher_destroy + mailbox_destroy + free inside the reaper thread
+	// dispatcher_reap spawned) a fixed margin, before this test function
+	// returns: the SAME per-task Tracking_Allocator hazard
+	// test_dispatcher_reap_does_not_block_the_caller documents (cmd_test.odin)
+	// applies here too, one level up, since run() now tears its Dispatcher/
+	// Mailbox down through that identical path.
+	sync.sema_wait(&finished)
+	time.sleep(150 * time.Millisecond)
 }

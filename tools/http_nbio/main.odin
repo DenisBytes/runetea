@@ -29,7 +29,7 @@ Status_Msg :: struct { code: int }
 // requirement applies (box()'s MESSAGE OWNERSHIP CONTRACT, runetea/arena.odin).
 Err_Msg :: struct { reason: rt.Msg_Text }
 
-check_server :: proc(env: rawptr) -> any {
+check_server :: proc(env: rawptr, cancel: ^rt.Cancel_Token) -> any {
 	e := cast(^Check_Env)env
 
 	sock, derr := net.dial_tcp_from_hostname_with_port_override(e.host, e.port)

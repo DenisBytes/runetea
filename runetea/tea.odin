@@ -5,6 +5,7 @@ import "core:strings"
 import "core:sync"
 import "core:sys/posix"
 import "core:thread"
+import "core:time"
 
 Quit_Msg :: struct {}
 
@@ -44,7 +45,7 @@ program_init :: proc(
 	p.quit     = false
 }
 
-quit_run :: proc(env: rawptr) -> any { return box(Quit_Msg{}, context.allocator) }
+quit_run :: proc(env: rawptr, cancel: ^Cancel_Token) -> any { return box(Quit_Msg{}, context.allocator) }
 
 quit_cmd :: proc() -> Cmd {
 	return Cmd{procedure = quit_run, env = nil, allocator = context.allocator}
@@ -70,11 +71,21 @@ run :: proc(p: ^Program($T), src: ^Input_Source, out: ^strings.Builder, flush_fd
 	}
 	defer frame_arena_destroy(&fa)
 
-	mbox: Mailbox
-	if err := mailbox_init(&mbox, 256); err != nil {
+	// Heap-allocated, not stack locals: see Reap_Ctx's own doc comment
+	// (cmd.odin) for why. If a Cmd is still in flight when this run() session
+	// quits, run() must be able to return before that Cmd finishes (that is
+	// the whole point of this change -- see
+	// docs/superpowers/cancellation-decision.md) -- so rc.disp and rc.mbox
+	// must both outlive run()'s own stack frame, which a plain `mbox: Mailbox`
+	// / `disp: Dispatcher` local could never do.
+	rc := new(Reap_Ctx, context.allocator)
+	if rc == nil {
+		return Terminal_Error{detail = "dispatcher/mailbox allocation failed"}
+	}
+	if err := mailbox_init(&rc.mbox, 256); err != nil {
+		free(rc, context.allocator)
 		return Terminal_Error{detail = "mailbox init failed"}
 	}
-	defer mailbox_destroy(&mbox)
 
 	// Signal_Watcher MUST start before any other thread this function
 	// creates (the Dispatcher's pool below, and the reader thread further
@@ -104,19 +115,45 @@ run :: proc(p: ^Program($T), src: ^Input_Source, out: ^strings.Builder, flush_fd
 	// exact cross-test pollution signals.odin's own SIG_WAKE-vs-SIGUSR1
 	// comment already goes out of its way to avoid.
 	sw: Signal_Watcher
-	if flush_fd >= 0 { signal_watcher_start(&sw, &mbox, flush_fd) }
-	// signal_watcher_stop no-ops on a never-started watcher (sw.running is
-	// false in its zero value), so this is safe unconditionally. It must
-	// run before mailbox_destroy -- the watcher is a mailbox producer, and
-	// mailbox_destroy's precondition requires every producer stopped and
-	// joined first -- which is why this defer is declared here, ahead of
-	// dispatcher_init: LIFO means it fires after dispatcher_destroy but
-	// before mailbox_destroy, exactly where it belongs.
-	defer signal_watcher_stop(&sw)
+	if flush_fd >= 0 { signal_watcher_start(&sw, &rc.mbox, flush_fd) }
 
-	disp: Dispatcher
-	dispatcher_init(&disp, &mbox, 4)
-	defer dispatcher_destroy(&disp)
+	dispatcher_init(&rc.disp, &rc.mbox, 4)
+	// Declared BEFORE signal_watcher_stop's defer just below -- the OPPOSITE
+	// of the two calls' own required order above (signal_watcher_start must
+	// run before dispatcher_init; see that comment) -- so that at return time
+	// it runs AFTER signal_watcher_stop instead. defer's LIFO order is fixed
+	// by DECLARATION position, not by when the matching setup call actually
+	// ran, so both orderings hold simultaneously: setup runs watcher-then-
+	// dispatcher, teardown runs (reader, declared further below, first, then)
+	// watcher-then-dispatcher-reap.
+	//
+	// This ordering is load-bearing for dispatcher_reap specifically (its own
+	// PRECONDITION, cmd.odin): dispatcher_reap hands rc off to a BACKGROUND
+	// thread, so by the time it is even CALLED, every other producer that
+	// could still touch rc.mbox -- this Signal_Watcher, and the reader
+	// thread torn down in the defer declared further below -- must already be
+	// stopped and joined. If dispatcher_reap ran first, the background reaper
+	// could reach mailbox_destroy (whenever rc.disp's own Cmds happen to
+	// finish, possibly before this function even returns) while the watcher
+	// or reader thread is still alive and could still be mid mailbox_send --
+	// exactly the use-after-free Task 5 fixed once already, reintroduced via
+	// a different producer. Reordering these two defers is what keeps that
+	// proof intact while still letting run() return without waiting for an
+	// in-flight Cmd.
+	//
+	// QUIT_GRACE bounds the worst case (a Cmd still running when the user
+	// quits) to itself instead of that Cmd's own duration -- see
+	// dispatcher_reap's own doc comment (cmd.odin) and
+	// docs/superpowers/cancellation-decision.md for why a SHORT bounded wait,
+	// not grace=0 (pure fire-and-forget), is what run() actually needs: it
+	// keeps the overwhelmingly common case (no Cmd in flight, or one that
+	// finishes quickly) fully synchronous, which matters for any caller whose
+	// context.allocator does not outlive this call by much -- odin test's own
+	// per-task allocator is exactly such a caller, rotated to a different
+	// test the moment THIS test's run() call returns.
+	QUIT_GRACE :: 100 * time.Millisecond
+	defer dispatcher_reap(rc, QUIT_GRACE)
+	defer signal_watcher_stop(&sw)
 
 	r: Renderer
 	// term_size(flush_fd) is only meaningful when flush_fd is a real tty (the
@@ -141,7 +178,7 @@ run :: proc(p: ^Program($T), src: ^Input_Source, out: ^strings.Builder, flush_fd
 		flush_frame(out, flush_fd)
 		frame_reset(&fa)
 	}
-	if !cmd_is_nil(p.init_cmd) { dispatch(&disp, p.init_cmd) }
+	if !cmd_is_nil(p.init_cmd) { dispatch(&rc.disp, p.init_cmd) }
 
 	// The mailbox is the SINGLE wait point. A reader thread turns bytes into
 	// Key_Msgs and pushes them alongside Cmd results, so an async result
@@ -150,11 +187,15 @@ run :: proc(p: ^Program($T), src: ^Input_Source, out: ^strings.Builder, flush_fd
 	//
 	// The spike reads on a thread rather than through nbio because the loop
 	// still owns rendering; Task 6's nbio path replaces this reader in T1.
-	rd := Reader_Ctx{src = src, mailbox = &mbox}
+	rd := Reader_Ctx{src = src, mailbox = &rc.mbox}
 	reader := thread.create(reader_thread)
 	reader.data = &rd
 	reader.init_context = context
 	thread.start(reader)
+	// Declared LAST, so it is the FIRST of this function's defers to run --
+	// see the comment above dispatcher_reap's own defer for why that
+	// ordering (reader, then watcher, then dispatcher_reap) is load-bearing,
+	// not incidental.
 	defer {
 		sync.atomic_store(&rd.stop, true)
 		// MUST wake the reader before joining. It parks inside input_read
@@ -162,15 +203,15 @@ run :: proc(p: ^Program($T), src: ^Input_Source, out: ^strings.Builder, flush_fd
 		// via a UI action rather than a keypress would otherwise hang here
 		// forever.
 		input_wake(src)
-		mailbox_close(&mbox)
+		mailbox_close(&rc.mbox)
 		thread.join(reader)
 		thread.destroy(reader)
 	}
 
 	for !p.quit {
-		msg, ok := mailbox_recv(&mbox)
+		msg, ok := mailbox_recv(&rc.mbox)
 		if !ok { break }   // closed and drained
-		if e := apply(p, msg, &fa, &disp, &r, out, flush_fd); e != nil { return e }
+		if e := apply(p, msg, &fa, &rc.disp, &r, out, flush_fd); e != nil { return e }
 	}
 	return nil
 }

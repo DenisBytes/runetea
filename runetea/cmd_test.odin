@@ -1,5 +1,6 @@
 package runetea
 
+import "core:sync"
 import "core:testing"
 import "core:time"
 
@@ -14,7 +15,7 @@ Fetch_Env :: struct { url: string, delay: time.Duration }
 // string.
 Fetch_Result :: struct { url: Msg_Text, status: int }
 
-fetch_run :: proc(env: rawptr) -> any {
+fetch_run :: proc(env: rawptr, cancel: ^Cancel_Token) -> any {
 	e := cast(^Fetch_Env)env
 	time.sleep(e.delay)
 	return box(Fetch_Result{url = msg_text_from(e.url), status = 200}, context.allocator)
@@ -25,7 +26,7 @@ test_cmd_carries_env_without_closures :: proc(t: ^testing.T) {
 	c := cmd_from(fetch_run, Fetch_Env{url = "https://example.com", delay = 0}, context.allocator)
 	testing.expect(t, !cmd_is_nil(c), "cmd should be populated")
 
-	msg := c.procedure(c.env)
+	msg := c.procedure(c.env, nil)
 	r, ok := msg.(Fetch_Result)
 	testing.expect(t, ok, "expected a Fetch_Result")
 	url := r.url
@@ -76,7 +77,7 @@ test_cmd_nil_is_detectable :: proc(t: ^testing.T) {
 // pinned here.
 Empty_Result :: struct {}
 
-empty_run :: proc(env: rawptr) -> any {
+empty_run :: proc(env: rawptr, cancel: ^Cancel_Token) -> any {
 	return box(Empty_Result{}, context.allocator)
 }
 
@@ -122,7 +123,7 @@ test_dispatch_delivers_a_zero_sized_result_detached :: proc(t: ^testing.T) {
 // This test pins that: more coordinators than workers must still complete.
 Coord_Env :: struct { d: ^Dispatcher, inner: ^Mailbox }
 
-coord_run :: proc(env: rawptr) -> any {
+coord_run :: proc(env: rawptr, cancel: ^Cancel_Token) -> any {
 	e := cast(^Coord_Env)env
 	// A child unit of work, run inline here to keep the test deterministic;
 	// the point under test is that the coordinator itself is not pool-bound.
@@ -176,7 +177,7 @@ test_detached_cmds_exceed_pool_width_without_deadlock :: proc(t: ^testing.T) {
 // would hit the meanwhile-destroyed mailbox.
 Slow_Env :: struct {}
 
-slow_run :: proc(env: rawptr) -> any {
+slow_run :: proc(env: rawptr, cancel: ^Cancel_Token) -> any {
 	time.sleep(150 * time.Millisecond)
 	return box(Fetch_Result{url = msg_text_from("slow"), status = 2}, context.allocator)
 }
@@ -200,4 +201,125 @@ test_dispatcher_destroy_waits_for_detached_cmds :: proc(t: ^testing.T) {
 	// Only safe to reach here, after dispatcher_destroy has proven no
 	// detached Cmd can still be touching the mailbox.
 	mailbox_destroy(&m)
+}
+
+// T1 structural fix (docs/superpowers/cancellation-decision.md): dispatcher_reap
+// is dispatcher_destroy + mailbox_destroy's non-blocking sibling, the one
+// run() actually uses so it can return promptly while a Cmd is still
+// running. This pins the "does not block" half directly, mirroring
+// test_dispatcher_destroy_waits_for_detached_cmds's own shape (dispatch a
+// slow Cmd, time the teardown call) but asserting the OPPOSITE: unlike that
+// test's `elapsed >= 100ms`, this one is non-vacuous only if it reliably
+// FAILS against the plain, always-blocking dispatcher_destroy this replaced
+// -- verified by temporarily swapping this test's dispatcher_reap(rc, 20ms)
+// call for dispatcher_destroy(&rc.disp) + mailbox_destroy(&rc.mbox) and
+// re-running: it then takes >= 300ms (the Cmd's own sleep) and this test's
+// `elapsed < 150ms` assertion fails, exactly as expected.
+Reap_Slow_Env :: struct { done: ^sync.Sema }
+
+reap_slow_run :: proc(env: rawptr, cancel: ^Cancel_Token) -> any {
+	e := cast(^Reap_Slow_Env)env
+	time.sleep(300 * time.Millisecond)
+	// Signals a Sema this TEST owns on its own stack -- not anything inside
+	// rc, which dispatcher_reap has already taken ownership of by the time
+	// this Cmd is even running. See the test's own trailing comment for why
+	// that distinction matters.
+	sync.sema_post(e.done)
+	return box(Fetch_Result{url = msg_text_from("reap-slow"), status = 3}, context.allocator)
+}
+
+@(test)
+test_dispatcher_reap_does_not_block_the_caller :: proc(t: ^testing.T) {
+	done: sync.Sema
+
+	// Heap-owned exactly the way tea.odin's run() does it -- see Reap_Ctx's
+	// own doc comment (cmd.odin): dispatcher_reap can hand rc off to a
+	// background thread that outlives this test function, so rc cannot be a
+	// stack local here either.
+	rc := new(Reap_Ctx)
+	testing.expect_value(t, mailbox_init(&rc.mbox, 8), nil)
+	dispatcher_init(&rc.disp, &rc.mbox, 1)
+
+	dispatch(&rc.disp, cmd_from(reap_slow_run, Reap_Slow_Env{done = &done}, context.allocator))
+
+	start := time.now()
+	finished := dispatcher_reap(rc, 20 * time.Millisecond)
+	elapsed := time.since(start)
+
+	testing.expect(t, !finished, "dispatcher_reap should NOT finish within a 20ms grace period against a 300ms Cmd")
+	testing.expectf(t, elapsed < 150 * time.Millisecond,
+		"dispatcher_reap should return close to its 20ms grace period, not block for the Cmd's full 300ms -- took %v", elapsed)
+
+	// Deliberately does NOT touch rc again after dispatcher_reap: ownership
+	// transferred to the reaper thread on that call, per its own documented
+	// precondition. Waiting on `done` instead -- a Sema this test owns on its
+	// own stack, signaled by the Cmd body itself as basically its last action
+	// -- is what lets this test return only once the Cmd has genuinely
+	// finished, WITHOUT odin test's per-task Tracking_Allocator racing the
+	// reaper thread's own free(rc) call the way an earlier version of this
+	// fix did: that version put the wait target directly inside Reap_Ctx and
+	// freed Reap_Ctx immediately after signaling it, which ThreadSanitizer
+	// caught as a genuine heap-use-after-free (see cmd.odin's Grace_Signal
+	// for the fix and docs/superpowers/cancellation-decision.md for the
+	// account of that bug).
+	sync.sema_wait(&done)
+	// Small fixed margin for the trailing dispatcher_destroy/mailbox_destroy/
+	// free(rc) inside the reaper thread, which runs after the Cmd body's own
+	// sema_post above -- not a correctness requirement of the fix itself,
+	// purely to keep this test's own memory report clean (same reasoning as
+	// the margin below in test_cancel_token_observed_by_a_polling_cmd).
+	time.sleep(50 * time.Millisecond)
+}
+
+// HALF 2 (docs/superpowers/cancellation-decision.md): a Cmd can poll
+// cancel_requested to notice the enclosing Dispatcher session is quitting.
+// This pins that the token actually reaches a running Cmd promptly --
+// dispatcher_reap fires it as its very first action, before the reaper
+// thread is even spawned, so a Cmd polling every 5ms should see it within a
+// poll interval or two, not run anywhere near its own 100-iteration bound.
+Cancel_Probe :: struct {
+	done:       sync.Sema,
+	observed:   bool,
+	iterations: int,
+}
+
+Cancel_Poll_Env :: struct { probe: ^Cancel_Probe }
+
+cancel_poll_run :: proc(env: rawptr, cancel: ^Cancel_Token) -> any {
+	e := cast(^Cancel_Poll_Env)env
+	p := e.probe
+	for i in 0 ..< 100 {
+		if cancel_requested(cancel) {
+			p.observed = true
+			p.iterations = i
+			break
+		}
+		time.sleep(5 * time.Millisecond)
+	}
+	sync.sema_post(&p.done)
+	return box(Empty_Result{}, context.allocator)
+}
+
+@(test)
+test_cancel_token_observed_by_a_polling_cmd :: proc(t: ^testing.T) {
+	probe: Cancel_Probe
+
+	rc := new(Reap_Ctx)
+	testing.expect_value(t, mailbox_init(&rc.mbox, 8), nil)
+	dispatcher_init(&rc.disp, &rc.mbox, 1)
+
+	dispatch(&rc.disp, cmd_from(cancel_poll_run, Cancel_Poll_Env{probe = &probe}, context.allocator))
+
+	// grace=0: this test only cares about the token firing promptly, not
+	// about dispatcher_reap's own return timing (that is
+	// test_dispatcher_reap_does_not_block_the_caller's job, above).
+	dispatcher_reap(rc, 0)
+
+	sync.sema_wait(&probe.done)          // deterministic: waits for the Cmd body itself, not the reaper
+	time.sleep(20 * time.Millisecond)    // margin for the trailing teardown -- see the test above for why
+
+	testing.expect(t, probe.observed, "the polling Cmd should have observed cancel_requested before its own 100-iteration bound")
+	testing.expectf(t, probe.iterations < 5,
+		"cancellation should be observed within a couple of 5ms poll intervals, not after running the full bound -- took %d iterations",
+		probe.iterations)
 }
