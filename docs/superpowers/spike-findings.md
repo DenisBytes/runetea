@@ -137,12 +137,61 @@ task that touches this:
 
 ## 4. Crash safety — Tier 1 and Tier 2
 
-**Tier 1** (`assertion_failure_proc` + `setjmp`/`longjmp`, `guard.odin`): recovers
-- a `panic()` in user code — `tea_test.odin::test_program_recovers_from_a_panicking_update`
-  drives it through the full `Program`/`run()` path, asserting the result is
-  `Panicked_Error`, not a crash.
-- a failed `assert()` — `guard_test.odin` (see line 6).
-- a bad type assertion — `guard_test.odin::test_guard_recovers_bad_type_assertion`.
+**CORRECTED (T1, `docs/superpowers/tier1-coverage-decision.md`).** As shipped
+at the end of the T0 spike, this section's "Tier 1 recovers a panic in user
+code" claim was true for exactly one of the three places user code actually
+runs — `update`. A panic in `view` or in a Cmd procedure fell straight
+through to Tier 2 (the process died honestly, terminal restored, but was not
+*recoverable* the way `update`'s was) — see the Addendum's item 7 below,
+which flagged this gap without yet closing it. T1's last decision closed it
+for all three:
+
+**Tier 1** (`assertion_failure_proc` + `setjmp`/`longjmp`, `guard.odin`):
+- **`update`** — unchanged since T0. A `panic()`, a failed `assert()`, or a
+  bad type assertion becomes `Panicked_Error`; `run()` returns cleanly, not a
+  crash. `tea_test.odin::test_program_recovers_from_a_panicking_update`;
+  `guard_test.odin` for `assert()`/bad-type-assertion recovery directly.
+- **`view`** — NOW GUARDED. Both call sites (`run()`'s/`run_nbio()`'s initial
+  paint and `apply()`'s per-iteration render) share one guarded helper,
+  `guarded_render` (tea.odin), so there is exactly one code path to reason
+  about, not two that could drift. A recovered view panic renders a
+  diagnostic frame (`"[view panicked: <message>]"`) through the real
+  Renderer and flushes it, THEN returns `Panicked_Error` — symmetric with
+  `update`: either kind of user-code panic ends the `run()` session cleanly,
+  and the last thing the user's screen shows explains what happened rather
+  than going blank or silently freezing on stale content.
+  `tea_test.odin::test_program_recovers_from_a_panicking_view` and
+  `::test_program_recovers_from_a_panicking_initial_view`; demonstrated live
+  under a real pty by `tools/tier1check view-panic`.
+- **Cmd procedures** — NOW GUARDED, on both thread classes. `run_cmd_guarded`
+  (cmd.odin) wraps the procedure call inside both `run_cmd_task` (pool
+  workers) and `run_cmd_detached`. A panicking Cmd does NOT force `run()` to
+  end — it structurally cannot: a background thread has no caller waiting
+  synchronously for it the way `apply()` waits on `update`. Instead the panic
+  is boxed as an ordinary `Panicked_Msg` (POD, per the message-ownership
+  decision) and delivered through the exact same mailbox path as any other
+  Cmd result, so the app's own `update` decides what to do with it (log,
+  ignore, retry, quit) — the same choice it already has for any other
+  Cmd-reported error (`examples/http`'s `Err_Msg` is the existing precedent).
+  Pinned on both thread classes directly
+  (`cmd_test.odin::test_dispatch_recovers_a_panicking_cmd_on_the_pool` /
+  `::test_dispatch_recovers_a_panicking_cmd_when_detached`) and end-to-end
+  through a real `Program`/`run()` session
+  (`tea_test.odin::test_program_survives_a_panicking_cmd`, which only passes
+  if the app's `update` genuinely observes the `Panicked_Msg`). Also
+  exercised at volume — 20000 pool-dispatched + 1500 detached Cmds, roughly
+  10% panicking — under real ThreadSanitizer by `tools/racecheck` phase B,
+  which asserts the drained `Panicked_Msg` count matches the expected count
+  exactly; this is what proves `guard.odin`'s `thread_local` recovery state
+  survives thousands of arm/disarm cycles reusing the SAME pool worker OS
+  threads, not just a single-shot unit test.
+- **Non-vacuousness**, all three: each guard was temporarily reverted and its
+  test re-run. Without the fix the relevant test does not fail gracefully —
+  it takes the ENTIRE test binary down with it (`odin test` exits 132, killed
+  by SIGILL on the unguarded `panic()`), the same "honest, immediate process
+  abort" already documented in message-ownership-decision.md for an
+  unguarded Cmd panic. Exact transcripts in
+  `docs/superpowers/tier1-coverage-decision.md`.
 
 **Tier 2** (signal handlers + `sigaltstack`, bypassing `assertion_failure_proc`
 entirely since bounds traps and SIGSEGV never go through it): controller-verified under
@@ -157,12 +206,26 @@ a real pty (Task 3) —
   `g_altstack_buf`, installed at `install_crash_handlers()` time) was verified to close
   exactly that hole.
 
-Known residual gaps, carried forward as v1.0 findings (§ below): the nesting guard on
-`guarded()` rides on `assert(!g_armed, ...)`, stripped by `-disable-assert`; and
-`sigaltstack` is per-thread, installed only on whichever thread calls
-`install_crash_handlers()` — the pool workers (Task 5) and the signal-watcher thread
-(Task 7) have no altstack of their own, so a stack-overflow SIGSEGV on those threads
-still defeats Tier 2.
+Wrapping `view` and Cmd procedures in `guarded()` (above) does not shrink Tier
+2's reach: a bounds violation inside either still traps directly and bypasses
+`assertion_failure_proc` entirely, unaffected by the new `guarded()` calls
+sitting around them — re-verified live under a real pty, not just assumed by
+analogy to T0, via `tools/tier1check view-bounds` (trap inside `view`) and
+`tools/tier1check cmd-bounds` (trap inside an init Cmd on a pool worker
+thread): both die by SIGILL with termios restored `True,True`, exactly like
+the T0-era `tools/crashcheck` baseline this extends.
+
+Known residual gaps, carried forward as v1.0 findings (§ below): `sigaltstack`
+is per-thread, installed only on whichever thread calls
+`install_crash_handlers()` — the pool workers (Task 5) and the signal-watcher
+thread (Task 7) have no altstack of their own, so a stack-overflow SIGSEGV on
+those threads still defeats Tier 2. (An earlier draft of this section also
+flagged `guarded()`'s nesting guard as riding on `assert(!g_armed, ...)`,
+stripped by `-disable-assert` — that was fixed in the closing fix-wave,
+commit `a0149d6`, see the Addendum's fixed-item 3 below; `guarded()`'s
+re-entrancy check is an explicit `if g_armed { ... }` today, not an `assert`,
+and survives `-disable-assert`. Listed here only to correct the stale
+cross-reference, not as a live gap.)
 
 ---
 
@@ -431,7 +494,24 @@ because §1-§8 read as a closing argument and omitted them.
    terminal wraps and the rewind under-counts, corrupting the display progressively.
    `term_size()` exists and the renderer never consults it. The golden harness
    therefore certifies only short lines.
-7. Tier 1 (`guarded`) wraps `update` only — `view` and Cmd bodies run unguarded.
+7. **RESOLVED (T1, `docs/superpowers/tier1-coverage-decision.md`).** Tier 1
+   (`guarded`) originally wrapped `update` only — `view` and Cmd bodies ran
+   unguarded, so a panic in either fell through to Tier 2 (safe — the process
+   died honestly, terminal restored — but not *recoverable* the way a panic
+   in `update` was). T1 extended `guarded()` coverage to both remaining
+   call sites: `view` via a shared `guarded_render` helper covering both
+   places it runs (`run()`'s/`run_nbio()`'s initial paint and `apply()`'s
+   per-iteration render), and Cmd procedures via `run_cmd_guarded`, wrapping
+   both thread classes (`run_cmd_task` for the pool, `run_cmd_detached` for
+   detached Cmds). The two endings deliberately differ: a view panic renders
+   a diagnostic frame then ends `run()` with `Panicked_Error`, symmetric with
+   `update`, because `apply()` has a synchronous caller to return that to; a
+   Cmd panic instead becomes an ordinary `Panicked_Msg` delivered through the
+   mailbox, because a pool/detached thread has no such caller and one
+   exploding background Cmd should not be allowed to force the whole session
+   to end. See §4 above and the decision doc for the full design, the
+   diagnostic-vs-blank-screen reasoning, and the non-vacuous revert-and-retest
+   proof for each guard.
 8. Message ownership is undefined and `examples/http` has already committed to an
    answer (it stores a pool-allocated string straight into the model). Decide
    borrow-vs-own **before** T1 writes more examples.

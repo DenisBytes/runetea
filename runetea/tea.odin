@@ -1,5 +1,6 @@
 package runetea
 
+import "core:fmt"
 import "core:mem"
 import "core:strings"
 import "core:sync"
@@ -172,12 +173,20 @@ run :: proc(p: ^Program($T), src: ^Input_Source, out: ^strings.Builder, flush_fd
 
 	// Initial paint, then the init Cmd -- in that order, so an app whose first
 	// action is asynchronous still shows its loading state immediately.
-	{
-		al := frame_allocator(&fa)
-		renderer_render(&r, p.view(p.model, al))
-		flush_frame(out, flush_fd)
-		frame_reset(&fa)
-	}
+	//
+	// Guarded (T1, docs/superpowers/tier1-coverage-decision.md): this is a
+	// real call to user code -- p.view -- happening before the mailbox loop,
+	// the reader thread, or the dispatcher have processed anything, and a
+	// panic here is exactly as real a crash as one from apply()'s per-frame
+	// render (guarded_render below is the SAME helper both call, so there is
+	// only one guarded-view code path to reason about, not two that could
+	// drift). Returning early on a panic here is correct, not merely
+	// tolerated: nothing has been dispatched yet (dispatch(init_cmd) is the
+	// next line) and the reader thread does not exist yet (created further
+	// below), so every defer already registered above (dispatcher_reap,
+	// signal_watcher_stop) tears down cleanly with nothing outstanding to
+	// wait for.
+	if e := guarded_render(p, &fa, &r, out, flush_fd); e != nil { return e }
 	if !cmd_is_nil(p.init_cmd) { dispatch(&rc.disp, p.init_cmd) }
 
 	// The mailbox is the SINGLE wait point. A reader thread turns bytes into
@@ -350,7 +359,88 @@ apply :: proc(p: ^Program($T), msg: any, fa: ^Frame_Arena, disp: ^Dispatcher, r:
 
 	if !cmd_is_nil(step.cmd) { dispatch(disp, step.cmd) }
 
-	renderer_render(r, p.view(p.model, frame_allocator(fa)))
+	return guarded_render(p, fa, r, out, flush_fd)
+}
+
+// Shared state for the guarded View call, mirroring Step above -- longjmp
+// discards the frame, so the view string produced (or not) lives outside it.
+@(private="file")
+View_Step :: struct($T: typeid) {
+	p:     ^Program(T),
+	alloc: mem.Allocator,
+	view:  string,
+}
+
+// Renders exactly one frame under guarded(): calls p.view, writes it through
+// the Renderer, flushes, and reclaims the frame arena -- the same four steps
+// apply()'s tail always performed, just now with p.view wrapped instead of
+// called bare. Two call sites share this (run()'s initial paint above, and
+// apply() just above this proc), which is the point: view has exactly one
+// guarded code path, not two hand-maintained copies that could drift.
+//
+// STRUCTURE (constraint a, tier1-coverage-decision.md): this is a SEPARATE,
+// SEQUENTIAL guarded() call, not one nested inside apply()'s update guard.
+// apply()'s own guarded(update) call above has already returned (successfully
+// or not) by the time this runs, so g_armed is back to false and this call is
+// perfectly ordinary from guarded()'s point of view -- nesting is a same-
+// thread, same-callstack hazard (an inner guarded() call from inside an outer
+// one's still-active body), and update-then-view here are two calls in
+// sequence on the same stack depth, not one nested in the other.
+//
+// WHAT A RECOVERED VIEW PANIC DISPLAYS (constraint d): a synthesized
+// diagnostic frame -- "[view panicked: <message>]" -- rendered and flushed
+// through the SAME Renderer the real frames use, then run() returns
+// Panicked_Error (ending the session, exactly like an update panic). Three
+// options were weighed:
+//   - Last good frame (skip rendering, leave last_rows/output untouched):
+//     silently hides the crash. The user's screen keeps showing stale
+//     content with no indication anything went wrong -- worse for debugging
+//     than an honest crash message, and indistinguishable from the app
+//     simply being idle.
+//   - Nothing (blank the screen / write nothing): actively worse than stale
+//     content -- exactly the failure mode this constraint's own doc comment
+//     calls out ("a TUI that goes blank on a transient view panic is worse
+//     than one that shows a diagnostic").
+//   - A diagnostic line -- ADOPTED. It costs nothing update-panic recovery
+//     doesn't already pay (Panicked_Error already carries info.message for
+//     the caller of run() to log/report), and it means the LAST thing on the
+//     user's real terminal, after the deferred term_restore() in their own
+//     main() runs, is a plain-text explanation of what happened rather than
+//     silence or stale state. This does not try to keep the session running
+//     past a view panic (see below) -- it exists purely so the one frame
+//     run() DOES still produce before quitting is informative.
+//
+// TERMINATE, NOT CONTINUE: a view panic ends run() with Panicked_Error, the
+// same as an update panic, rather than recovering in place and looping back
+// to the next message. A model whose view panics on the CURRENT state will
+// almost always panic again on the next call with the same (or barely
+// different) state -- looping forever re-panicking and re-painting the same
+// diagnostic every frame is a worse outcome than an honest, one-time,
+// clearly-explained exit. This also keeps view's failure mode symmetric with
+// update's: EITHER kind of user-code panic ends the run() session cleanly;
+// neither is allowed to corrupt state and continue.
+@(private="package")
+guarded_render :: proc(p: ^Program($T), fa: ^Frame_Arena, r: ^Renderer, out: ^strings.Builder, flush_fd: posix.FD) -> Run_Error {
+	vs := View_Step(T){p = p, alloc = frame_allocator(fa)}
+	info := guarded(proc(ud: rawptr) {
+		s := cast(^View_Step(T))ud
+		s.view = s.p.view(s.p.model, s.alloc)
+	}, &vs)
+
+	if info.recovered {
+		// longjmp ran no defers: reclaim whatever the failed view() call
+		// allocated from the frame arena (a partially-built strings.Builder,
+		// etc.) before building the diagnostic from a clean arena -- same
+		// wholesale-reclaim move apply() already makes for a failed update().
+		frame_reset(fa)
+		diag := fmt.aprintf("[view panicked: %s]", info.message, allocator = frame_allocator(fa))
+		renderer_render(r, diag)
+		flush_frame(out, flush_fd)
+		frame_reset(fa)
+		return Panicked_Error{message = info.message}
+	}
+
+	renderer_render(r, vs.view)
 	flush_frame(out, flush_fd)
 	frame_reset(fa)
 	return nil

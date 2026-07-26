@@ -374,12 +374,100 @@ deliver_result :: proc(m: ^Mailbox, msg: any) -> bool {
 	}
 }
 
+// Delivered through the SAME mailbox path as any normal Cmd result, when a
+// Cmd's own procedure panics -- run_cmd_guarded below is what makes that
+// true. See its doc comment and docs/superpowers/tier1-coverage-decision.md
+// for the full reasoning; short version: the only synchronization a pool
+// worker or detached Cmd thread has with the main loop is already the
+// mailbox, and one exploding background Cmd (of possibly several in flight)
+// should not be allowed to force the whole run() session to end -- the app
+// gets to decide how to react, the same choice it already has for any other
+// Cmd-reported error (examples/http's Err_Msg is the existing precedent).
+// A Panicked_Msg that reaches an update() with no matching case is simply
+// unhandled, exactly like any other Msg type an app doesn't care about --
+// not silently dropped, since it still reached update()'s switch, just not
+// acted on.
+//
+// POD, per box()'s MESSAGE OWNERSHIP CONTRACT (arena.odin): Msg_Text, not a
+// bare `string`, carries the panic text -- truncated past 255 bytes exactly
+// like every other Msg_Text use (msg.odin).
+Panicked_Msg :: struct {
+	message: Msg_Text,
+}
+
+// Shared state for the guarded Cmd call, mirroring tea.odin's Step/View_Step
+// -- longjmp discards the frame, so the result (or lack of one) lives
+// outside it.
+@(private = "file")
+Cmd_Step :: struct {
+	cmd:    Cmd,
+	cancel: ^Cancel_Token,
+	result: any,
+}
+
+// Runs a Cmd's procedure under guarded(), turning a panic into a boxed
+// Panicked_Msg instead of taking down the whole pool worker or detached
+// thread (T1, docs/superpowers/tier1-coverage-decision.md -- Tier 1
+// previously wrapped update only; spike-findings.md §4/addendum item 7).
+// Shared by run_cmd_task and run_cmd_detached below so both thread classes
+// get identical panic handling from one place, not two copies that could
+// drift.
+//
+// Also owns freeing cmd.env exactly once, regardless of outcome (constraint
+// c: longjmp skips defer, so the free that used to sit right after the bare
+// procedure call must now run unconditionally AFTER guarded() returns --
+// which, by the time this code runs, is back to ordinary non-longjmp control
+// flow either way, panic or not). This is a real improvement over the
+// pre-guard code, not just a preserved behavior: before this change a
+// panicking Cmd took the whole process down (see box()'s own non-POD panic
+// path, which used to abort here unconditionally -- message-ownership-
+// decision.md §2 Option B), so cmd.env was never freed on that path either;
+// now it always is.
+//
+// WHAT IS NOT RECLAIMED: any heap memory the Cmd body itself allocated
+// (typically via context.allocator, since a Cmd's result must cross a thread
+// boundary -- see arena.odin's LIFETIME CONTRACT) before panicking. Unlike
+// apply()'s update/view guards, a Cmd has no frame-arena equivalent to
+// wholesale-reclaim on the recovery path -- frame_allocator(fa) is
+// per-run()-iteration and explicitly forbidden for anything crossing a
+// thread boundary, which is exactly what a Cmd's own scratch allocations
+// usually are not, but easily could be. A Cmd that panics after allocating
+// its own scratch buffer leaks that buffer, the same as any non-guarded Odin
+// code with no RAII would. This is a fundamental limit of setjmp/longjmp
+// recovery, not something this change closes, and is recorded here rather
+// than silently promised away.
+run_cmd_guarded :: proc(cmd: Cmd, cancel: ^Cancel_Token) -> any {
+	step := Cmd_Step{cmd = cmd, cancel = cancel}
+	info := guarded(proc(ud: rawptr) {
+		s := cast(^Cmd_Step)ud
+		s.result = s.cmd.procedure(s.cmd.env, s.cancel)
+	}, &step)
+
+	if cmd.env != nil { free(cmd.env, cmd.allocator) }
+
+	if info.recovered {
+		// Msg types must be POD (message-ownership-decision.md): the panic
+		// text -- an owned `string` cloned by guard_assertion_failure -- must
+		// become a Msg_Text, not travel as-is. Unlike apply()'s update-panic
+		// path (which hands info.message to the CALLER of run() via
+		// Panicked_Error, so it cannot free it), nothing else ever holds a
+		// reference to this particular copy once it's been copied into the
+		// Msg_Text below -- there is no caller waiting on a Cmd's panic text
+		// the way run()'s own caller waits on its return value -- so freeing
+		// it immediately is correct, not merely convenient, and avoids adding
+		// a second instance of guard.odin's already-documented
+		// Panic_Info.message leak.
+		defer delete(info.message, context.allocator)
+		return box(Panicked_Msg{message = msg_text_from(info.message)}, context.allocator)
+	}
+	return step.result
+}
+
 @(private="file")
 run_cmd_task :: proc(task: thread.Task) {
 	te := cast(^Task_Env)task.data
 	if te.cmd.procedure != nil {
-		msg := te.cmd.procedure(te.cmd.env, te.cancel)
-		if te.cmd.env != nil { free(te.cmd.env, te.cmd.allocator) }
+		msg := run_cmd_guarded(te.cmd, te.cancel)
 		// msg.id != nil, NOT msg != nil: Odin's `any == nil` compares by the
 		// `data` field alone, and new() legitimately returns a nil pointer for
 		// a zero-sized allocation -- which is exactly what box() does for any
@@ -434,8 +522,7 @@ run_cmd_detached :: proc(data: rawptr) {
 	te := cast(^Task_Env)data
 	inflight := te.inflight
 	if te.cmd.procedure != nil {
-		msg := te.cmd.procedure(te.cmd.env, te.cancel)
-		if te.cmd.env != nil { free(te.cmd.env, te.cmd.allocator) }
+		msg := run_cmd_guarded(te.cmd, te.cancel)
 		// See run_cmd_task's comment: msg.id, not msg, distinguishes "a real
 		// zero-sized Msg" from "genuinely nothing to send".
 		if msg.id != nil {

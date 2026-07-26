@@ -88,12 +88,16 @@ run_nbio :: proc(p: ^Program($T), fd: posix.FD, out: ^strings.Builder, flush_fd:
 	// Initial paint, then the init Cmd -- identical to run(), and for the
 	// same reason: an app whose first action is asynchronous must still show
 	// its loading state immediately.
-	{
-		al := frame_allocator(&fa)
-		renderer_render(&r, p.view(p.model, al))
-		flush_frame(out, flush_fd)
-		frame_reset(&fa)
-	}
+	//
+	// Guarded via the SAME guarded_render (tea.odin) run()'s initial paint
+	// uses -- see its doc comment (constraints a/d, tier1-coverage-decision.md)
+	// for why this is one shared code path rather than a second hand-copy
+	// that could drift. Early return here is safe for the identical reason
+	// it is in run(): nothing has been dispatched (dispatch(init_cmd) is the
+	// next line) and no read is in flight (nbio_issue_read is further below),
+	// so every defer already registered above tears down with nothing
+	// outstanding.
+	if e := guarded_render(p, &fa, &r, out, flush_fd); e != nil { return e }
 	if !cmd_is_nil(p.init_cmd) { dispatch(&disp, p.init_cmd) }
 
 	rc: Nbio_Read_Ctx

@@ -204,8 +204,25 @@ Cmd_Result :: struct { id: int }
 
 Pool_Env :: struct { id: int }
 
+// PANIC_EVERY_N_POOL: a fraction of pool Cmds panic instead of returning
+// normally -- T1 extension (docs/superpowers/tier1-coverage-decision.md),
+// exercising run_cmd_guarded (cmd.odin) at volume under real
+// ThreadSanitizer, not just single-shot unit tests. This is the scenario
+// unit tests structurally cannot cover: guard.odin's g_guard/g_panic_msg/
+// g_armed are thread_local, and the pool's 8 worker OS threads are REUSED
+// across DP_POOL_CMDS/8 ~= 2500 tasks each -- this is what proves that
+// arming and disarming that thread-local state thousands of times in a row
+// on the SAME reused thread, concurrently with 7 other threads doing the
+// same, never corrupts a jmp_buf or leaks a panic across tasks. 1/13 is
+// arbitrary but deliberately not a divisor of 8 (the worker count) or 7 (the
+// existing stagger below), so panics land unevenly across workers and
+// interleave with normal completions rather than falling into a clean
+// per-worker pattern.
+PANIC_EVERY_N_POOL :: 13
+
 pool_cmd_run :: proc(env: rawptr, cancel: ^rt.Cancel_Token) -> any {
 	e := cast(^Pool_Env)env
+	if e.id % PANIC_EVERY_N_POOL == 0 { panic("racecheck: pool cmd exploded") }
 	// Stagger completion so a meaningful fraction are still running when the
 	// dispatch loop below reaches dispatcher_destroy.
 	if e.id % 7 == 0 { time.sleep(time.Millisecond) }
@@ -214,22 +231,35 @@ pool_cmd_run :: proc(env: rawptr, cancel: ^rt.Cancel_Token) -> any {
 
 Detached_Env :: struct { id: int }
 
+// See PANIC_EVERY_N_POOL above -- same reasoning, applied to the OTHER
+// guarded thread class: a detached Cmd gets a brand-new OS thread per
+// dispatch (no worker reuse), so this instead proves install_crash_handlers
+// + guarded() compose correctly on a thread that only ever runs ONE task
+// before exiting, at volume, concurrently with the pool's reused-thread case
+// above running in the same process.
+PANIC_EVERY_N_DETACHED :: 11
+
 detached_cmd_run :: proc(env: rawptr, cancel: ^rt.Cancel_Token) -> any {
 	e := cast(^Detached_Env)env
+	if e.id % PANIC_EVERY_N_DETACHED == 0 { panic("racecheck: detached cmd exploded") }
 	if e.id % 5 == 0 { time.sleep(time.Millisecond) }
 	return rt.box(Cmd_Result{id = e.id}, context.allocator)
 }
 
 Dispatch_Drainer :: struct {
-	m:     ^rt.Mailbox,
-	count: ^int,
+	m:            ^rt.Mailbox,
+	count:        ^int,
+	panic_count:  ^int, // atomic; counts Panicked_Msg specifically, see phase_dispatcher's own verification of this against the expected panic rate
 }
 
 dispatch_drainer_run :: proc(data: rawptr) {
 	d := cast(^Dispatch_Drainer)data
 	for {
-		_, ok := rt.mailbox_recv(d.m)
+		msg, ok := rt.mailbox_recv(d.m)
 		if !ok { return }
+		if _, is_panic := msg.(rt.Panicked_Msg); is_panic {
+			sync.atomic_add(d.panic_count, 1)
+		}
 		sync.atomic_add(d.count, 1)
 	}
 }
@@ -248,7 +278,8 @@ phase_dispatcher :: proc() {
 	}
 
 	recv_count: int
-	drainer_state := Dispatch_Drainer{m = &m, count = &recv_count}
+	panic_count: int
+	drainer_state := Dispatch_Drainer{m = &m, count = &recv_count, panic_count = &panic_count}
 	drainer := thread.create_and_start_with_data(&drainer_state, dispatch_drainer_run, init_context = context)
 
 	d: rt.Dispatcher
@@ -266,7 +297,10 @@ phase_dispatcher :: proc() {
 	// detached Cmd (including its own mailbox_send) has completed by the
 	// time this returns -- but the drainer thread above has been racing
 	// that completion the whole time, concurrently pulling results out of
-	// the SAME mailbox those worker/detached threads are sending into.
+	// the SAME mailbox those worker/detached threads are sending into, and a
+	// meaningful fraction of them panicked (PANIC_EVERY_N_POOL/_DETACHED
+	// above) and went through run_cmd_guarded/guarded() concurrently on both
+	// thread classes while this teardown was in flight.
 	rt.dispatcher_destroy(&d)
 
 	// dispatcher_destroy's return is the proof that no producer can still
@@ -276,6 +310,27 @@ phase_dispatcher :: proc() {
 
 	fmt.printfln("  dispatcher: %d results drained (dispatched %d pool + %d detached)",
 		recv_count, DP_POOL_CMDS, DP_DETACHED_CMDS)
+
+	// Every dispatch produces EXACTLY one mailbox message, panic or not
+	// (run_cmd_guarded turns a panic into a Panicked_Msg rather than
+	// dropping it) -- so recv_count must equal the total dispatched
+	// regardless of how many panicked, and panic_count must equal the
+	// expected count from the two moduli above exactly (not "close to" --
+	// a lost or duplicated Panicked_Msg under concurrent thread_local
+	// guard state would show up as a mismatch here, under real
+	// ThreadSanitizer pressure, not just in a single-threaded unit test).
+	expected_panics := (DP_POOL_CMDS + PANIC_EVERY_N_POOL - 1) / PANIC_EVERY_N_POOL
+	expected_panics += (DP_DETACHED_CMDS + PANIC_EVERY_N_DETACHED - 1) / PANIC_EVERY_N_DETACHED
+	if recv_count != DP_POOL_CMDS + DP_DETACHED_CMDS {
+		fmt.eprintfln("  FAIL: expected %d total results, got %d", DP_POOL_CMDS + DP_DETACHED_CMDS, recv_count)
+		os.exit(1)
+	}
+	if panic_count != expected_panics {
+		fmt.eprintfln("  FAIL: expected %d Panicked_Msg results, got %d", expected_panics, panic_count)
+		os.exit(1)
+	}
+	fmt.printfln("  dispatcher: %d of those were Panicked_Msg (expected %d) -- guarded Cmd panics survive pool-thread reuse and detached-thread volume under TSan",
+		panic_count, expected_panics)
 
 	rt.mailbox_destroy(&m)
 }

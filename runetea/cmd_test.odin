@@ -65,6 +65,73 @@ test_cmd_nil_is_detectable :: proc(t: ^testing.T) {
 	testing.expect(t, cmd_is_nil(cmd_nil()), "cmd_nil must be reported as nil")
 }
 
+// T1 extension (docs/superpowers/tier1-coverage-decision.md): Cmd bodies were
+// the other unguarded user-code call site spike-findings.md §4/addendum item
+// 7 flagged, alongside View. run_cmd_guarded (cmd.odin) is what closes it --
+// these two tests pin BOTH thread classes it runs on (pool below, detached
+// further down), since guard.odin's thread_local state means each needs its
+// own proof, not just one.
+panicking_pool_task_cmd_run :: proc(env: rawptr, cancel: ^Cancel_Token) -> any {
+	panic("boom on pool")
+}
+
+@(test)
+test_dispatch_recovers_a_panicking_cmd_on_the_pool :: proc(t: ^testing.T) {
+	m: Mailbox
+	testing.expect_value(t, mailbox_init(&m, 8), nil)
+	defer mailbox_destroy(&m)
+
+	d: Dispatcher
+	dispatcher_init(&d, &m, 2)
+	defer dispatcher_destroy(&d)
+
+	dispatch(&d, cmd_from(panicking_pool_task_cmd_run, struct{}{}, context.allocator))
+
+	// Plain blocking mailbox_recv, same as every other dispatch test in this
+	// file (e.g. test_dispatch_delivers_a_zero_sized_result_pool above) --
+	// deliberately no bespoke timeout wrapper: against the UNGUARDED code
+	// this replaced, a panicking Cmd took the whole process down immediately
+	// (message-ownership-decision.md §2, Option B's "honest, immediate
+	// process abort" -- true for a non-POD box() panic and equally true for
+	// a bare user panic() before this fix), so a regression here would
+	// crash this test binary outright, not hang it -- a timeout wrapper
+	// would add machinery this specific failure mode doesn't need.
+	msg, ok := mailbox_recv(&m)
+	testing.expect(t, ok, "expected a result even though the Cmd panicked -- the mailbox must not just silently have nothing")
+	pm, is := msg.(Panicked_Msg)
+	testing.expect(t, is, "a panicking pool Cmd must deliver a Panicked_Msg, not vanish")
+	if is {
+		pm := pm
+		testing.expect_value(t, msg_text_string(&pm.message), "boom on pool")
+	}
+}
+
+panicking_detached_cmd_run :: proc(env: rawptr, cancel: ^Cancel_Token) -> any {
+	panic("boom detached")
+}
+
+@(test)
+test_dispatch_recovers_a_panicking_cmd_when_detached :: proc(t: ^testing.T) {
+	m: Mailbox
+	testing.expect_value(t, mailbox_init(&m, 8), nil)
+	defer mailbox_destroy(&m)
+
+	d: Dispatcher
+	dispatcher_init(&d, &m, 2)
+	defer dispatcher_destroy(&d)
+
+	dispatch(&d, cmd_from(panicking_detached_cmd_run, struct{}{}, context.allocator, detached = true))
+
+	msg, ok := mailbox_recv(&m)
+	testing.expect(t, ok, "expected a result even though the detached Cmd panicked")
+	pm, is := msg.(Panicked_Msg)
+	testing.expect(t, is, "a panicking detached Cmd must deliver a Panicked_Msg, not vanish or take the process down")
+	if is {
+		pm := pm
+		testing.expect_value(t, msg_text_string(&pm.message), "boom detached")
+	}
+}
+
 // Regression: box() of a ZERO-SIZED Msg (Quit_Msg is exactly `struct {}`)
 // returns an `any` whose `data` field is nil -- new() legitimately returns a
 // nil pointer for a zero-size allocation -- and Odin's `any == nil` compares

@@ -62,6 +62,152 @@ test_program_recovers_from_a_panicking_update :: proc(t: ^testing.T) {
 	testing.expect(t, panicked, "a panicking Update must surface as Panicked_Error, not a crash")
 }
 
+// T1 extension (docs/superpowers/tier1-coverage-decision.md): View was one of
+// the two unguarded user-code call sites spike-findings.md §4/addendum item 7
+// flagged. The view here succeeds on the FIRST call (n == 0, the initial
+// paint) and panics starting on the SECOND (n == 1, after the one keypress
+// this test sends) -- deliberately, so this test exercises apply()'s
+// guarded_render call specifically (the steady-state path), not just
+// run()'s initial-paint call site, while still proving the initial paint
+// itself renders normally (no regression there).
+@(test)
+test_program_recovers_from_a_panicking_view :: proc(t: ^testing.T) {
+	View_Boom :: struct { n: int }
+	view_boom_update :: proc(m: View_Boom, msg: any, alloc: mem.Allocator) -> (View_Boom, Cmd) {
+		m := m
+		if _, is_key := msg.(Key_Msg); is_key { m.n += 1 }
+		return m, cmd_nil()
+	}
+	view_boom_view :: proc(m: View_Boom, alloc: mem.Allocator) -> string {
+		if m.n > 0 { panic("view exploded") }
+		return fmt.aprintf("count: %d", m.n, allocator = alloc)
+	}
+
+	src := input_source_from_bytes(transmute([]u8)string("x"))
+	defer input_close(&src)
+	b := strings.builder_make(); defer strings.builder_destroy(&b)
+
+	p: Program(View_Boom)
+	program_init(&p, View_Boom{}, view_boom_update, view_boom_view)
+
+	err := run(&p, &src, &b)
+	_, panicked := err.(Panicked_Error)
+	testing.expect(t, panicked, "a panicking View must surface as Panicked_Error, not a crash")
+
+	// Constraint d's decision, pinned: the loop does not go blank or freeze
+	// on the last good frame -- it renders a diagnostic naming the panic
+	// before returning, and that diagnostic is what actually reached the
+	// output builder (flush_fd < 0 here, so run() accumulates every frame
+	// into `b` rather than writing to a real fd -- see flush_frame's own
+	// doc comment).
+	out := strings.to_string(b)
+	testing.expect(t, strings.contains(out, "view panicked"),
+		"the last frame flushed before returning should show a diagnostic, not go blank")
+	testing.expect(t, strings.contains(out, "view exploded"),
+		"the diagnostic should carry the actual panic message, not a generic placeholder")
+}
+
+// Companion to test_program_recovers_from_a_panicking_view: pins the OTHER
+// call site guarded_render covers -- run()'s own initial paint, called
+// before the mailbox loop (and therefore before apply()) ever runs. Panics
+// on the very first view() call, with no keypress sent at all, so this can
+// only pass if guarded_render's coverage genuinely extends to that call site
+// and not just apply()'s.
+@(test)
+test_program_recovers_from_a_panicking_initial_view :: proc(t: ^testing.T) {
+	Init_View_Boom :: struct {}
+	init_view_boom_update :: proc(m: Init_View_Boom, msg: any, alloc: mem.Allocator) -> (Init_View_Boom, Cmd) {
+		return m, cmd_nil()
+	}
+	init_view_boom_view :: proc(m: Init_View_Boom, alloc: mem.Allocator) -> string {
+		panic("initial view exploded")
+	}
+
+	fds: [2]posix.FD
+	testing.expect(t, posix.pipe(&fds) == .OK, "pipe should succeed")
+	read_fd, write_fd := fds[0], fds[1]
+	defer posix.close(write_fd)
+	defer posix.close(read_fd)
+
+	src, ok := input_source_from_fd(read_fd)
+	testing.expect(t, ok, "input_source_from_fd should succeed")
+	defer input_close(&src)
+
+	b := strings.builder_make(); defer strings.builder_destroy(&b)
+
+	p: Program(Init_View_Boom)
+	program_init(&p, Init_View_Boom{}, init_view_boom_update, init_view_boom_view)
+
+	err := run(&p, &src, &b)
+	_, panicked := err.(Panicked_Error)
+	testing.expect(t, panicked, "a panicking initial View must surface as Panicked_Error, not a crash, and must not hang waiting for input that never comes")
+
+	out := strings.to_string(b)
+	testing.expect(t, strings.contains(out, "initial view exploded"),
+		"the diagnostic for the initial paint's own panic should still reach the output")
+}
+
+// T1 extension: a Cmd's own procedure panicking must NOT force run() to end
+// (design decision b, tier1-coverage-decision.md) -- it is delivered as an
+// ordinary Panicked_Msg through the mailbox, exactly like any other Cmd
+// result, and the APP decides what to do with it. This model quits only once
+// it has actually observed the Panicked_Msg, so a clean `err == nil` return
+// is only possible if the message genuinely arrived -- proving delivery, not
+// just "the process didn't crash".
+Cmd_Panic_Model :: struct { got_panic_msg: bool }
+
+panicking_pool_cmd_run :: proc(env: rawptr, cancel: ^Cancel_Token) -> any {
+	panic("pool cmd exploded")
+}
+
+cmd_panic_update :: proc(m: Cmd_Panic_Model, msg: any, alloc: mem.Allocator) -> (Cmd_Panic_Model, Cmd) {
+	m := m
+	switch v in msg {
+	case Key_Msg:
+		return m, cmd_from(panicking_pool_cmd_run, struct{}{}, context.allocator)
+	case Panicked_Msg:
+		m.got_panic_msg = true
+		return m, quit_cmd()
+	}
+	return m, cmd_nil()
+}
+
+cmd_panic_view :: proc(m: Cmd_Panic_Model, alloc: mem.Allocator) -> string { return "" }
+
+@(test)
+test_program_survives_a_panicking_cmd :: proc(t: ^testing.T) {
+	// A real pipe, not input_source_from_bytes -- same reasoning as
+	// test_program_quits_from_an_async_init_cmd_with_no_keypress above:
+	// Bytes_Source hits EOF (and closes the mailbox) the instant its one
+	// byte is consumed, which can race ahead of the async Panicked_Msg this
+	// test needs to actually observe, closing the mailbox before the pool
+	// worker's result arrives and giving a false-clean `err == nil` with
+	// got_panic_msg still false. An open pipe with nothing further written
+	// never produces that spurious EOF; the run only ends via the model's
+	// own quit_cmd() once it has genuinely seen the Panicked_Msg.
+	fds: [2]posix.FD
+	testing.expect(t, posix.pipe(&fds) == .OK, "pipe should succeed")
+	read_fd, write_fd := fds[0], fds[1]
+	defer posix.close(write_fd)
+	defer posix.close(read_fd)
+
+	src, ok := input_source_from_fd(read_fd)
+	testing.expect(t, ok, "input_source_from_fd should succeed")
+	defer input_close(&src)
+
+	one_key := [1]u8{'x'}
+	testing.expect(t, posix.write(write_fd, raw_data(one_key[:]), 1) == 1, "write should succeed")
+
+	b := strings.builder_make(); defer strings.builder_destroy(&b)
+
+	p: Program(Cmd_Panic_Model)
+	program_init(&p, Cmd_Panic_Model{}, cmd_panic_update, cmd_panic_view)
+
+	err := run(&p, &src, &b)
+	testing.expect(t, err == nil, "run should exit cleanly once the app quits in reaction to Panicked_Msg -- a Cmd panic must not force Panicked_Error the way an update/view panic does")
+	testing.expect(t, p.model.got_panic_msg, "a panicking pool Cmd must reach update() as a Panicked_Msg, not vanish or hang")
+}
+
 // Regression: an init Cmd that resolves to Quit_Msg -- with NO keypress ever
 // sent -- must actually end run(). This is the spec's marquee scenario for
 // the mailbox-as-single-wait-point design ("an async result updates the view
