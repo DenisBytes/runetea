@@ -1204,7 +1204,7 @@ The nbio loop *is* RuneTea's loop. The `Input_Source` indirection exists so the 
 
 **Interfaces:**
 - Consumes: `Mailbox` (Task 1).
-- Produces: `Input_Source` vtable struct; `input_source_from_fd(fd: posix.FD) -> (Input_Source, bool)`; `input_source_from_bytes(data: []u8) -> Input_Source`; `input_read(src: ^Input_Source, buf: []u8) -> (n: int, ok: bool)`; `input_close(src: ^Input_Source)`.
+- Produces: `Input_Source` vtable struct; `input_source_from_fd(fd: posix.FD) -> (Input_Source, bool)`; `input_source_from_bytes(data: []u8) -> Input_Source`; `input_read(src: ^Input_Source, buf: []u8) -> (n: int, ok: bool, woken: bool)`; `input_close(src: ^Input_Source)`; `input_wake(src: ^Input_Source)`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -2120,6 +2120,11 @@ run :: proc(p: ^Program($T), src: ^Input_Source, out: ^strings.Builder, flush_fd
 	thread.start(reader)
 	defer {
 		sync.atomic_store(&rd.stop, true)
+		// MUST wake the reader before joining. It parks inside input_read
+		// waiting on the tty, and checks `stop` only between reads -- quitting
+		// via a UI action rather than a keypress would otherwise hang here
+		// forever.
+		input_wake(src)
 		mailbox_close(&mbox)
 		thread.join(reader)
 		thread.destroy(reader)
@@ -2147,9 +2152,13 @@ reader_thread :: proc(th: ^thread.Thread) {
 	pending: [dynamic]u8;            defer delete(pending)
 
 	for !sync.atomic_load(&rd.stop) {
-		n, ok := input_read(rd.src, buf[:])
+		n, ok, woken := input_read(rd.src, buf[:])
+		// `woken` is input_wake() asking us to shut down -- structurally
+		// distinct from EOF so a clean quit is never misreported as input
+		// dying. Loop back so the `stop` check above sees the flag.
+		if woken { continue }
 		if !ok || n == 0 {
-			mailbox_close(rd.mailbox)   // EOF: unblock the loop
+			mailbox_close(rd.mailbox)   // EOF: input really is gone
 			return
 		}
 		append(&pending, ..buf[:n])
