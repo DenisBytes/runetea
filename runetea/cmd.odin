@@ -80,7 +80,20 @@ run_cmd_task :: proc(task: thread.Task) {
 	if te.cmd.procedure != nil {
 		msg := te.cmd.procedure(te.cmd.env)
 		if te.cmd.env != nil { free(te.cmd.env, te.cmd.allocator) }
-		if msg != nil { _ = mailbox_send(te.mailbox, msg) }
+		// msg.id != nil, NOT msg != nil: Odin's `any == nil` compares by the
+		// `data` field alone, and new() legitimately returns a nil pointer for
+		// a zero-sized allocation -- which is exactly what box() does for any
+		// zero-sized Msg (Quit_Msg is `struct {}`). `msg != nil` on such a
+		// result is FALSE -- it silently discards the message, so a Cmd
+		// returning Quit_Msg through this path would never reach the mailbox
+		// and the program could never quit. Proven with a standalone repro
+		// (`a: any = p^` for `p := new(Empty)` prints `a == nil: true` while
+		// `a.id != nil: true`) and caught live: an init Cmd returning
+		// Quit_Msg hung forever waiting on mailbox_recv, see
+		// task-10-report.md. `.id` is nil ONLY for a genuinely absent message
+		// (a real `nil` any, or box()'s own allocator-failure return), which
+		// is what this check must key on instead.
+		if msg.id != nil { _ = mailbox_send(te.mailbox, msg) }
 	}
 	// Freed here, per-task, rather than accumulated in the Dispatcher and
 	// freed only at dispatcher_destroy: a Dispatcher is meant to live for
@@ -96,7 +109,9 @@ run_cmd_detached :: proc(data: rawptr) {
 	if te.cmd.procedure != nil {
 		msg := te.cmd.procedure(te.cmd.env)
 		if te.cmd.env != nil { free(te.cmd.env, te.cmd.allocator) }
-		if msg != nil { _ = mailbox_send(te.mailbox, msg) }
+		// See run_cmd_task's comment: msg.id, not msg, distinguishes "a real
+		// zero-sized Msg" from "genuinely nothing to send".
+		if msg.id != nil { _ = mailbox_send(te.mailbox, msg) }
 	}
 	free(te)
 	// Must be the LAST action: dispatcher_destroy's wait_group_wait treats

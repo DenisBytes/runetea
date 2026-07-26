@@ -55,6 +55,58 @@ test_cmd_nil_is_detectable :: proc(t: ^testing.T) {
 	testing.expect(t, cmd_is_nil(cmd_nil()), "cmd_nil must be reported as nil")
 }
 
+// Regression: box() of a ZERO-SIZED Msg (Quit_Msg is exactly `struct {}`)
+// returns an `any` whose `data` field is nil -- new() legitimately returns a
+// nil pointer for a zero-size allocation -- and Odin's `any == nil` compares
+// by `data` alone, ignoring `id`. A naive `if msg != nil` gate before
+// mailbox_send (as run_cmd_task/run_cmd_detached originally had) therefore
+// silently drops every zero-sized result. Caught live: an init Cmd
+// returning Quit_Msg through run() hung forever on mailbox_recv, because
+// quit_cmd()'s own Quit_Msg never reached the mailbox through this exact
+// path. Both dispatch paths (pool and detached) share the bug, so both are
+// pinned here.
+Empty_Result :: struct {}
+
+empty_run :: proc(env: rawptr) -> any {
+	return box(Empty_Result{}, context.allocator)
+}
+
+@(test)
+test_dispatch_delivers_a_zero_sized_result_pool :: proc(t: ^testing.T) {
+	m: Mailbox
+	testing.expect_value(t, mailbox_init(&m, 8), nil)
+	defer mailbox_destroy(&m)
+
+	d: Dispatcher
+	dispatcher_init(&d, &m, 2)
+	defer dispatcher_destroy(&d)
+
+	dispatch(&d, cmd_from(empty_run, struct{}{}, context.allocator))
+
+	msg, ok := mailbox_recv(&m)
+	testing.expect(t, ok, "expected the zero-sized result to reach the mailbox")
+	_, is := msg.(Empty_Result)
+	testing.expect(t, is, "zero-sized Msg types must not be silently dropped")
+}
+
+@(test)
+test_dispatch_delivers_a_zero_sized_result_detached :: proc(t: ^testing.T) {
+	m: Mailbox
+	testing.expect_value(t, mailbox_init(&m, 8), nil)
+	defer mailbox_destroy(&m)
+
+	d: Dispatcher
+	dispatcher_init(&d, &m, 2)
+	defer dispatcher_destroy(&d)
+
+	dispatch(&d, cmd_from(empty_run, struct{}{}, context.allocator, detached = true))
+
+	msg, ok := mailbox_recv(&m)
+	testing.expect(t, ok, "expected the zero-sized result to reach the mailbox")
+	_, is := msg.(Empty_Result)
+	testing.expect(t, is, "zero-sized Msg types must not be silently dropped")
+}
+
 // A coordinator Cmd waits on children it dispatches. On a fixed pool sized N,
 // N such coordinators occupy every worker and their children never get one --
 // deadlock. Detached Cmds bypass the pool, which is the elastic-overflow path.

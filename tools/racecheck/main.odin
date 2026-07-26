@@ -46,7 +46,9 @@ package main
 // appear here.
 
 import "core:fmt"
+import "core:mem"
 import "core:os"
+import "core:strings"
 import "core:sync"
 import "core:sys/posix"
 import "core:thread"
@@ -59,6 +61,7 @@ main :: proc() {
 	phase_mailbox()
 	phase_dispatcher()
 	phase_signals()
+	phase_program()
 	fmt.printfln("=== racecheck: all phases completed without crashing (%v) ===", time.since(start))
 }
 
@@ -346,4 +349,137 @@ phase_signals :: proc() {
 		recv_count, SIG_DRIVERS * SIG_ROUNDS_EACH)
 
 	rt.mailbox_destroy(&m)
+}
+
+// --- Phase D: Program / run() end-to-end ---------------------------------
+//
+// Phases A-C exercise Mailbox, Dispatcher and Signal_Watcher in isolation --
+// none of them touch tea.odin, which is ALL new concurrency: a reader
+// thread that boxes tty bytes into Key_Msgs and pushes them into the same
+// mailbox a pool-dispatched Cmd result also lands in, with run()'s main
+// loop as the single consumer racing both producers every iteration.
+//
+// Two quit paths are driven, alternating by iteration:
+//   - via_cmd:  the init Cmd sleeps briefly and returns Quit_Msg with NO
+//     keypress ever sent -- the scenario the mailbox-as-single-wait-point
+//     design exists for (spec: "an async result updates the view with no
+//     keypress"). This is also the shutdown-order hazard the brief calls
+//     out explicitly: run() quits while the reader thread is still parked
+//     in poll() on an open pipe that will never see more data, so run()'s
+//     defer MUST call input_wake before thread.join or this phase hangs.
+//     There is no separate timeout here -- a hang IS the failure signal.
+//   - keypress: the feeder writes a few bursts then 'q', which Update turns
+//     into quit_cmd(); that Cmd is dispatched (pool) and its Quit_Msg
+//     result arrives back through the very same mailbox the reader thread
+//     is still feeding, so the quit itself is racing live input.
+//
+// Runs entirely over an anonymous pipe (Fd_Source over posix.pipe), the
+// same substitution nbiocheck/Phase-testing already established for
+// exercising a real fd without a tty. No terminal semantics are under test
+// here, only the concurrency.
+
+Race_Model :: struct { n: int }
+
+race_update :: proc(m: Race_Model, msg: any, alloc: mem.Allocator) -> (Race_Model, rt.Cmd) {
+	m := m
+	switch v in msg {
+	case rt.Key_Msg:
+		if v.code == .Rune && v.r == 'q' {
+			return m, rt.quit_cmd()
+		}
+		m.n += 1
+	}
+	return m, rt.cmd_nil()
+}
+
+race_view :: proc(m: Race_Model, alloc: mem.Allocator) -> string {
+	return fmt.aprintf("n=%d", m.n, allocator = alloc)
+}
+
+race_async_quit :: proc(env: rawptr) -> any {
+	time.sleep(2 * time.Millisecond)
+	return rt.box(rt.Quit_Msg{}, context.allocator)
+}
+
+// Deliberately bounded, on BOTH paths: an unbounded feeder loop that only
+// checks a stop flag between writes can block forever inside posix.write
+// once run() has quit and the reader thread has stopped draining the pipe
+// (its read end fills at 64KB and nothing empties it from then on) -- that
+// is a real bug this phase hit during its own development (feeder thread
+// wedged in pipe_write, thread.join on it then hung the whole phase; root-
+// caused via /proc/<pid>/task/*/wchan showing pipe_write). A handful of
+// small writes can never fill the pipe regardless of whether anything is
+// still reading, so the feeder always finishes on its own -- no stop flag,
+// no join-time race, while still overlapping the ~2ms async-quit delay
+// (20-200 iterations * 200us) so real concurrent input is in flight when
+// each quit path fires.
+Race_Key_Feeder :: struct {
+	w:      posix.FD,
+	send_q: bool, // true: a short burst then "q"; false: a longer burst (via_cmd path)
+}
+
+race_key_feeder_run :: proc(data: rawptr) {
+	f := cast(^Race_Key_Feeder)data
+	ab := []u8{'a', 'b'}
+	rounds := 200 if !f.send_q else 20
+	for i in 0 ..< rounds {
+		posix.write(f.w, raw_data(ab), len(ab))
+		time.sleep(200 * time.Microsecond)
+	}
+	if f.send_q {
+		q := []u8{'q'}
+		posix.write(f.w, raw_data(q), len(q))
+	}
+}
+
+RACE_PROGRAM_ITERS :: 30
+
+phase_program :: proc() {
+	fmt.println("--- phase D: Program/run() (reader thread racing async-Cmd and keypress-driven quits) ---")
+
+	for iter in 0 ..< RACE_PROGRAM_ITERS {
+		via_cmd := iter % 2 == 0
+
+		fds: [2]posix.FD
+		if posix.pipe(&fds) != .OK {
+			fmt.eprintln("pipe failed")
+			os.exit(1)
+		}
+		read_fd, write_fd := fds[0], fds[1]
+
+		src, ok := rt.input_source_from_fd(read_fd)
+		if !ok {
+			fmt.eprintln("input_source_from_fd failed")
+			os.exit(1)
+		}
+
+		feeder := Race_Key_Feeder{w = write_fd, send_q = !via_cmd}
+		feeder_th := thread.create_and_start_with_data(&feeder, race_key_feeder_run, init_context = context)
+
+		b := strings.builder_make(); defer strings.builder_destroy(&b)
+
+		p: rt.Program(Race_Model)
+		init_cmd := rt.cmd_nil()
+		if via_cmd {
+			init_cmd = rt.Cmd{procedure = race_async_quit, env = nil, allocator = context.allocator}
+		}
+		rt.program_init(&p, Race_Model{}, race_update, race_view, init_cmd)
+
+		// THE shutdown-order assertion: if input_wake were ever dropped from
+		// run()'s teardown, the via_cmd iterations would hang right here.
+		err := rt.run(&p, &src, &b)
+		if err != nil {
+			fmt.eprintln("run() returned an error:", err)
+			os.exit(1)
+		}
+
+		thread.join(feeder_th); thread.destroy(feeder_th)
+
+		rt.input_close(&src)
+		posix.close(write_fd)
+		posix.close(read_fd)
+	}
+
+	fmt.printfln("  program: %d full run() cycles completed (%d async-Cmd quits with no keypress, %d keypress-driven quits)",
+		RACE_PROGRAM_ITERS, (RACE_PROGRAM_ITERS + 1) / 2, RACE_PROGRAM_ITERS / 2)
 }
