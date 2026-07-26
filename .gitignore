@@ -21,4 +21,5 @@
 /tools/*/msgcheck
 /tools/*/nbiocheck
 /tools/*/ttycheck
+/tools/*/wincheck
 /tools/*/golden
