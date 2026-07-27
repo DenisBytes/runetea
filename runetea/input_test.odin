@@ -72,22 +72,29 @@ test_decode_double_escape :: proc(t: ^testing.T) {
 // whole sequence and emit nothing -- not leak its trailing bytes as spurious
 // rune keypresses.
 //
-// The sequences chosen here are deliberately ones that are OUT of T1-H's
-// scope rather than merely unimplemented: bracketed paste start/end, a Kitty
-// keyboard flags report, an SGR mouse report, and F13 (CSI 25~, beyond the
-// F1-F12 vocabulary Key_Code carries). The flags report is a KEY-level
-// assertion and stays true after T1-K taught the decoder to read it: it is
-// never a Key_Msg, and with `enh` omitted (as here, and as every caller
-// outside the two event-loop hosts does) it is still consumed whole and
-// dropped -- see test_kitty_flags_reply_becomes_an_enhancements_msg for the
-// other half. This test used to use "\e[5~", which
-// was a fine example of "unsupported" when the decoder had no tilde table at
-// all; PageUp is decoded now, so keeping it would have made the test assert
-// the opposite of the feature.
+// The sequences chosen here are deliberately ones that are OUT of scope
+// rather than merely unimplemented: a Kitty keyboard flags report, an SGR
+// mouse report, F13 (CSI 25~, beyond the F1-F12 vocabulary Key_Code carries),
+// an unassigned tilde parameter, focus in/out and Shift+Tab. The flags report
+// is a KEY-level assertion and stays true after T1-K taught the decoder to
+// read it: it is never a Key_Msg, and with `enh` omitted (as here, and as
+// every caller outside the two event-loop hosts does) it is still consumed
+// whole and dropped -- see test_kitty_flags_reply_becomes_an_enhancements_msg
+// for the other half.
+//
+// THE LIST HAS BEEN RETARGETED TWICE, both times for the same reason: a
+// sequence that was genuinely unsupported became a feature, and leaving it
+// here would have made this test assert the OPPOSITE of the feature. It used
+// to use "\e[5~" when the decoder had no tilde table at all (PageUp is decoded
+// now), and it used to use "\e[200~" and "\e[201~" until T1-L made bracketed
+// paste real -- those two now have their own coverage in the T1-L block below.
+// Both times the coverage was moved, not deleted: what this test is FOR is the
+// consume-whole-and-emit-nothing contract, and that needs sequences the
+// decoder still has no vocabulary for.
 @(test)
 test_decode_unsupported_csi_is_cleanly_ignored :: proc(t: ^testing.T) {
 	out := make([dynamic]Key_Msg); defer delete(out)
-	for seq in ([?]string{"\e[200~", "\e[201~", "\e[?1u", "\e[<0;10;5M", "\e[25~", "\e[9~"}) {
+	for seq in ([?]string{"\e[?1u", "\e[<0;10;5M", "\e[25~", "\e[9~", "\e[I", "\e[O", "\e[Z"}) {
 		clear(&out)
 		n := decode_keys(transmute([]u8)seq, &out)
 		testing.expectf(t, n == len(seq), "%q: consumed %d, want %d", seq, n, len(seq))
@@ -168,84 +175,89 @@ Key_Case :: struct {
 	seq:   string,
 	want:  [2]Key_Msg,
 	nwant: int,
+	// T1-L: how many Paste_Markers the sequence produces. Zero for everything
+	// that is not bracketed paste, which is why it is the LAST field -- adding
+	// it in the middle would have meant rewriting all 110 positional rows'
+	// values, not just appending a 0 to each.
+	nmark: int,
 }
 
 @(private = "file")
 key_cases := [?]Key_Case{
 	// -- CSI tilde: navigation ------------------------------------------
-	{"\e[1~", {{code = .Home},      {}}, 1},
-	{"\e[2~", {{code = .Insert},    {}}, 1},
-	{"\e[3~", {{code = .Delete},    {}}, 1},
-	{"\e[4~", {{code = .End},       {}}, 1},
-	{"\e[5~", {{code = .Page_Up},   {}}, 1},
-	{"\e[6~", {{code = .Page_Down}, {}}, 1},
-	{"\e[7~", {{code = .Home},      {}}, 1},
-	{"\e[8~", {{code = .End},       {}}, 1},
+	{"\e[1~", {{code = .Home},      {}}, 1, 0},
+	{"\e[2~", {{code = .Insert},    {}}, 1, 0},
+	{"\e[3~", {{code = .Delete},    {}}, 1, 0},
+	{"\e[4~", {{code = .End},       {}}, 1, 0},
+	{"\e[5~", {{code = .Page_Up},   {}}, 1, 0},
+	{"\e[6~", {{code = .Page_Down}, {}}, 1, 0},
+	{"\e[7~", {{code = .Home},      {}}, 1, 0},
+	{"\e[8~", {{code = .End},       {}}, 1, 0},
 
 	// -- CSI letter finals ----------------------------------------------
-	{"\e[A", {{code = .Up},    {}}, 1},
-	{"\e[B", {{code = .Down},  {}}, 1},
-	{"\e[C", {{code = .Right}, {}}, 1},
-	{"\e[D", {{code = .Left},  {}}, 1},
-	{"\e[H", {{code = .Home},  {}}, 1},
-	{"\e[F", {{code = .End},   {}}, 1},
+	{"\e[A", {{code = .Up},    {}}, 1, 0},
+	{"\e[B", {{code = .Down},  {}}, 1, 0},
+	{"\e[C", {{code = .Right}, {}}, 1, 0},
+	{"\e[D", {{code = .Left},  {}}, 1, 0},
+	{"\e[H", {{code = .Home},  {}}, 1, 0},
+	{"\e[F", {{code = .End},   {}}, 1, 0},
 
 	// -- F1-F12, all three encodings ------------------------------------
 	// SS3 (what xterm actually sends for F1-F4).
-	{"\eOP", {{code = .F1}, {}}, 1},
-	{"\eOQ", {{code = .F2}, {}}, 1},
-	{"\eOR", {{code = .F3}, {}}, 1},
-	{"\eOS", {{code = .F4}, {}}, 1},
+	{"\eOP", {{code = .F1}, {}}, 1, 0},
+	{"\eOQ", {{code = .F2}, {}}, 1, 0},
+	{"\eOR", {{code = .F3}, {}}, 1, 0},
+	{"\eOS", {{code = .F4}, {}}, 1, 0},
 	// CSI legacy, bare and with the redundant "1" parameter some terminals
 	// emit (linux console, a few terminfo entries).
-	{"\e[P",  {{code = .F1}, {}}, 1},
-	{"\e[Q",  {{code = .F2}, {}}, 1},
-	{"\e[R",  {{code = .F3}, {}}, 1},
-	{"\e[S",  {{code = .F4}, {}}, 1},
-	{"\e[1P", {{code = .F1}, {}}, 1},
-	{"\e[1Q", {{code = .F2}, {}}, 1},
-	{"\e[1S", {{code = .F4}, {}}, 1},
+	{"\e[P",  {{code = .F1}, {}}, 1, 0},
+	{"\e[Q",  {{code = .F2}, {}}, 1, 0},
+	{"\e[R",  {{code = .F3}, {}}, 1, 0},
+	{"\e[S",  {{code = .F4}, {}}, 1, 0},
+	{"\e[1P", {{code = .F1}, {}}, 1, 0},
+	{"\e[1Q", {{code = .F2}, {}}, 1, 0},
+	{"\e[1S", {{code = .F4}, {}}, 1, 0},
 	// CSI tilde. 11-14 duplicate F1-F4 on terminals that do not use SS3.
-	{"\e[11~", {{code = .F1},  {}}, 1},
-	{"\e[12~", {{code = .F2},  {}}, 1},
-	{"\e[13~", {{code = .F3},  {}}, 1},
-	{"\e[14~", {{code = .F4},  {}}, 1},
-	{"\e[15~", {{code = .F5},  {}}, 1},
-	{"\e[17~", {{code = .F6},  {}}, 1},
-	{"\e[18~", {{code = .F7},  {}}, 1},
-	{"\e[19~", {{code = .F8},  {}}, 1},
-	{"\e[20~", {{code = .F9},  {}}, 1},
-	{"\e[21~", {{code = .F10}, {}}, 1},
-	{"\e[23~", {{code = .F11}, {}}, 1},
-	{"\e[24~", {{code = .F12}, {}}, 1},
+	{"\e[11~", {{code = .F1},  {}}, 1, 0},
+	{"\e[12~", {{code = .F2},  {}}, 1, 0},
+	{"\e[13~", {{code = .F3},  {}}, 1, 0},
+	{"\e[14~", {{code = .F4},  {}}, 1, 0},
+	{"\e[15~", {{code = .F5},  {}}, 1, 0},
+	{"\e[17~", {{code = .F6},  {}}, 1, 0},
+	{"\e[18~", {{code = .F7},  {}}, 1, 0},
+	{"\e[19~", {{code = .F8},  {}}, 1, 0},
+	{"\e[20~", {{code = .F9},  {}}, 1, 0},
+	{"\e[21~", {{code = .F10}, {}}, 1, 0},
+	{"\e[23~", {{code = .F11}, {}}, 1, 0},
+	{"\e[24~", {{code = .F12}, {}}, 1, 0},
 
 	// -- SS3 arrows (DECCKM application cursor key mode) -----------------
-	{"\eOA", {{code = .Up},    {}}, 1},
-	{"\eOB", {{code = .Down},  {}}, 1},
-	{"\eOC", {{code = .Right}, {}}, 1},
-	{"\eOD", {{code = .Left},  {}}, 1},
-	{"\eOH", {{code = .Home},  {}}, 1},
-	{"\eOF", {{code = .End},   {}}, 1},
+	{"\eOA", {{code = .Up},    {}}, 1, 0},
+	{"\eOB", {{code = .Down},  {}}, 1, 0},
+	{"\eOC", {{code = .Right}, {}}, 1, 0},
+	{"\eOD", {{code = .Left},  {}}, 1, 0},
+	{"\eOH", {{code = .Home},  {}}, 1, 0},
+	{"\eOF", {{code = .End},   {}}, 1, 0},
 
 	// -- xterm modifier parameters: 1 + bitmask -------------------------
-	{"\e[1;5A", {{code = .Up,     mods = {.Ctrl}},          {}}, 1},
-	{"\e[1;2C", {{code = .Right,  mods = {.Shift}},         {}}, 1},
-	{"\e[3;5~", {{code = .Delete, mods = {.Ctrl}},          {}}, 1},
-	{"\e[1;3H", {{code = .Home,   mods = {.Alt}},           {}}, 1},
-	{"\e[1;2D", {{code = .Left,   mods = {.Shift}},         {}}, 1},
-	{"\e[1;7C", {{code = .Right,  mods = {.Ctrl, .Alt}},    {}}, 1},
-	{"\e[1;8B", {{code = .Down,   mods = {.Ctrl, .Alt, .Shift}}, {}}, 1},
-	{"\e[1;9A", {{code = .Up,     mods = {.Meta}},          {}}, 1},
-	{"\e[1;10D",{{code = .Left,   mods = {.Meta, .Shift}},  {}}, 1},
-	{"\e[5;5~", {{code = .Page_Up, mods = {.Ctrl}},         {}}, 1},
-	{"\e[15;2~",{{code = .F5,     mods = {.Shift}},         {}}, 1},
-	{"\e[1;5P", {{code = .F1,     mods = {.Ctrl}},          {}}, 1},
-	{"\e[1;2R", {{code = .F3,     mods = {.Shift}},         {}}, 1},
-	{"\e[1;5F", {{code = .End,    mods = {.Ctrl}},          {}}, 1},
+	{"\e[1;5A", {{code = .Up,     mods = {.Ctrl}},          {}}, 1, 0},
+	{"\e[1;2C", {{code = .Right,  mods = {.Shift}},         {}}, 1, 0},
+	{"\e[3;5~", {{code = .Delete, mods = {.Ctrl}},          {}}, 1, 0},
+	{"\e[1;3H", {{code = .Home,   mods = {.Alt}},           {}}, 1, 0},
+	{"\e[1;2D", {{code = .Left,   mods = {.Shift}},         {}}, 1, 0},
+	{"\e[1;7C", {{code = .Right,  mods = {.Ctrl, .Alt}},    {}}, 1, 0},
+	{"\e[1;8B", {{code = .Down,   mods = {.Ctrl, .Alt, .Shift}}, {}}, 1, 0},
+	{"\e[1;9A", {{code = .Up,     mods = {.Meta}},          {}}, 1, 0},
+	{"\e[1;10D",{{code = .Left,   mods = {.Meta, .Shift}},  {}}, 1, 0},
+	{"\e[5;5~", {{code = .Page_Up, mods = {.Ctrl}},         {}}, 1, 0},
+	{"\e[15;2~",{{code = .F5,     mods = {.Shift}},         {}}, 1, 0},
+	{"\e[1;5P", {{code = .F1,     mods = {.Ctrl}},          {}}, 1, 0},
+	{"\e[1;2R", {{code = .F3,     mods = {.Shift}},         {}}, 1, 0},
+	{"\e[1;5F", {{code = .End,    mods = {.Ctrl}},          {}}, 1, 0},
 	// SS3 with a leading modifier parameter (rare, but xterm emits it for
 	// modified F1-F4 in some configurations).
-	{"\eO5A", {{code = .Up, mods = {.Ctrl}}, {}}, 1},
-	{"\eO2P", {{code = .F1, mods = {.Shift}}, {}}, 1},
+	{"\eO5A", {{code = .Up, mods = {.Ctrl}}, {}}, 1, 0},
+	{"\eO2P", {{code = .F1, mods = {.Shift}}, {}}, 1, 0},
 
 	// -- T1-K: Kitty's event-type sub-parameter on the LEGACY encodings --
 	//
@@ -256,20 +268,20 @@ key_cases := [?]Key_Case{
 	// through csi_event_type's separate stripping pass instead), so the whole
 	// block is the non-vacuity lever for that pass: drop it and every row here
 	// reports 0 keys instead of 1.
-	{"\e[1;5:1A", {{kind = .Press,   code = .Up,    mods = {.Ctrl}}, {}}, 1},
-	{"\e[1;5:2A", {{kind = .Repeat,  code = .Up,    mods = {.Ctrl}}, {}}, 1},
-	{"\e[1;5:3A", {{kind = .Release, code = .Up,    mods = {.Ctrl}}, {}}, 1},
-	{"\e[1;2:3D", {{kind = .Release, code = .Left,  mods = {.Shift}}, {}}, 1},
-	{"\e[1;1:2B", {{kind = .Repeat,  code = .Down}, {}}, 1},
-	{"\e[3;5:3~", {{kind = .Release, code = .Delete, mods = {.Ctrl}}, {}}, 1},
-	{"\e[5;1:2~", {{kind = .Repeat,  code = .Page_Up}, {}}, 1},
-	{"\e[15;2:3~",{{kind = .Release, code = .F5,    mods = {.Shift}}, {}}, 1},
-	{"\e[1;5:3P", {{kind = .Release, code = .F1,    mods = {.Ctrl}}, {}}, 1},
+	{"\e[1;5:1A", {{kind = .Press,   code = .Up,    mods = {.Ctrl}}, {}}, 1, 0},
+	{"\e[1;5:2A", {{kind = .Repeat,  code = .Up,    mods = {.Ctrl}}, {}}, 1, 0},
+	{"\e[1;5:3A", {{kind = .Release, code = .Up,    mods = {.Ctrl}}, {}}, 1, 0},
+	{"\e[1;2:3D", {{kind = .Release, code = .Left,  mods = {.Shift}}, {}}, 1, 0},
+	{"\e[1;1:2B", {{kind = .Repeat,  code = .Down}, {}}, 1, 0},
+	{"\e[3;5:3~", {{kind = .Release, code = .Delete, mods = {.Ctrl}}, {}}, 1, 0},
+	{"\e[5;1:2~", {{kind = .Repeat,  code = .Page_Up}, {}}, 1, 0},
+	{"\e[15;2:3~",{{kind = .Release, code = .F5,    mods = {.Shift}}, {}}, 1, 0},
+	{"\e[1;5:3P", {{kind = .Release, code = .F1,    mods = {.Ctrl}}, {}}, 1, 0},
 	// An event type this decoder has no name for is still a real keypress --
 	// the SAME answer kitty_decode gives for "\e[97;1:9u", by construction.
-	{"\e[1;5:9A", {{kind = .Press,   code = .Up,    mods = {.Ctrl}}, {}}, 1},
+	{"\e[1;5:9A", {{kind = .Press,   code = .Up,    mods = {.Ctrl}}, {}}, 1, 0},
 	// Present-but-empty sub-parameter: press, again matching "\e[97;1:u".
-	{"\e[1;5:A",  {{kind = .Press,   code = .Up,    mods = {.Ctrl}}, {}}, 1},
+	{"\e[1;5:A",  {{kind = .Press,   code = .Up,    mods = {.Ctrl}}, {}}, 1, 0},
 
 	// -- T1-J: Kitty keyboard protocol, CSI <code> [;<mods>[:<ev>]] u ---
 	//
@@ -280,90 +292,121 @@ key_cases := [?]Key_Case{
 	//
 	// THE WHOLE POINT of the protocol is the pairs below: each legacy
 	// collision becomes two distinct byte sequences.
-	{"\e[9u",     {{code = .Tab},   {}}, 1},   // Tab
-	{"\e[105;5u", {{code = .Rune, r = 'i', mods = {.Ctrl}}, {}}, 1},   // ...vs Ctrl+i
-	{"\e[13u",    {{code = .Enter}, {}}, 1},   // Enter
-	{"\e[109;5u", {{code = .Rune, r = 'm', mods = {.Ctrl}}, {}}, 1},   // ...vs Ctrl+m
-	{"\e[27u",    {{code = .Escape},{}}, 1},   // Escape
-	{"\e[91;5u",  {{code = .Rune, r = '[', mods = {.Ctrl}}, {}}, 1},   // ...vs Ctrl+[
-	{"\e[8u",     {{code = .Backspace}, {}}, 1},
-	{"\e[104;5u", {{code = .Rune, r = 'h', mods = {.Ctrl}}, {}}, 1},   // ...vs Ctrl+h
-	{"\e[127u",   {{code = .Backspace}, {}}, 1},
+	{"\e[9u",     {{code = .Tab},   {}}, 1, 0},   // Tab
+	{"\e[105;5u", {{code = .Rune, r = 'i', mods = {.Ctrl}}, {}}, 1, 0},   // ...vs Ctrl+i
+	{"\e[13u",    {{code = .Enter}, {}}, 1, 0},   // Enter
+	{"\e[109;5u", {{code = .Rune, r = 'm', mods = {.Ctrl}}, {}}, 1, 0},   // ...vs Ctrl+m
+	{"\e[27u",    {{code = .Escape},{}}, 1, 0},   // Escape
+	{"\e[91;5u",  {{code = .Rune, r = '[', mods = {.Ctrl}}, {}}, 1, 0},   // ...vs Ctrl+[
+	{"\e[8u",     {{code = .Backspace}, {}}, 1, 0},
+	{"\e[104;5u", {{code = .Rune, r = 'h', mods = {.Ctrl}}, {}}, 1, 0},   // ...vs Ctrl+h
+	{"\e[127u",   {{code = .Backspace}, {}}, 1, 0},
 
 	// Plain and modified text keys.
-	{"\e[97u",    {{code = .Rune, r = 'a'}, {}}, 1},
-	{"\e[97;5u",  {{code = .Rune, r = 'a', mods = {.Ctrl}}, {}}, 1},
-	{"\e[97;3u",  {{code = .Rune, r = 'a', mods = {.Alt}}, {}}, 1},
-	{"\e[97;7u",  {{code = .Rune, r = 'a', mods = {.Ctrl, .Alt}}, {}}, 1},
-	{"\e[97;8u",  {{code = .Rune, r = 'a', mods = {.Ctrl, .Alt, .Shift}}, {}}, 1},
-	{"\e[32u",    {{code = .Space, r = ' '}, {}}, 1},
-	{"\e[0u",     {{code = .Space, mods = {.Ctrl}}, {}}, 1},   // Ctrl+Space, no text
+	{"\e[97u",    {{code = .Rune, r = 'a'}, {}}, 1, 0},
+	{"\e[97;5u",  {{code = .Rune, r = 'a', mods = {.Ctrl}}, {}}, 1, 0},
+	{"\e[97;3u",  {{code = .Rune, r = 'a', mods = {.Alt}}, {}}, 1, 0},
+	{"\e[97;7u",  {{code = .Rune, r = 'a', mods = {.Ctrl, .Alt}}, {}}, 1, 0},
+	{"\e[97;8u",  {{code = .Rune, r = 'a', mods = {.Ctrl, .Alt, .Shift}}, {}}, 1, 0},
+	{"\e[32u",    {{code = .Space, r = ' '}, {}}, 1, 0},
+	{"\e[0u",     {{code = .Space, mods = {.Ctrl}}, {}}, 1, 0},   // Ctrl+Space, no text
 
 	// THE KITTY BITMASK IS NOT THE XTERM BITMASK. Bit 8 is Super in Kitty
 	// (Meta in xterm) and bit 32 is Meta in Kitty (nothing in xterm). Decode
 	// these with xterm_mods and both lines below flip: ;9u would gain .Meta
 	// and ;33u would lose it. That is the non-vacuity lever for kitty_mods.
-	{"\e[97;9u",  {{code = .Rune, r = 'a'}, {}}, 1},            // Super: no member, dropped
-	{"\e[97;33u", {{code = .Rune, r = 'a', mods = {.Meta}}, {}}, 1},
-	{"\e[97;65u", {{code = .Rune, r = 'a'}, {}}, 1},            // CapsLock: dropped
-	{"\e[97;129u",{{code = .Rune, r = 'a'}, {}}, 1},            // NumLock: dropped
+	{"\e[97;9u",  {{code = .Rune, r = 'a'}, {}}, 1, 0},            // Super: no member, dropped
+	{"\e[97;33u", {{code = .Rune, r = 'a', mods = {.Meta}}, {}}, 1, 0},
+	{"\e[97;65u", {{code = .Rune, r = 'a'}, {}}, 1, 0},            // CapsLock: dropped
+	{"\e[97;129u",{{code = .Rune, r = 'a'}, {}}, 1, 0},            // NumLock: dropped
 
 	// Event types (the ':' sub-parameter on the modifier field).
-	{"\e[97;1:1u", {{kind = .Press,   code = .Rune, r = 'a'}, {}}, 1},
-	{"\e[97;1:2u", {{kind = .Repeat,  code = .Rune, r = 'a'}, {}}, 1},
-	{"\e[97;1:3u", {{kind = .Release, code = .Rune, r = 'a'}, {}}, 1},
-	{"\e[97;5:3u", {{kind = .Release, code = .Rune, r = 'a', mods = {.Ctrl}}, {}}, 1},
-	{"\e[57352;5:2u", {{kind = .Repeat, code = .Up, mods = {.Ctrl}}, {}}, 1},
+	{"\e[97;1:1u", {{kind = .Press,   code = .Rune, r = 'a'}, {}}, 1, 0},
+	{"\e[97;1:2u", {{kind = .Repeat,  code = .Rune, r = 'a'}, {}}, 1, 0},
+	{"\e[97;1:3u", {{kind = .Release, code = .Rune, r = 'a'}, {}}, 1, 0},
+	{"\e[97;5:3u", {{kind = .Release, code = .Rune, r = 'a', mods = {.Ctrl}}, {}}, 1, 0},
+	{"\e[57352;5:2u", {{kind = .Repeat, code = .Up, mods = {.Ctrl}}, {}}, 1, 0},
 
 	// Functional keycodes: the 57344+ private-use block.
-	{"\e[57344u", {{code = .Escape},    {}}, 1},
-	{"\e[57345u", {{code = .Enter},     {}}, 1},
-	{"\e[57346u", {{code = .Tab},       {}}, 1},
-	{"\e[57347u", {{code = .Backspace}, {}}, 1},
-	{"\e[57348u", {{code = .Insert},    {}}, 1},
-	{"\e[57349u", {{code = .Delete},    {}}, 1},
-	{"\e[57350u", {{code = .Left},      {}}, 1},
-	{"\e[57351u", {{code = .Right},     {}}, 1},
-	{"\e[57352u", {{code = .Up},        {}}, 1},
-	{"\e[57353u", {{code = .Down},      {}}, 1},
-	{"\e[57354u", {{code = .Page_Up},   {}}, 1},
-	{"\e[57355u", {{code = .Page_Down}, {}}, 1},
-	{"\e[57356u", {{code = .Home},      {}}, 1},
-	{"\e[57357u", {{code = .End},       {}}, 1},
-	{"\e[57364u", {{code = .F1},        {}}, 1},
-	{"\e[57375u", {{code = .F12},       {}}, 1},
-	{"\e[57352;5u", {{code = .Up, mods = {.Ctrl}}, {}}, 1},
+	{"\e[57344u", {{code = .Escape},    {}}, 1, 0},
+	{"\e[57345u", {{code = .Enter},     {}}, 1, 0},
+	{"\e[57346u", {{code = .Tab},       {}}, 1, 0},
+	{"\e[57347u", {{code = .Backspace}, {}}, 1, 0},
+	{"\e[57348u", {{code = .Insert},    {}}, 1, 0},
+	{"\e[57349u", {{code = .Delete},    {}}, 1, 0},
+	{"\e[57350u", {{code = .Left},      {}}, 1, 0},
+	{"\e[57351u", {{code = .Right},     {}}, 1, 0},
+	{"\e[57352u", {{code = .Up},        {}}, 1, 0},
+	{"\e[57353u", {{code = .Down},      {}}, 1, 0},
+	{"\e[57354u", {{code = .Page_Up},   {}}, 1, 0},
+	{"\e[57355u", {{code = .Page_Down}, {}}, 1, 0},
+	{"\e[57356u", {{code = .Home},      {}}, 1, 0},
+	{"\e[57357u", {{code = .End},       {}}, 1, 0},
+	{"\e[57364u", {{code = .F1},        {}}, 1, 0},
+	{"\e[57375u", {{code = .F12},       {}}, 1, 0},
+	{"\e[57352;5u", {{code = .Up, mods = {.Ctrl}}, {}}, 1, 0},
 
 	// Alternate key reporting: <key>:<shifted>:<base-layout>. The shifted
 	// codepoint is what the keypress actually produces, so it wins for `r`;
 	// the base-layout codepoint has nowhere to go and is dropped.
-	{"\e[97:65;2u",    {{code = .Rune, r = 'A', mods = {.Shift}}, {}}, 1},
-	{"\e[97:65:97;2u", {{code = .Rune, r = 'A', mods = {.Shift}}, {}}, 1},
-	{"\e[97::97u",     {{code = .Rune, r = 'a'}, {}}, 1},   // empty shifted sub-param
+	{"\e[97:65;2u",    {{code = .Rune, r = 'A', mods = {.Shift}}, {}}, 1, 0},
+	{"\e[97:65:97;2u", {{code = .Rune, r = 'A', mods = {.Shift}}, {}}, 1, 0},
+	{"\e[97::97u",     {{code = .Rune, r = 'a'}, {}}, 1, 0},   // empty shifted sub-param
 
 	// Text-as-codepoints, the third field. One codepoint populates `r`.
-	{"\e[97;;98u",   {{code = .Rune, r = 'b'}, {}}, 1},
-	{"\e[97;1:1;98u",{{code = .Rune, r = 'b'}, {}}, 1},
+	{"\e[97;;98u",   {{code = .Rune, r = 'b'}, {}}, 1, 0},
+	{"\e[97;1:1;98u",{{code = .Rune, r = 'b'}, {}}, 1, 0},
 	// ...several do not: Key_Msg.r is ONE rune and there is nowhere to put the
 	// rest, so the text field is ignored wholesale and `r` falls back to the
 	// key code. Documented in kitty_decode; deliberately not a silent truncation.
-	{"\e[97;;98:99u", {{code = .Rune, r = 'a'}, {}}, 1},
+	{"\e[97;;98:99u", {{code = .Rune, r = 'a'}, {}}, 1, 0},
+
+	// -- T1-L: bracketed paste -------------------------------------------
+	//
+	// Here for the same reason the Kitty block is: this is the table
+	// test_split_at_every_byte_boundary reads, and `\e[200~` is a six-byte
+	// introducer whose every proper prefix has to hold back or a paste split
+	// across two reads turns into a spurious Escape plus five garbage runes.
+	// The richer content cases (a pasted `\e[A`, a nested `\e[200~`, a bare
+	// ESC) do not fit `want`'s two slots and live in the T1-L block below.
+	{"\e[200~", {{}, {}}, 0, 1},                      // start marker, no keys
+	{"\e[200~\e[201~", {{}, {}}, 0, 2},               // empty paste
+	{"\e[200~ab\e[201~",
+		{{code = .Rune, r = 'a', pasted = true}, {code = .Rune, r = 'b', pasted = true}}, 2, 2},
+	// A pasted \n is the CHARACTER, not Enter, and a pasted \t is the
+	// character, not Tab -- the whole point of suspending key semantics
+	// inside a paste. decode_c0 is never consulted here.
+	{"\e[200~\n\t\e[201~",
+		{{code = .Rune, r = '\n', pasted = true}, {code = .Rune, r = '\t', pasted = true}}, 2, 2},
+	// Multi-byte UTF-8 survives intact; 'é' is 0xC3 0xA9, so this row is also
+	// the one that would break first if the paste path decoded byte-wise.
+	{"\e[200~é\e[201~", {{code = .Rune, r = 'é', pasted = true}, {}}, 1, 2},
 
 	// -- two sequences back to back -------------------------------------
-	{"\e[A\e[1;5D", {{code = .Up}, {code = .Left, mods = {.Ctrl}}}, 2},
-	{"\eOA\e[5~",   {{code = .Up}, {code = .Page_Up}}, 2},
+	{"\e[A\e[1;5D", {{code = .Up}, {code = .Left, mods = {.Ctrl}}}, 2, 0},
+	{"\eOA\e[5~",   {{code = .Up}, {code = .Page_Up}}, 2, 0},
 	// Kitty and legacy bytes in ONE buffer must both decode (T1-J req. 7).
-	{"\e[97;5u\e[A", {{code = .Rune, r = 'a', mods = {.Ctrl}}, {code = .Up}}, 2},
-	{"\e[A\e[97u",   {{code = .Up}, {code = .Rune, r = 'a'}}, 2},
+	{"\e[97;5u\e[A", {{code = .Rune, r = 'a', mods = {.Ctrl}}, {code = .Up}}, 2, 0},
+	{"\e[A\e[97u",   {{code = .Up}, {code = .Rune, r = 'a'}}, 2, 0},
 }
 
 @(test)
 test_decode_key_table :: proc(t: ^testing.T) {
 	out := make([dynamic]Key_Msg); defer delete(out)
+	// One Paste_State, RESET per row rather than carried: a table row is a
+	// self-contained buffer, and "\e[200~" leaving paste mode on would
+	// otherwise silently reinterpret every row after it as pasted text --
+	// which is exactly the cross-call persistence the T1-L tests below check
+	// deliberately, and must not leak in here by accident.
+	pst := Paste_State{}; defer delete(pst.markers)
 	for c in key_cases {
 		clear(&out)
-		n := decode_keys(transmute([]u8)c.seq, &out)
+		pst.active = false
+		clear(&pst.markers)
+		n := decode_keys(transmute([]u8)c.seq, &out, {}, nil, &pst)
 		testing.expectf(t, n == len(c.seq), "%q: consumed %d, want %d", c.seq, n, len(c.seq))
+		testing.expectf(t, len(pst.markers) == c.nmark,
+			"%q: emitted %d paste markers, want %d (%v)", c.seq, len(pst.markers), c.nmark, pst.markers[:])
 		if !testing.expectf(t, len(out) == c.nwant,
 			"%q: emitted %d keys, want %d (%v)", c.seq, len(out), c.nwant, out[:]) {
 			continue
@@ -387,16 +430,18 @@ test_decode_key_table :: proc(t: ^testing.T) {
 // Asserting those two positively, rather than exempting them, is what stops
 // this test from quietly degenerating into "anything goes at the boundary".
 //
-// Only the single-sequence table entries are split here: a prefix of a
-// two-sequence entry legitimately decodes its first sequence, which is a
-// different property (and the one test_complete_then_partial checks).
+// Only the entries that produce exactly ONE message are split here -- a key,
+// or (since T1-L) a lone paste marker. A prefix of a multi-message entry
+// legitimately decodes its first sequence, which is a different property (and
+// the one test_complete_then_partial checks for keys and
+// test_paste_split_at_every_byte_boundary for pastes).
 // `checked` guards against the filter silently eating the whole table.
 @(test)
 test_split_at_every_byte_boundary :: proc(t: ^testing.T) {
 	out := make([dynamic]Key_Msg); defer delete(out)
 	checked := 0
 	for c in key_cases {
-		if c.nwant != 1 { continue }
+		if c.nwant + c.nmark != 1 { continue }
 		b := transmute([]u8)c.seq
 		for k in 1 ..< len(b) {
 			checked += 1
@@ -420,12 +465,13 @@ test_split_at_every_byte_boundary :: proc(t: ^testing.T) {
 			}
 		}
 	}
-	// Floor raised from 100 to 500 when T1-J added the Kitty block, and from
-	// 500 to 600 when T1-K added the legacy event-type block (608 split points
-	// at the time of writing, up from 531, up from 186). The floor exists so
-	// deleting a chunk of the table cannot quietly make this test vacuous, so
-	// it has to track the table's actual size.
-	testing.expectf(t, checked >= 600, "only %d split points exercised -- table shrank?", checked)
+	// Floor raised from 100 to 500 when T1-J added the Kitty block, from 500 to
+	// 600 when T1-K added the legacy event-type block, and from 600 to 610 when
+	// T1-L added "\e[200~" (613 split points at the time of writing, up from
+	// 608, up from 531, up from 186). The floor exists so deleting a chunk of
+	// the table cannot quietly make this test vacuous, so it has to track the
+	// table's actual size.
+	testing.expectf(t, checked >= 610, "only %d split points exercised -- table shrank?", checked)
 }
 
 // A complete sequence followed by a partial one: the complete prefix must be
@@ -1016,4 +1062,348 @@ test_modifier_edges :: proc(t: ^testing.T) {
 	n = decode_keys(transmute([]u8)string("\e[2;5A"), &out)
 	testing.expect_value(t, n, 6)
 	testing.expect_value(t, len(out), 0)
+}
+
+// ---------------------------------------------------------------------------
+// T1-L: bracketed paste.
+//
+// The correctness crux is that INSIDE a paste the bytes are TEXT, not keys:
+// no escape-sequence decoding (a pasted "\e[A" is three literal runes, never
+// Up) and no key semantics (a pasted "\n" is the character, never Enter). The
+// table below is written as "what runes should come out", so every row is a
+// direct statement of that property.
+// ---------------------------------------------------------------------------
+
+@(private = "file")
+Paste_Case :: struct {
+	name:   string,
+	seq:    string,
+	// The pasted TEXT, as the runes that must come out in order. Every one of
+	// them must arrive as Key_Msg{code = .Rune, r = <it>, pasted = true}.
+	text:   string,
+	marks:  [2]Paste_Marker,
+	nmark:  int,
+}
+
+@(private = "file")
+paste_cases := [?]Paste_Case{
+	{"complete paste", "\e[200~hello\e[201~", "hello",
+		{{at = 0, start = true}, {at = 5}}, 2},
+
+	// THE HEADLINE BUG. Without bracketed paste, pasting a buffer that happens
+	// to contain "\e[A" executes an Up arrow in the middle of the text.
+	{"escape sequence is literal text", "\e[200~x\e[Ay\e[201~", "x\e[Ay",
+		{{at = 0, start = true}, {at = 5}}, 2},
+
+	// Key semantics are suspended too: an app inserting pasted text wants a
+	// newline CHARACTER in its buffer, not "the user pressed Enter". Same for
+	// \t (not Tab) and \r (not Enter).
+	{"newline, tab and CR are literal runes", "\e[200~a\n\t\rb\e[201~", "a\n\t\rb",
+		{{at = 0, start = true}, {at = 5}}, 2},
+
+	// Multi-byte UTF-8 must come through intact -- the paste path does its own
+	// rune decoding rather than emitting bytes.
+	{"multi-byte utf-8", "\e[200~héllo→\e[201~", "héllo→",
+		{{at = 0, start = true}, {at = 6}}, 2},
+
+	// Zero-length paste. This is the case that makes the markers necessary at
+	// all: with no keys between them there is nothing else for an application
+	// to notice the paste by.
+	{"empty paste", "\e[200~\e[201~", "",
+		{{at = 0, start = true}, {at = 0}}, 2},
+
+	// ONLY "\e[201~" ends a paste. xterm filters ESC out of paste content, but
+	// this decoder does not assume that: a bare ESC that is not the terminator
+	// is literal text.
+	{"bare ESC inside a paste is literal", "\e[200~a\e\e[201~", "a\e",
+		{{at = 0, start = true}, {at = 2}}, 2},
+
+	// ...and so is a nested "\e[200~": all six of its bytes are runes. A
+	// decoder that re-entered paste mode here would swallow the real
+	// terminator and never leave.
+	{"nested paste start is literal", "\e[200~a\e[200~b\e[201~", "a\e[200~b",
+		{{at = 0, start = true}, {at = 8}}, 2},
+
+	// A near-miss terminator: "\e[201X" is not "\e[201~", so every byte of it
+	// is text and the paste keeps going.
+	{"near-miss terminator is literal", "\e[200~\e[201X\e[201~", "\e[201X",
+		{{at = 0, start = true}, {at = 6}}, 2},
+}
+
+// Feeds `data` through decode_keys exactly the way the reader loops do
+// (tea.odin, loop_nbio.odin): append to a pending buffer, decode, drop what
+// was consumed, keep the rest for the next chunk. Returns nothing -- the
+// caller inspects `out`, `pst` and `pending` itself.
+@(private = "file")
+paste_feed :: proc(pending: ^[dynamic]u8, chunk: []u8, out: ^[dynamic]Key_Msg, pst: ^Paste_State) {
+	append(pending, ..chunk)
+	consumed := decode_keys(pending[:], out, {}, nil, pst)
+	if consumed > 0 { remove_range(pending, 0, consumed) }
+}
+
+// Asserts that `out`/`pst` hold exactly what `c` says they should.
+@(private = "file")
+paste_check :: proc(t: ^testing.T, c: Paste_Case, label: string, out: []Key_Msg, pst: ^Paste_State) {
+	i := 0
+	for r in c.text {
+		if !testing.expectf(t, i < len(out), "%s/%s: ran out of keys at rune %d (%v)",
+			c.name, label, i, out) { return }
+		want := Key_Msg{code = .Rune, r = r, pasted = true}
+		testing.expectf(t, out[i] == want, "%s/%s: key %d = %v, want %v",
+			c.name, label, i, out[i], want)
+		i += 1
+	}
+	testing.expectf(t, len(out) == i, "%s/%s: emitted %d keys, want %d (%v)",
+		c.name, label, len(out), i, out)
+	if !testing.expectf(t, len(pst.markers) == c.nmark, "%s/%s: %d markers, want %d (%v)",
+		c.name, label, len(pst.markers), c.nmark, pst.markers[:]) { return }
+	for k in 0 ..< c.nmark {
+		testing.expectf(t, pst.markers[k] == c.marks[k], "%s/%s: marker %d = %v, want %v",
+			c.name, label, k, pst.markers[k], c.marks[k])
+	}
+	testing.expectf(t, !pst.active, "%s/%s: paste mode still active after the terminator", c.name, label)
+}
+
+@(test)
+test_bracketed_paste_table :: proc(t: ^testing.T) {
+	out := make([dynamic]Key_Msg); defer delete(out)
+	pending: [dynamic]u8; defer delete(pending)
+	pst := Paste_State{}; defer delete(pst.markers)
+
+	for c in paste_cases {
+		clear(&out); clear(&pending); clear(&pst.markers); pst.active = false
+		paste_feed(&pending, transmute([]u8)c.seq, &out, &pst)
+		testing.expectf(t, len(pending) == 0, "%s: %d bytes left unconsumed", c.name, len(pending))
+		paste_check(t, c, "whole", out[:], &pst)
+	}
+}
+
+// THE STREAMING TEST, and the one that pins paste mode as decoder STATE.
+//
+// Every case is split at every byte boundary into two chunks fed through ONE
+// Paste_State, which is exactly what the reader does when a paste straddles a
+// read: decode_keys is called once per read, so paste mode has to survive the
+// gap. The result must be byte-for-byte what the whole buffer produced -- a
+// paste that stalled (held back its content) or that lost its mode across the
+// call boundary both show up here immediately.
+@(test)
+test_paste_split_at_every_byte_boundary :: proc(t: ^testing.T) {
+	out := make([dynamic]Key_Msg); defer delete(out)
+	pending: [dynamic]u8; defer delete(pending)
+	pst := Paste_State{}; defer delete(pst.markers)
+	checked := 0
+
+	for c in paste_cases {
+		b := transmute([]u8)c.seq
+		for k in 1 ..< len(b) {
+			clear(&out); clear(&pending); clear(&pst.markers); pst.active = false
+
+			if k == 1 {
+				// THE ONE EXCEPTION, and it is not a paste exception: a first
+				// chunk of exactly "\e" is the documented lone-ESC ambiguity
+				// (decode_keys' doc comment), resolved as Escape because there
+				// is no timer to tell "sequence in flight" from "key pressed".
+				// Bracketed paste does not change that, and the introducer's
+				// ESC is not special -- test_split_at_every_byte_boundary pins
+				// the same answer for every other sequence in the decoder.
+				// Asserted positively rather than skipped, so the exception
+				// stays visible.
+				paste_feed(&pending, b[:1], &out, &pst)
+				testing.expectf(t, len(out) == 1 && out[0] == Key_Msg{code = .Escape},
+					"%s[:1]: got %v, want the documented lone-ESC resolution", c.name, out[:])
+				testing.expectf(t, len(pending) == 0, "%s[:1]: %d bytes left unconsumed",
+					c.name, len(pending))
+				continue
+			}
+
+			checked += 1
+			paste_feed(&pending, b[:k], &out, &pst)
+			paste_feed(&pending, b[k:], &out, &pst)
+			testing.expectf(t, len(pending) == 0,
+				"%s[:%d]: %d bytes left unconsumed", c.name, k, len(pending))
+			paste_check(t, c, "split", out[:], &pst)
+		}
+	}
+	// Anti-vacuity floor, same purpose as test_split_at_every_byte_boundary's:
+	// 121 split points across the 8 cases at the time of writing (129 boundaries
+	// less the 8 lone-ESC ones handled above).
+	testing.expectf(t, checked >= 115, "only %d split points exercised -- table shrank?", checked)
+}
+
+// The content of a paste must NOT be held back: it is streamed out as it
+// arrives, or a large paste would sit in the reader's `pending` buffer
+// unboundedly, which is the whole reason this feature streams rather than
+// accumulating. Only a partial UTF-8 rune or a partial terminator may stall.
+@(test)
+test_paste_content_is_streamed_not_buffered :: proc(t: ^testing.T) {
+	out := make([dynamic]Key_Msg); defer delete(out)
+	pending: [dynamic]u8; defer delete(pending)
+	pst := Paste_State{}; defer delete(pst.markers)
+
+	// Start plus 1000 bytes of content, no terminator in sight.
+	body: [dynamic]u8; defer delete(body)
+	append(&body, ..transmute([]u8)string("\e[200~"))
+	for _ in 0 ..< 1000 { append(&body, 'x') }
+	paste_feed(&pending, body[:], &out, &pst)
+	testing.expect_value(t, len(pending), 0)
+	testing.expect_value(t, len(out), 1000)
+	testing.expect(t, pst.active, "still inside the paste")
+	testing.expect_value(t, len(pst.markers), 1)
+
+	// The only things that may stall: a partial UTF-8 rune...
+	clear(&out)
+	paste_feed(&pending, []u8{0xC3}, &out, &pst)
+	testing.expectf(t, len(out) == 0 && len(pending) == 1,
+		"a split UTF-8 rune inside a paste must hold back: %d keys, %d pending", len(out), len(pending))
+	paste_feed(&pending, []u8{0xA9}, &out, &pst)
+	testing.expect_value(t, len(out), 1)
+	testing.expect_value(t, out[0], Key_Msg{code = .Rune, r = 'é', pasted = true})
+
+	// ...and a partial terminator. A BARE ESC AT THE END OF THE BUFFER HOLDS
+	// BACK inside a paste, unlike the lone-ESC rule at top level: both readings
+	// (terminator in flight, literal ESC in the text) are text, so there is no
+	// keypress to lose by waiting -- whereas resolving it as text would eat the
+	// real terminator's first byte and strand the decoder in paste mode
+	// forever. See decode_keys' doc comment.
+	clear(&out)
+	paste_feed(&pending, transmute([]u8)string("\e[20"), &out, &pst)
+	testing.expectf(t, len(out) == 0 && len(pending) == 4,
+		"a partial terminator must hold back: %d keys, %d pending", len(out), len(pending))
+	paste_feed(&pending, transmute([]u8)string("1~"), &out, &pst)
+	testing.expect_value(t, len(out), 0)
+	testing.expect_value(t, len(pending), 0)
+	testing.expect(t, !pst.active, "the terminator must end paste mode")
+}
+
+// Paste mode is state that persists across decode_keys calls -- the reader
+// calls it once per read, so a paste spanning two reads is the normal case,
+// not the edge case.
+@(test)
+test_paste_state_persists_across_decode_keys_calls :: proc(t: ^testing.T) {
+	out := make([dynamic]Key_Msg); defer delete(out)
+	pst := Paste_State{}; defer delete(pst.markers)
+
+	n := decode_keys(transmute([]u8)string("\e[200~ab"), &out, {}, nil, &pst)
+	testing.expect_value(t, n, 8)
+	testing.expect(t, pst.active, "paste mode must survive the end of the call")
+	testing.expect_value(t, len(out), 2)
+
+	// A SEPARATE call: "\e[A" here is pasted text, not Up.
+	n = decode_keys(transmute([]u8)string("\e[Ac\e[201~"), &out, {}, nil, &pst)
+	testing.expect_value(t, n, 10)
+	testing.expect(t, !pst.active, "the terminator must end paste mode")
+	if testing.expect_value(t, len(out), 6) {
+		for r, i in "ab\e[Ac" {
+			testing.expect_value(t, out[i], Key_Msg{code = .Rune, r = r, pasted = true})
+		}
+	}
+	if testing.expect_value(t, len(pst.markers), 2) {
+		testing.expect_value(t, pst.markers[0], Paste_Marker{at = 0, start = true})
+		testing.expect_value(t, pst.markers[1], Paste_Marker{at = 6})
+	}
+
+	// A key AFTER the paste is an ordinary key again: pasted = false, and
+	// "\e[A" decodes as Up once more.
+	clear(&out); clear(&pst.markers)
+	n = decode_keys(transmute([]u8)string("\e[A"), &out, {}, nil, &pst)
+	testing.expect_value(t, n, 3)
+	testing.expect_value(t, len(out), 1)
+	testing.expect_value(t, out[0], Key_Msg{code = .Up})
+}
+
+// `pst = nil` (the default, and what every caller before T1-L passed) is the
+// same degradation `enh = nil` is: the sequences are still understood WITHIN
+// one buffer, but there is nowhere to record the markers and nowhere for the
+// mode to live between calls. Pinned rather than left implicit, because a
+// caller that wants paste across reads has to pass a Paste_State and this is
+// what happens if it forgets.
+@(test)
+test_paste_without_a_state_does_not_persist :: proc(t: ^testing.T) {
+	out := make([dynamic]Key_Msg); defer delete(out)
+
+	// Within one buffer it still works: the "\e[A" is text.
+	n := decode_keys(transmute([]u8)string("\e[200~\e[A\e[201~"), &out)
+	testing.expect_value(t, n, 15)
+	if testing.expect_value(t, len(out), 3) {
+		for r, i in "\e[A" {
+			testing.expect_value(t, out[i], Key_Msg{code = .Rune, r = r, pasted = true})
+		}
+	}
+
+	// Across two calls it does not: the second call starts outside paste mode.
+	clear(&out)
+	decode_keys(transmute([]u8)string("\e[200~a"), &out)
+	clear(&out)
+	decode_keys(transmute([]u8)string("\e[A"), &out)
+	testing.expect_value(t, len(out), 1)
+	testing.expect_value(t, out[0], Key_Msg{code = .Up})
+}
+
+// An END with no START is cleanly ignored, NOT reported as a Paste_End_Msg.
+// Emitting one would tell an application to leave a mode it never entered --
+// the same class of hazard as the Kitty double-pop (term.odin), one layer up.
+@(test)
+test_unpaired_paste_end_is_ignored :: proc(t: ^testing.T) {
+	out := make([dynamic]Key_Msg); defer delete(out)
+	pst := Paste_State{}; defer delete(pst.markers)
+
+	n := decode_keys(transmute([]u8)string("\e[201~"), &out, {}, nil, &pst)
+	testing.expect_value(t, n, 6)
+	testing.expect_value(t, len(out), 0)
+	testing.expect_value(t, len(pst.markers), 0)
+	testing.expect(t, !pst.active, "an unpaired end must not enter paste mode")
+
+	// A trailing extra terminator after a real paste is the same thing.
+	clear(&pst.markers)
+	n = decode_keys(transmute([]u8)string("\e[200~a\e[201~\e[201~"), &out, {}, nil, &pst)
+	testing.expect_value(t, n, 19)
+	testing.expect_value(t, len(out), 1)
+	testing.expect_value(t, len(pst.markers), 2)
+}
+
+// An UNTERMINATED paste (the terminal dies, or is buggy, mid-paste) must not
+// wedge anything: everything decodable is still consumed and emitted, only an
+// ambiguous tail of at most five bytes (a proper prefix of the terminator) is
+// held back, and the reader keeps making progress until its read() reports
+// EOF. Documented in decode_keys; asserted here so "bounded" is a fact.
+@(test)
+test_unterminated_paste_does_not_wedge_the_reader :: proc(t: ^testing.T) {
+	out := make([dynamic]Key_Msg); defer delete(out)
+	pending: [dynamic]u8; defer delete(pending)
+	pst := Paste_State{}; defer delete(pst.markers)
+
+	paste_feed(&pending, transmute([]u8)string("\e[200~hello"), &out, &pst)
+	testing.expect_value(t, len(pending), 0)
+	testing.expect_value(t, len(out), 5)
+
+	// More text keeps flowing, still as pasted text, still fully consumed.
+	clear(&out)
+	paste_feed(&pending, transmute([]u8)string(" world"), &out, &pst)
+	testing.expect_value(t, len(pending), 0)
+	testing.expect_value(t, len(out), 6)
+	testing.expect(t, pst.active, "no terminator arrived, so paste mode stays on")
+
+	// The worst case for `pending` is a full proper prefix of the terminator:
+	// five bytes, and it can never grow past that.
+	clear(&out)
+	paste_feed(&pending, transmute([]u8)string("\e[201"), &out, &pst)
+	testing.expect_value(t, len(pending), 5)
+	clear(&out)
+	paste_feed(&pending, transmute([]u8)string("X\e[201"), &out, &pst)
+	testing.expectf(t, len(pending) == 5, "pending grew to %d -- it must stay bounded", len(pending))
+	testing.expect_value(t, len(out), 6)   // "\e[201X" resynchronised as literal text
+}
+
+// Paste_Start_Msg and Paste_End_Msg cross the mailbox like every other Msg, so
+// they are subject to box()'s MESSAGE OWNERSHIP CONTRACT (arena.odin). They
+// are zero-sized structs precisely so they can be: Bubble Tea's
+// PasteMsg{Content string} would be rejected here, which is why RuneTea
+// streams the content as ordinary Key_Msgs instead of accumulating it.
+@(test)
+test_paste_msgs_are_pod :: proc(t: ^testing.T) {
+	testing.expect(t, is_pod_type(Paste_Start_Msg), "Paste_Start_Msg must be POD")
+	testing.expect(t, is_pod_type(Paste_End_Msg), "Paste_End_Msg must be POD")
+	testing.expect(t, is_pod_type(Key_Msg), "Key_Msg must stay POD after gaining `pasted`")
+	testing.expect_value(t, size_of(Paste_Start_Msg), 0)
+	testing.expect_value(t, size_of(Paste_End_Msg), 0)
 }

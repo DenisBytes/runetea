@@ -83,7 +83,84 @@ Key_Msg :: struct {
 	code: Key_Code,
 	r:    rune,
 	mods: Modifiers,
+	// T1-L: true for every rune that arrived between a bracketed-paste
+	// `CSI 200~` and its `CSI 201~`. APPENDED, like every other member in this
+	// file, and false is the zero value, so every existing decode path keeps
+	// producing exactly what it did.
+	//
+	// A pasted key is always `code = .Rune` with `mods = {}`: inside a paste
+	// the bytes are TEXT, so no escape sequence is decoded and no key semantics
+	// are applied (see decode_keys). An application that ignores paste entirely
+	// still receives the pasted text as ordinary keypresses, which is the
+	// graceful degradation this design is built around.
+	pasted: bool,
 }
+
+// Bracketed paste's boundaries. ZERO-SIZED ON PURPOSE, and the reason is
+// box()'s MESSAGE OWNERSHIP CONTRACT (arena.odin): Bubble Tea's
+// `PasteMsg{Content string}` is ILLEGAL here, because box() rejects a `string`
+// field at runtime, and Msg_Text is not a workaround -- it truncates at 255
+// bytes and pastes routinely run to kilobytes.
+//
+// So the content is STREAMED instead: between these two messages the pasted
+// text arrives as ordinary Key_Msgs with `pasted = true`. That is O(1) memory
+// for an arbitrarily large paste (accumulating it would mean holding the whole
+// thing in the reader's `pending` buffer, unbounded, before emitting anything)
+// and it arrives incrementally rather than all at the end.
+Paste_Start_Msg :: struct{}
+Paste_End_Msg   :: struct{}
+
+// Where a paste boundary sits RELATIVE TO THE KEYS decode_keys emitted in the
+// same call: the marker belongs immediately before `out[at]`, and `at ==
+// len(out)` means "after everything".
+//
+// Positions rather than a second, unordered output stream (which is what
+// `enh` is) because ORDER IS THE POINT here. An application that switches into
+// a bulk-insert mode on Paste_Start_Msg needs it before the first pasted
+// character, not after the last one; the keyboard-enhancement reply has no
+// such requirement, arrives once, and can afford to be reported out of band.
+Paste_Marker :: struct {
+	at:    int,
+	start: bool,   // true = Paste_Start_Msg, false = Paste_End_Msg
+}
+
+// decode_keys' bracketed-paste state AND its marker output, in one struct
+// because a caller needs both or neither.
+//
+// `active` is DECODER STATE THAT MUST PERSIST ACROSS CALLS. The reader calls
+// decode_keys once per read(), and a paste of any size straddles reads, so
+// "am I inside a paste?" cannot live in a local. It is not a package-level
+// global either: there is more than one decoder in this process (run() and
+// run_nbio() each own a reader, and tests call decode_keys directly), and a
+// shared global would have one reader's paste swallow another's keystrokes.
+// The caller owns the struct; both event-loop hosts keep one next to their
+// `pending` buffer.
+//
+// `markers` is CALLER-CLEARED, exactly like `out` and `enh`: decode_keys only
+// appends. Delete it when done -- it is the one allocation this type owns.
+Paste_State :: struct {
+	active:  bool,
+	markers: [dynamic]Paste_Marker,
+}
+
+// Boxes a Paste_Marker as the Msg it denotes. Package-visible because both
+// event-loop hosts need it and Odin has no closures to share the branch with;
+// context.allocator (never the frame arena) because these cross a thread
+// boundary into the mailbox like every other Msg -- see arena.odin's LIFETIME
+// CONTRACT. Both types are zero-sized, so box() returns a nil-data `any` and
+// box_free no-ops on it, exactly as it already does for Quit_Msg.
+@(private = "package")
+paste_marker_box :: proc(m: Paste_Marker) -> any {
+	if m.start { return box(Paste_Start_Msg{}, context.allocator) }
+	return box(Paste_End_Msg{}, context.allocator)
+}
+
+// The two bracketed-paste sequences, as strings so decode_keys can compare a
+// still-arriving tail against a prefix of PASTE_END without any arithmetic.
+@(private = "file")
+PASTE_START :: "\e[200~"
+@(private = "file")
+PASTE_END   :: "\e[201~"
 
 // What the terminal answered when term_enter_raw asked "CSI ? u" which
 // keyboard enhancements it actually enabled. `flags` is the terminal's word,
@@ -775,7 +852,9 @@ ss3_decode :: proc(mod_digits: []u8, gl: u8) -> (key: Key_Msg, ok: bool) {
 // Kitty keyboard protocol's CSI-u key events, including press/repeat/release
 // event types and the alternate-key and text sub-parameter forms; Kitty's
 // event-type sub-parameter on the LEGACY encodings (CSI 1;5:3 A,
-// CSI 3;5:3 ~); and the terminal's keyboard-enhancement reply
+// CSI 3;5:3 ~); bracketed paste (CSI 200~ ... CSI 201~), whose content is
+// streamed as Key_Msgs with `pasted = true` and whose boundaries land in
+// `pst.markers`; and the terminal's keyboard-enhancement reply
 // (CSI ? <flags> u), which is the one thing here that is not a Key_Msg and so
 // goes to `enh` instead of `out`.
 //
@@ -791,11 +870,45 @@ ss3_decode :: proc(mod_digits: []u8, gl: u8) -> (key: Key_Msg, ok: bool) {
 // (term.odin). Decoding is unconditional and does not consult that: a terminal
 // simply never emits these forms unless it was asked to.
 //
+// BRACKETED PASTE (T1-L) is the one construct here that is not a key at all.
+// Between `CSI 200~` and `CSI 201~` the bytes are TEXT, and this decoder
+// suspends BOTH of its usual jobs for the duration:
+//   - no escape-sequence decoding. A pasted "\e[A" is three literal runes, NOT
+//     Up. That is the entire bug the feature exists to fix: without it, pasting
+//     a buffer that happens to contain an arrow sequence executes it;
+//   - no key semantics. A pasted "\n" is Key_Msg{code = .Rune, r = '\n'}, not
+//     Enter; likewise "\t" is not Tab and "\r" is not Enter. decode_c0 is never
+//     consulted inside a paste. An application inserting the text wants a
+//     newline CHARACTER in its buffer, not "the user pressed Enter".
+// UTF-8 decoding does still apply -- a multi-byte rune must arrive intact, and
+// one split across a read boundary still holds back. The ONLY thing that ends
+// paste mode is the `CSI 201~` terminator; a nested `CSI 200~` is literal text.
+//
+// The state lives in `pst` (see Paste_State) because the reader calls this
+// proc once per read and a paste of any size straddles reads. With pst == nil
+// paste is still decoded WITHIN a single buffer, but the mode cannot survive
+// the call and the markers have nowhere to go -- the same degradation
+// enh == nil gives the enhancement reply.
+//
+// AN UNTERMINATED PASTE (the terminal dies or misbehaves mid-paste) does not
+// wedge anything, and this is worth stating because "hold back" and "wedge"
+// are one mistake apart. Everything decodable is consumed and emitted as it
+// arrives; the only thing ever held back is an ambiguous tail of at most five
+// bytes (a proper prefix of the terminator). So `pending` in the reader stays
+// bounded, the loop keeps making progress, and the session ends the way any
+// other does -- when read() reports EOF. What DOES persist is the mode itself:
+// every subsequent keystroke arrives as pasted text until the process exits.
+// Recovering from that would need a timeout, which is the same missing timer
+// the lone-ESC rule below documents, so it is left as a documented limitation
+// rather than half-solved with a guess.
+//
 // DOCUMENTED LIMITATIONS -- each of these is a separate future unit, and each
 // is CLEANLY IGNORED here (consumed whole, nothing emitted) rather than
 // leaking bytes as garbage runes:
 //   - mouse reporting (X10, SGR: CSI M ..., CSI < ... M/m);
-//   - bracketed paste (CSI 200~ / CSI 201~ and the text between them);
+//   - an UNPAIRED `CSI 201~` (a paste end with no matching start). Reporting a
+//     Paste_End_Msg for it would tell an application to leave a mode it never
+//     entered -- the same class of hazard as term.odin's unpaired Kitty pop;
 //   - the Kitty keyboard protocol's set/push/pop REQUESTS
 //     (CSI = / > / < ... u). Those are bytes a program writes, so one arriving
 //     on the input stream is an echo, not information. (The fourth member of
@@ -892,15 +1005,86 @@ ss3_decode :: proc(mod_digits: []u8, gl: u8) -> (key: Key_Msg, ok: bool) {
 // it is treated as a real Escape keypress, and the second ESC byte is left
 // for the next loop iteration to resolve on its own terms -- as a lone
 // trailing Escape, as the start of a new sequence, or as another double-ESC.
+//
+// A BARE ESC AT THE END OF THE BUFFER *INSIDE A PASTE* GOES THE OTHER WAY: it
+// HOLDS BACK. That is not an inconsistency with the lone-ESC rule above, it is
+// the same trade-off evaluated against different stakes.
+//
+// Above, the two readings are "a real Escape keypress" and "a sequence in
+// flight", and holding back would risk silently dropping a keypress that never
+// gets a follow-up byte -- so the rule resolves, and the cost is a mis-decoded
+// sequence in the rare split.
+//
+// Inside a paste, BOTH readings are text: either the ESC begins the `CSI 201~`
+// terminator, or it is a literal ESC in the pasted content. There is no
+// keypress to lose by waiting. And the two costs are wildly asymmetric --
+// resolving it as literal text when it was the terminator emits a garbage rune,
+// then re-emits "[201~" as five more, AND leaves the decoder stuck in paste
+// mode for the rest of the session, whereas holding back costs at most a
+// handful of bytes of latency in a burst that is by definition still arriving.
+// Bounded, too: only a proper prefix of the terminator can stall, so at most
+// five bytes are ever held (see the unterminated-paste note above).
 decode_keys :: proc(
 	data:   []u8,
 	out:    ^[dynamic]Key_Msg,
 	legacy: Legacy_Key_Encoding = {},
 	enh:    ^[dynamic]Keyboard_Enhancements_Msg = nil,
+	pst:    ^Paste_State = nil,
 ) -> (consumed: int) {
+	// Mirrored into a local and written back on EVERY exit path (there are
+	// several early returns for hold-back). With pst == nil the local is the
+	// only state there is, which is what makes paste work within one buffer
+	// but not across calls -- see this proc's doc comment.
+	in_paste := pst != nil && pst.active
+	defer { if pst != nil { pst.active = in_paste } }
+
 	i := 0
 	for i < len(data) {
 		b := data[i]
+
+		// PASTE CONTENT. Checked before everything else because inside a paste
+		// none of the grammars below apply: the only structure left in the
+		// stream is UTF-8 and the terminator.
+		if in_paste {
+			if b == 0x1b {
+				// Is this the terminator, or literal text? Compare against as
+				// much of PASTE_END as has actually arrived.
+				// `end` is a runtime copy: Odin cannot slice a constant string
+				// with a runtime index.
+				end  := PASTE_END
+				rest := data[i:]
+				n := min(len(rest), len(end))
+				if string(rest[:n]) == end[:n] {
+					// Still a candidate. If the whole thing is not here yet,
+					// hold back -- see the bare-ESC discussion above for why
+					// this one waits where the top-level lone ESC resolves.
+					if n < len(PASTE_END) { return i }
+					in_paste = false
+					if pst != nil { append(&pst.markers, Paste_Marker{at = len(out)}) }
+					i += len(PASTE_END)
+					continue
+				}
+				// Not the terminator, so the ESC is literal text. Emit just the
+				// ESC and resynchronise on the next byte: whatever follows is
+				// text too, and if it happens to begin a real terminator the
+				// check above catches it on the next iteration. (xterm filters
+				// ESC out of paste content; this decoder does not assume that.)
+				append(out, Key_Msg{code = .Rune, r = rune(0x1b), pasted = true})
+				i += 1
+				continue
+			}
+			// Everything else is a literal rune -- including \n, \t, \r and the
+			// rest of C0, which is why decode_c0 is deliberately NOT called
+			// here. Only an incomplete UTF-8 rune holds back; the content is
+			// otherwise streamed out in full on every call, because buffering it
+			// is exactly what this design exists to avoid.
+			need := utf8_lead_len(b)
+			if i + need > len(data) { return i }
+			r, w := utf8.decode_rune(data[i:])
+			append(out, Key_Msg{code = .Rune, r = r, pasted = true})
+			i += w
+			continue
+		}
 
 		if b == 0x1b {
 			if i + 1 >= len(data) {
@@ -945,6 +1129,24 @@ decode_keys :: proc(
 				// identical either way, so a caller that passes enh = nil
 				// (every existing one, and the golden harness) sees precisely
 				// the old behaviour.
+				// Bracketed paste START. Dispatched here, next to the flags
+				// reply and for the same reason: it is not a Key_Msg, so
+				// csi_decode -- whose whole signature is "a Key_Msg or
+				// nothing" -- has nowhere to put it. Matched against the WHOLE
+				// sequence rather than its parameter run so intermediates and
+				// private prefixes are excluded for free.
+				//
+				// The matching END is NOT handled here: while a paste is open
+				// the branch at the top of the loop consumes it, and while one
+				// is not, an unpaired `CSI 201~` falls straight through to
+				// csi_decode, where csi_tilde_code has no entry for 201 and it
+				// lands on the cleanly-ignored path exactly as it always did.
+				if string(data[i:j + 1]) == PASTE_START {
+					in_paste = true
+					if pst != nil { append(&pst.markers, Paste_Marker{at = len(out), start = true}) }
+					i = j + 1
+					continue
+				}
 				if final == 'u' && pe == j {
 					if fl, fok := kitty_flags_reply(data[ps:pe]); fok {
 						if enh != nil { append(enh, Keyboard_Enhancements_Msg{flags = fl}) }

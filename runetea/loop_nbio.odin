@@ -110,6 +110,7 @@ run_nbio :: proc(p: ^Program($T), fd: posix.FD, out: ^strings.Builder, flush_fd:
 		delete(rc.pending)
 		delete(rc.keys)
 		delete(rc.enh)
+		delete(rc.pst.markers)
 		// Any entries still sitting unflushed (only reachable if the mailbox
 		// closed mid-flush -- see nbio_flush_backlog) were boxed but never
 		// handed to apply(), so nothing else will ever free them; box_free
@@ -177,6 +178,10 @@ Nbio_Read_Ctx :: struct {
 	// (term.odin) -- a different Msg type, so decode_keys reports it on its
 	// own stream. Scratch, reused every callback, same as `keys`.
 	enh:         [dynamic]Keyboard_Enhancements_Msg,
+	// Bracketed-paste state owned by THIS reader (see input.odin's
+	// Paste_State): `active` has to survive between callbacks, since a paste
+	// straddles reads; `markers` is scratch, cleared every callback.
+	pst:         Paste_State,
 	legacy:      Legacy_Key_Encoding, // copy of Program.legacy; see its comment
 	// Boxed (via context.allocator), not raw Key_Msg -- box()'s own MESSAGE
 	// OWNERSHIP CONTRACT (arena.odin) requires anything that reaches the
@@ -222,14 +227,29 @@ nbio_on_read :: proc(op: ^nbio.Operation) {
 	append(&rc.pending, ..rc.buf[:n])
 	clear(&rc.keys)
 	clear(&rc.enh)
-	consumed := decode_keys(rc.pending[:], &rc.keys, rc.legacy, &rc.enh)
+	clear(&rc.pst.markers)
+	consumed := decode_keys(rc.pending[:], &rc.keys, rc.legacy, &rc.enh, &rc.pst)
 	if consumed > 0 { remove_range(&rc.pending, 0, consumed) }
 
 	// Boxed here, once per key, via context.allocator -- same convention as
 	// tea.odin's reader_thread -- so every message that ever reaches the
 	// mailbox is a genuine box() allocation. See Nbio_Read_Ctx's own comment
 	// on `backlog` for why this replaced sending rc.keys' elements directly.
-	for k in rc.keys { append(&rc.backlog, box(k, context.allocator)) }
+	//
+	// Paste markers interleave with the keys, for the reason spelled out in
+	// tea.odin's copy of this loop: their POSITION is their meaning, so
+	// Paste_Start_Msg must be queued before the first pasted character.
+	mi := 0
+	for k, idx in rc.keys {
+		for mi < len(rc.pst.markers) && rc.pst.markers[mi].at <= idx {
+			append(&rc.backlog, paste_marker_box(rc.pst.markers[mi]))
+			mi += 1
+		}
+		append(&rc.backlog, box(k, context.allocator))
+	}
+	for ; mi < len(rc.pst.markers); mi += 1 {
+		append(&rc.backlog, paste_marker_box(rc.pst.markers[mi]))
+	}
 	for e in rc.enh  { append(&rc.backlog, box(e, context.allocator)) }
 	nbio_flush_backlog(rc)
 }

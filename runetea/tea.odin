@@ -275,6 +275,11 @@ reader_thread :: proc(th: ^thread.Thread) {
 	// not a Key_Msg -- see decode_keys' note on the ordering that costs.
 	enh  := make([dynamic]Keyboard_Enhancements_Msg); defer delete(enh)
 	pending: [dynamic]u8;            defer delete(pending)
+	// Bracketed-paste state, owned by THIS reader (input.odin's Paste_State
+	// explains why it cannot be a global): `active` has to survive from one
+	// decode_keys call to the next, because a paste of any size straddles
+	// reads. `markers` is scratch, cleared and reused every read like `keys`.
+	pst := Paste_State{};            defer delete(pst.markers)
 
 	for !sync.atomic_load(&rd.stop) {
 		n, ok, woken := input_read(rd.src, buf[:])
@@ -290,12 +295,31 @@ reader_thread :: proc(th: ^thread.Thread) {
 
 		clear(&keys)
 		clear(&enh)
-		consumed := decode_keys(pending[:], &keys, rd.legacy, &enh)
+		clear(&pst.markers)
+		consumed := decode_keys(pending[:], &keys, rd.legacy, &enh, &pst)
 		if consumed > 0 { remove_range(&pending, 0, consumed) }
 
 		// Boxed on the heap, not the frame arena: these cross a thread
 		// boundary and outlive any single frame.
-		for k in keys { if reader_send(rd.mailbox, box(k, context.allocator)) { return } }
+		//
+		// Paste markers are INTERLEAVED with the keys rather than appended
+		// after them, because their position is their meaning: Paste_Start_Msg
+		// has to reach update() before the first pasted character and
+		// Paste_End_Msg after the last. `at` is monotonic, so one index into
+		// the marker list walked alongside the keys is enough. (`enh` is the
+		// contrast: it genuinely has no ordering requirement -- see
+		// decode_keys' note -- so it is flushed at the end.)
+		mi := 0
+		for k, idx in keys {
+			for mi < len(pst.markers) && pst.markers[mi].at <= idx {
+				if reader_send(rd.mailbox, paste_marker_box(pst.markers[mi])) { return }
+				mi += 1
+			}
+			if reader_send(rd.mailbox, box(k, context.allocator)) { return }
+		}
+		for ; mi < len(pst.markers); mi += 1 {
+			if reader_send(rd.mailbox, paste_marker_box(pst.markers[mi])) { return }
+		}
 		for e in enh  { if reader_send(rd.mailbox, box(e, context.allocator)) { return } }
 	}
 }

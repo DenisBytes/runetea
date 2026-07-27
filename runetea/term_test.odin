@@ -127,12 +127,14 @@ test_kitty_flag_values_match_the_protocol :: proc(t: ^testing.T) {
 	testing.expect_value(t, transmute(u8)all, u8(31))
 }
 
-// A terminal that never opted in must see ZERO keyboard bytes -- not a push,
-// not a query, and above all not a pop on the way out. `kb` defaults to {}
-// precisely so that every pre-T1-K call site (all 23 programs under examples/
-// and tools/, plus the golden harness) keeps behaving exactly as it did.
+// A terminal that never opted in must see ZERO bytes -- no keyboard push, no
+// query, no bracketed-paste enable, and above all nothing on the way out. Both
+// opt-ins default to off (`kb: Kitty_Flags = {}`, `paste: bool = false`)
+// precisely so that every call site that predates them (all 23 programs under
+// examples/ and tools/, plus the golden harness) keeps behaving exactly as it
+// did.
 @(test)
-test_no_kitty_flags_writes_nothing :: proc(t: ^testing.T) {
+test_no_opt_ins_write_nothing :: proc(t: ^testing.T) {
 	pty, ok := open_test_pty()
 	if !testing.expect(t, ok, "could not open a pty") { return }
 	defer close_test_pty(pty)
@@ -141,15 +143,16 @@ test_no_kitty_flags_writes_nothing :: proc(t: ^testing.T) {
 
 	testing.expect(t, term_enter_raw(pty.slave), "term_enter_raw on a pty slave should succeed")
 	testing.expect(t, !g_term.kitty_active, "no flags requested: kitty_active must stay false")
+	testing.expect(t, !g_term.paste_active, "no paste requested: paste_active must stay false")
 
 	buf: [64]u8
 	testing.expectf(t, drain_master(pty.master, buf[:], 0) == "",
-		"term_enter_raw(fd) with no flags wrote %q -- it must write nothing at all",
+		"term_enter_raw(fd) with no opt-in wrote %q -- it must write nothing at all",
 		drain_master(pty.master, buf[:], 0))
 
 	term_restore()
 	testing.expectf(t, drain_master(pty.master, buf[:], 0) == "",
-		"term_restore after an opt-out enter popped something -- an unpaired pop eats another program's stack entry")
+		"term_restore after an opt-out enter wrote something -- an unpaired pop eats another program's stack entry, and an unpaired ?2004l turns paste reporting off for whoever DID enable it")
 }
 
 // THE INVARIANT OF THIS TASK. Push once on the way in, pop EXACTLY once on the
@@ -250,4 +253,129 @@ test_kitty_pops_exactly_once_on_the_crash_path :: proc(t: ^testing.T) {
 	got := drain_master(pty.master, buf[:], len(want))
 	testing.expectf(t, got == want,
 		"crash path wrote %q, want push+query then exactly one pop %q", got, want)
+}
+
+// ---------------------------------------------------------------------------
+// T1-L: bracketed paste's set/reset pairing. Same pty technique as the Kitty
+// tests above, and deliberately the same SHAPE of test, because the invariant
+// is the same one: never undo something this process did not do.
+//
+// What differs is the HAZARD, and it is worth being precise about rather than
+// copying the Kitty reasoning across. `CSI ? 2004 h` / `l` are DECSET/DECRST
+// -- a mode SET and RESET, not a stack PUSH and POP. Resetting twice is
+// idempotent, and resetting a mode we never set cannot consume some other
+// program's stack entry the way an unpaired `CSI < 1 u` can, because there is
+// no stack and no depth to get wrong. The flag guard is still required -- an
+// unpaired `?2004l` turns bracketed paste OFF for whatever program above us
+// had it on, which is a real regression for that program -- but the blast
+// radius is bounded and observable (that program stops seeing paste brackets)
+// rather than unbounded and invisible (some unknown entry disappears from a
+// stack nobody can inspect).
+// ---------------------------------------------------------------------------
+
+@(test)
+test_paste_set_and_reset_exactly_once :: proc(t: ^testing.T) {
+	pty, ok := open_test_pty()
+	if !testing.expect(t, ok, "could not open a pty") { return }
+	defer close_test_pty(pty)
+	g_term = {}
+	defer g_term = {}
+
+	testing.expect(t, term_enter_raw(pty.slave, {}, true), "term_enter_raw should succeed")
+	testing.expect(t, g_term.paste_active, "a successful enable must leave paste_active true")
+	testing.expect(t, !g_term.kitty_active, "paste alone must not touch the keyboard stack")
+
+	buf: [64]u8
+	got := drain_master(pty.master, buf[:], len("\e[?2004h"))
+	testing.expectf(t, got == "\e[?2004h", "enabled %q, want %q", got, "\e[?2004h")
+
+	// Three teardowns: the orderly one, a redundant repeat, and the
+	// signal-handler entry point. Exactly one reset must come out. A second
+	// reset would be harmless on the wire (RESET is idempotent) but it would
+	// mean the flag guard is not working, and the guard is what stops us
+	// resetting a mode we never set at all.
+	term_restore()
+	testing.expect(t, !g_term.paste_active, "restore must clear paste_active")
+	term_restore()
+	term_restore_c()
+
+	buf2: [64]u8
+	got2 := drain_master(pty.master, buf2[:], len("\e[?2004l"))
+	testing.expectf(t, got2 == "\e[?2004l",
+		"teardown wrote %q, want exactly one reset %q", got2, "\e[?2004l")
+}
+
+// The two opt-ins are independent layers and must pair independently. This
+// also pins the RESTORE ORDERING: termios, then the keyboard pop, then the
+// paste reset -- worst-first, so a second fatal signal landing mid-teardown
+// has already undone the most damaging state. See term_restore_c.
+@(test)
+test_kitty_and_paste_pair_independently :: proc(t: ^testing.T) {
+	pty, ok := open_test_pty()
+	if !testing.expect(t, ok, "could not open a pty") { return }
+	defer close_test_pty(pty)
+	g_term = {}
+	defer g_term = {}
+
+	testing.expect(t, term_enter_raw(pty.slave, {.Disambiguate}, true), "term_enter_raw should succeed")
+	testing.expect(t, g_term.kitty_active && g_term.paste_active, "both opt-ins must be armed")
+
+	want_in := "\e[>1u\e[?u\e[?2004h"
+	buf: [64]u8
+	got := drain_master(pty.master, buf[:], len(want_in))
+	testing.expectf(t, got == want_in, "enter wrote %q, want %q", got, want_in)
+
+	term_restore()
+	term_restore_c()
+
+	want_out := "\e[<1u\e[?2004l"
+	buf2: [64]u8
+	got2 := drain_master(pty.master, buf2[:], len(want_out))
+	testing.expectf(t, got2 == want_out, "teardown wrote %q, want %q", got2, want_out)
+}
+
+// The crash path, end to end and for real -- the exact shape of
+// test_kitty_pops_exactly_once_on_the_crash_path, for the same reason: a
+// process killed by a signal never runs its `defer`s, so the reset has to come
+// out of guard.odin's crash_handler (which calls term_restore_c directly) or
+// not at all. Leaving a terminal in bracketed-paste mode after a crash means
+// every subsequent paste into the user's shell arrives wrapped in literal
+// "[200~"/"[201~" garbage.
+@(test)
+test_paste_resets_on_the_crash_path :: proc(t: ^testing.T) {
+	pty, ok := open_test_pty()
+	if !testing.expect(t, ok, "could not open a pty") { return }
+	defer close_test_pty(pty)
+
+	pid := posix.fork()
+	if !testing.expect(t, pid >= 0, "fork failed") { return }
+
+	if pid == 0 {
+		// CHILD. No `defer term_restore()`: this proves the SIGNAL path resets.
+		posix.close(pty.master)
+		install_crash_handlers()
+		if !term_enter_raw(pty.slave, {}, true) { posix._exit(1) }
+		posix.raise(posix.Signal.SIGTERM)
+		posix._exit(1)   // NOT REACHED: crash_handler re-raises with SIG_DFL
+	}
+
+	status: c.int
+	exited := false
+	for _ in 0 ..< 200 {
+		if posix.waitpid(pid, &status, {.NOHANG}) == pid { exited = true; break }
+		time.sleep(5 * time.Millisecond)
+	}
+	if !exited {
+		posix.kill(pid, posix.Signal.SIGKILL)
+		testing.expect(t, false, "child did not die within 1s")
+		return
+	}
+	testing.expect(t, posix.WIFSIGNALED(status),
+		"the child must die BY SIGNAL -- if it exited normally, crash_handler never ran")
+
+	buf: [64]u8
+	want := "\e[?2004h\e[?2004l"
+	got := drain_master(pty.master, buf[:], len(want))
+	testing.expectf(t, got == want,
+		"crash path wrote %q, want enable then exactly one reset %q", got, want)
 }

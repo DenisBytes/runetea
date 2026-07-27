@@ -35,6 +35,11 @@ Term_State :: struct {
 	// the whole mechanism that stops the normal teardown and the crash-signal
 	// teardown from both popping.
 	kitty_active: bool,
+	// T1-L. Same guarded-flag shape as kitty_active, and required for the same
+	// reason -- never undo something this process did not do -- but the hazard
+	// it guards is genuinely milder; see term_restore_c's "SET/RESET, NOT
+	// PUSH/POP" note for why, and for why the guard stays anyway.
+	paste_active: bool,
 }
 
 // Process-global: signal handlers take no arguments and must reach this.
@@ -51,6 +56,15 @@ g_term: Term_State
 // read-only) data pointer.
 @(private="file")
 KITTY_POP: string : "\e[<1u"
+
+// DECSET/DECRST 2004 -- bracketed paste on/off. Static strings for the same
+// reason KITTY_POP is one: PASTE_OFF is written from a signal handler, where
+// write(2) is safe and fmt/the allocator are not. PASTE_ON is static too so the
+// pair reads as a pair.
+@(private="file")
+PASTE_ON:  string : "\e[?2004h"
+@(private="file")
+PASTE_OFF: string : "\e[?2004l"
 
 // Builds "CSI > <flags> u" (push) followed by "CSI ? u" (query) into `buf`,
 // returning the filled prefix. Hand-formatted rather than fmt.bprintf'd: this
@@ -76,12 +90,15 @@ kitty_push_seq :: proc(kb: Kitty_Flags, buf: []u8) -> []u8 {
 
 // `kb` defaults to {}, which means DO NOT TOUCH the terminal's keyboard mode:
 // nothing is written, nothing is pushed, and the paired teardown in
-// term_restore_c stays a no-op. Opting in is the application's call, not the
+// term_restore_c stays a no-op. `paste` defaults to false and means the same
+// thing for bracketed paste. Opting in is the application's call, not the
 // framework's -- unlike Bubble Tea, run() does not own the terminal here (the
 // app calls term_enter_raw itself, and the golden tests drive run() with a
 // plain pipe), so the layer that entered raw mode is the layer that gets to
-// decide, and a terminal that never opted in must see zero keyboard sequences.
-term_enter_raw :: proc(fd: posix.FD, kb: Kitty_Flags = {}) -> bool {
+// decide, and a terminal that never opted in must see zero sequences of either
+// kind. Both are trailing defaulted parameters so that every call site written
+// before they existed keeps compiling and keeps behaving identically.
+term_enter_raw :: proc(fd: posix.FD, kb: Kitty_Flags = {}, paste: bool = false) -> bool {
 	if posix.tcgetattr(fd, &g_term.saved) != .OK { return false }
 
 	// ORDERING INVARIANT: raw_active must be true for the entire interval in
@@ -119,8 +136,21 @@ term_enter_raw :: proc(fd: posix.FD, kb: Kitty_Flags = {}) -> bool {
 		return false
 	}
 
-	if kb == {} { return true }
+	// Both opt-ins are written from here down, and BOTH ONLY AFTER tcsetattr
+	// SUCCEEDED. The Kitty block has its own (different, stronger) reason,
+	// below; the reason common to both is the rollback path -- tcsetattr
+	// failing returns false, and every call site's failure branch is
+	// `eprintln("not a tty"); os.exit(1)` placed BEFORE its `defer
+	// term_restore()`, so anything already written to the terminal at that
+	// point would never be undone. Writing after the last thing that can fail
+	// means there is nothing stranded when it does.
+	if kb != {} { kitty_enable(fd, kb) }
+	if paste    { paste_enable(fd) }
+	return true
+}
 
+@(private="file")
+kitty_enable :: proc(fd: posix.FD, kb: Kitty_Flags) {
 	// THE KEYBOARD PUSH MUST COME AFTER tcsetattr, not before. TCSAFLUSH
 	// DISCARDS pending input, and the query below asks the terminal to send
 	// some: push+query written first would race the mode change, and a reply
@@ -168,7 +198,29 @@ term_enter_raw :: proc(fd: posix.FD, kb: Kitty_Flags = {}) -> bool {
 		// application learns which it got.
 		g_term.kitty_active = false
 	}
-	return true
+}
+
+// `CSI ? 2004 h`. Ordering invariant identical in SHAPE to kitty_enable's --
+// the flag goes true BEFORE the write, so a crash signal landing between the
+// two resets a mode we may not have set rather than stranding one we did --
+// but the two sides of that trade are much less lopsided here, because RESET
+// is idempotent and stack-free. See term_restore_c for the full comparison.
+//
+// Unlike the Kitty block there is no reply to wait for, so TCSAFLUSH's
+// input-discarding has nothing to race; the reason this still runs after
+// tcsetattr is the rollback one stated at the call site.
+@(private="file")
+paste_enable :: proc(fd: posix.FD) {
+	g_term.paste_active = true
+	if posix.write(fd, raw_data(PASTE_ON), len(PASTE_ON)) <= 0 {
+		// Nothing went out at all (EIO once the far end is gone), so there is
+		// nothing for restore to turn off. A short write is not a case worth
+		// splitting here the way it is for the Kitty push: this is one eight-byte
+		// sequence rather than two independent ones, so a partial write leaves
+		// the terminal mid-sequence either way, and "assume set whenever it is
+		// not certain we did not" is the safe direction.
+		g_term.paste_active = false
+	}
 }
 
 term_restore :: proc() {
@@ -195,18 +247,34 @@ term_restore :: proc() {
 // immediately, so a crash handler that pops and a `defer term_restore()` that
 // runs afterwards cannot both pop.
 //
-// ORDERING: termios FIRST, the keyboard pop SECOND. The two are independent
-// layers (kernel line discipline vs terminal-emulator state) so neither
-// depends on the other, which leaves two tie-breakers, and both point the same
-// way. (1) This runs from a crash handler; the only thing that can stop it
-// half-way is a SECOND fatal signal, so the more catastrophic restoration goes
-// first. A tty stranded in raw mode has no echo, no line editing and no
-// Ctrl+C -- the user must blind-type `reset`. A tty stranded with an extra
-// keyboard-stack entry still echoes and still line-edits; with Disambiguate it
-// does not even change ordinary printable keys. (2) tcsetattr cannot block,
-// write CAN (a full tty output queue), and blocking mid-crash before the line
-// discipline is back would be the worst of both. Writing the pop after the
-// TCSAFLUSH also means it is never at risk from that flush.
+// PASTE IS SET/RESET, NOT PUSH/POP -- the difference from the Kitty pairing
+// above, stated rather than copied. `CSI ? 2004 h` / `l` are DECSET/DECRST:
+// one boolean mode, no stack, no depth. Resetting twice is idempotent, so the
+// specific catastrophe the POP-EXACTLY-ONCE rule exists to prevent -- eating an
+// entry that belongs to a program above us, from a stack nobody can inspect --
+// simply has no analogue here. The `paste_active` guard is still required, for
+// the general form of the same rule (never undo something this process did not
+// do): an unpaired `?2004l` turns bracketed paste OFF for whatever program had
+// it on, which is a real regression for that program. But the blast radius is
+// bounded and observable (that program stops seeing paste brackets) rather
+// than unbounded and invisible, so the guard is protecting against a smaller
+// hazard, and a bug in it would be correspondingly less destructive.
+//
+// ORDERING: termios FIRST, then the keyboard pop, then the paste reset. The
+// three are independent layers (kernel line discipline vs two separate pieces
+// of terminal-emulator state) so none depends on another, which leaves two
+// tie-breakers, and both point the same way. (1) This runs from a crash
+// handler; the only thing that can stop it half-way is a SECOND fatal signal,
+// so restorations go WORST-FIRST. A tty stranded in raw mode has no echo, no
+// line editing and no Ctrl+C -- the user must blind-type `reset`. A tty
+// stranded with an extra keyboard-stack entry still echoes and still
+// line-edits, but it can mis-report EVERY subsequent keystroke to the shell. A
+// tty stranded in bracketed-paste mode reports every keystroke correctly and
+// only wraps PASTES in literal "[200~"/"[201~" -- annoying, and invisible until
+// the user next pastes, but the smallest of the three. (2) tcsetattr cannot
+// block, write CAN (a full tty output queue), and blocking mid-crash before the
+// line discipline is back would be the worst of both. Writing both sequences
+// after the TCSAFLUSH also means neither is at risk from that flush.
 //
 // The write targets a real tty by construction -- kitty_active can only be
 // true if tcgetattr succeeded on this fd -- so it can only fail with EIO once
@@ -229,9 +297,9 @@ term_restore :: proc() {
 // first thing to meet that bar: it is written ONLY when this process
 // actually pushed.
 //
-// The two flags are checked INDEPENDENTLY rather than nested under one
-// early return, so that neither restoration can ever be skipped because of
-// the other's state.
+// The three flags are checked INDEPENDENTLY rather than nested under one
+// early return, so that no restoration can ever be skipped because of
+// another's state.
 term_restore_c :: proc "c" () {
 	if g_term.raw_active {
 		posix.tcsetattr(g_term.fd, .TCSAFLUSH, &g_term.saved)
@@ -240,6 +308,10 @@ term_restore_c :: proc "c" () {
 	if g_term.kitty_active {
 		posix.write(g_term.fd, raw_data(KITTY_POP), len(KITTY_POP))
 		g_term.kitty_active = false
+	}
+	if g_term.paste_active {
+		posix.write(g_term.fd, raw_data(PASTE_OFF), len(PASTE_OFF))
+		g_term.paste_active = false
 	}
 }
 

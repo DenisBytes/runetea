@@ -481,3 +481,85 @@ test_keyboard_enhancements_msg_reaches_update :: proc(t: ^testing.T) {
 		testing.expectf(t, p.model.keys == 1, "run_nbio(): update saw %d keys, want 1", p.model.keys)
 	}
 }
+
+// T1-L, end to end: a paste has to reach update() as Paste_Start_Msg, the
+// pasted characters, then Paste_End_Msg -- IN THAT ORDER. Order is the whole
+// reason decode_keys reports paste boundaries as POSITIONED markers rather
+// than on a second unordered stream the way it reports the keyboard-
+// enhancement reply: an app that switches into a bulk-insert mode on
+// Paste_Start needs the message before the first pasted character, not after
+// the last. Both event-loop hosts have to interleave them, so both are driven
+// here.
+Paste_Log_Model :: struct {
+	log: [64]u8,
+	n:   int,
+}
+
+@(private = "file")
+paste_log :: proc(m: ^Paste_Log_Model, ch: u8) {
+	if m.n < len(m.log) { m.log[m.n] = ch; m.n += 1 }
+}
+
+paste_log_update :: proc(m: Paste_Log_Model, msg: any, alloc: mem.Allocator) -> (Paste_Log_Model, Cmd) {
+	m := m
+	switch v in msg {
+	case Paste_Start_Msg: paste_log(&m, 'S')
+	case Paste_End_Msg:   paste_log(&m, 'E')
+	case Key_Msg:
+		if v.pasted {
+			paste_log(&m, 'p')
+		} else {
+			paste_log(&m, 'k')
+			if v.code == .Rune && v.r == 'q' { return m, quit_cmd() }
+		}
+	}
+	return m, cmd_nil()
+}
+
+paste_log_view :: proc(m: Paste_Log_Model, alloc: mem.Allocator) -> string { return "" }
+
+@(test)
+test_bracketed_paste_reaches_update_in_order :: proc(t: ^testing.T) {
+	// A normal key, then a paste whose content contains an arrow sequence and a
+	// newline (neither may become Up or Enter), then a normal key that quits.
+	script := "a\e[200~x\e[A\ny\e[201~q"
+	want   := "kSppppppEk"   // k S p(x) p(ESC) p([) p(A) p(\n) p(y) E k(q)
+
+	{
+		fds: [2]posix.FD
+		testing.expect(t, posix.pipe(&fds) == .OK, "pipe should succeed")
+		posix.write(fds[1], raw_data(script), len(script))
+		posix.close(fds[1])
+
+		src, ok := input_source_from_fd(fds[0])
+		testing.expect(t, ok, "input_source_from_fd should succeed")
+		b := strings.builder_make(); defer strings.builder_destroy(&b)
+
+		p: Program(Paste_Log_Model)
+		program_init(&p, Paste_Log_Model{}, paste_log_update, paste_log_view)
+		err := run(&p, &src, &b)
+		input_close(&src)
+		posix.close(fds[0])
+
+		testing.expect(t, err == nil, "run should exit cleanly")
+		testing.expectf(t, string(p.model.log[:p.model.n]) == want,
+			"run(): update saw %q, want %q", string(p.model.log[:p.model.n]), want)
+	}
+
+	{
+		fds: [2]posix.FD
+		testing.expect(t, posix.pipe(&fds) == .OK, "pipe should succeed")
+		posix.write(fds[1], raw_data(script), len(script))
+		posix.close(fds[1])
+
+		b := strings.builder_make(); defer strings.builder_destroy(&b)
+		p: Program(Paste_Log_Model)
+		program_init(&p, Paste_Log_Model{}, paste_log_update, paste_log_view)
+		err := run_nbio(&p, fds[0], &b)
+		posix.close(fds[0])
+
+		testing.expect(t, err == nil, "run_nbio should exit cleanly")
+		testing.expectf(t, string(p.model.log[:p.model.n]) == want,
+			"run_nbio(): update saw %q, want %q", string(p.model.log[:p.model.n]), want)
+	}
+}
