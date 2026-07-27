@@ -120,6 +120,22 @@ cd "$PKG"
 case "$mode" in
 plain)
 	run_with_leak_audit "$ODIN" test . -define:ODIN_TEST_THREADS=1
+
+	# examples/editor's model/update/view live in their own package
+	# (examples/editor/edit) precisely so they can be driven through the real
+	# rt.run() loop from scripted input bytes -- an example that only exists
+	# as a binary is validated by nobody. It CANNOT live in runetea's own test
+	# package: edit imports runetea, so a runetea test importing edit would be
+	# an import cycle. Hence a second `odin test` invocation rather than more
+	# files in $PKG.
+	#
+	# Same leak audit, same allowlist: these tests call run(), so they produce
+	# the same one-^Thread-per-session leak documented above and nothing else.
+	# cwd matters -- the golden test reads testdata/ relative to it.
+	echo
+	echo "=== examples/editor/edit ==="
+	cd "$ROOT/examples/editor/edit"
+	run_with_leak_audit "$ODIN" test . -define:ODIN_TEST_THREADS=1
 	;;
 tsan)
 	# WARNING (verified 2026-07-26): `odin test -sanitize:thread` does NOT
