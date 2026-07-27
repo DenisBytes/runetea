@@ -163,17 +163,18 @@ Check_Slot :: struct { host: string, port: int, status: int, err: string, done: 
 
 Model :: struct { checks: [2]Check_Slot }
 
-update :: proc(m: Model, msg: any, alloc: mem.Allocator) -> (Model, rt.Cmd) {
-	m := m
+// `m` is a POINTER: mutate it in place, return only the Cmd. See
+// rt.Program.update (runetea/tea.odin).
+update :: proc(m: ^Model, msg: any, alloc: mem.Allocator) -> rt.Cmd {
 	switch v in msg {
 	case rt.Key_Msg:
 		if v.code == .Rune && (v.r == 'q' || (v.r == 'c' && .Ctrl in v.mods)) {
-			return m, rt.quit_cmd()
+			return rt.quit_cmd()
 		}
 	case Status_Msg:
 		m.checks[v.idx].status = v.code
 		m.checks[v.idx].done = true
-		if all_checks_done(m) { return m, rt.quit_cmd() }
+		if all_checks_done(m^) { return rt.quit_cmd() }
 	case Err_Msg:
 		// The ONLY way to get a `string` out of a Msg_Text is
 		// rt.msg_text_clone, and it always allocates a fresh, independent
@@ -182,9 +183,9 @@ update :: proc(m: Model, msg: any, alloc: mem.Allocator) -> (Model, rt.Cmd) {
 		// anything retained in the model must not alias the box's storage.
 		m.checks[v.idx].err = rt.msg_text_clone(v.reason, context.allocator)
 		m.checks[v.idx].done = true
-		if all_checks_done(m) { return m, rt.quit_cmd() }
+		if all_checks_done(m^) { return rt.quit_cmd() }
 	}
-	return m, rt.cmd_nil()
+	return rt.cmd_nil()
 }
 
 all_checks_done :: proc(m: Model) -> bool {

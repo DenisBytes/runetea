@@ -2103,6 +2103,32 @@ this behind the golden-byte harness."
 
 ## Task 10: Program wiring and examples/simple
 
+> **AMENDED 2026-07-27 — `update` now takes `^T`.** Every `update` signature
+> and the `apply()` body quoted verbatim below are the code as it was WRITTEN
+> during T0 and are left unedited as the historical record. The shipping
+> signature is now:
+>
+> ```odin
+> update: proc(model: ^T, msg: any, alloc: mem.Allocator) -> Cmd,
+> ```
+>
+> and `apply()`'s guarded body is `s.cmd = s.p.update(&s.p.model, s.msg, s.alloc)`.
+> `view` is unchanged (still by value).
+>
+> **Why:** the by-value round-trip below made LLVM codegen superlinear in
+> `sizeof(T)` — 32 KiB took 102 s to build, 64 KiB did not finish in 200 s.
+> Bisected to that one call (deleting it alone moved 85 s → 0.7 s); the
+> pointer form is flat at ~0.2 s out to 256 KiB.
+>
+> **What it cost:** the by-value assignment in `apply()` was also what made a
+> recovered `update` panic leave `p.model` untouched — `longjmp` skipped the
+> store. That is gone: a panic mid-`update` now leaves the model half-mutated,
+> and an app cannot roll it back itself because `longjmp` skips the app's code
+> too. See `docs/superpowers/specs/2026-07-25-runetea-design.md` §5
+> ("DECISION REVERSED 2026-07-27") for the full table and bisection, and
+> `docs/superpowers/tier1-coverage-decision.md` §5 for what Tier 1 does and
+> does not guarantee about model state now.
+
 First point at which all the pieces run together. `run()` owns the terminal, drives Update/View, and returns an error rather than dying.
 
 **Files:**

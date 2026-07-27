@@ -7,6 +7,19 @@ package main
 // cmd.odin) in addition to Update, which was all Tier 1 covered before this
 // change (spike-findings.md §4). Three modes, selected by argv[1]:
 //
+//   update-panic -- an Update that panics BETWEEN two writes to the model.
+//                  Demonstrates Tier 1 recovering, AND pins what that recovery
+//                  does NOT cover as of 2026-07-27: `Program.update` takes ^T
+//                  now (tea.odin; docs/superpowers/tier1-coverage-decision.md
+//                  §5), so the model is mutated IN PLACE and a panic partway
+//                  through leaves it half-written. Under the old by-value
+//                  signature apply()'s `p.model = ...` assignment was skipped
+//                  by longjmp and the model survived intact; that is gone.
+//                  This mode asserts the WEAKER truth under a real pty --
+//                  process survives, terminal restored, run() returns
+//                  Panicked_Error, and the model's own invariant is broken.
+//                  Runs in this process: nothing crashes, nothing to fork.
+//
 //   view-panic  -- a View that panics on its second call. Demonstrates Tier 1
 //                  RECOVERING: run() returns Panicked_Error, the terminal's
 //                  line discipline is restored, and a diagnostic frame (not
@@ -94,10 +107,11 @@ open_pty :: proc() -> (pty: Pty, ok: bool) {
 
 main :: proc() {
 	if len(os.args) < 2 {
-		fmt.eprintln("usage: tier1check <view-panic|view-bounds|cmd-bounds>")
+		fmt.eprintln("usage: tier1check <update-panic|view-panic|view-bounds|cmd-bounds>")
 		os.exit(2)
 	}
 	switch os.args[1] {
+	case "update-panic": mode_update_panic()
 	case "view-panic":  mode_view_panic()
 	case "view-bounds": mode_view_bounds()
 	case "cmd-bounds":  mode_cmd_bounds()
@@ -107,14 +121,115 @@ main :: proc() {
 	}
 }
 
+// --- update-panic: Tier 1 recovers, but the model does NOT ---------------
+
+// INVARIANT, by construction: a == b at every point an outside observer could
+// look. up_update breaks it deliberately.
+Update_Panic_Model :: struct { a: int, b: int }
+
+// Writes the first half of the invariant-preserving pair, then panics before
+// the second. Under the OLD by-value signature this proc worked on a copy and
+// longjmp skipped apply()'s `p.model = ...` store, so p.model came out of
+// recovery still {0, 0}. With ^T the `m.a += 1` below lands directly in
+// p.model and survives the panic, while `m.b += 1` never happens.
+up_update :: proc(m: ^Update_Panic_Model, msg: any, alloc: mem.Allocator) -> rt.Cmd {
+	if _, is_key := msg.(rt.Key_Msg); is_key {
+		m.a += 1
+		panic("tier1check: update exploded between two writes")
+		// m.b += 1 -- NEVER RUNS. Nor would a `defer m^ = snapshot` restore,
+		// nor any error path in this proc: longjmp leaves this frame without
+		// executing anything else in it. That is why an app cannot roll its
+		// own snapshot back and must instead order its writes AFTER anything
+		// that can fail.
+	}
+	return rt.cmd_nil()
+}
+
+up_view :: proc(m: Update_Panic_Model, alloc: mem.Allocator) -> string {
+	return fmt.aprintf("a=%d b=%d", m.a, m.b, allocator = alloc)
+}
+
+mode_update_panic :: proc() {
+	pty, ok := open_pty()
+	if !ok { os.exit(1) }
+	defer posix.close(pty.master)
+	defer posix.close(pty.slave)
+	defer delete(pty.slave_path)
+
+	// install_crash_handlers BEFORE term_enter_raw -- required order (FIX 4,
+	// final fix-wave report; guard.odin's own doc comment).
+	rt.install_crash_handlers()
+	if !rt.term_enter_raw(pty.slave) {
+		fmt.println("BLOCKED: term_enter_raw failed")
+		os.exit(1)
+	}
+	defer rt.term_restore()
+
+	src, sok := rt.input_source_from_fd(pty.slave)
+	if !sok {
+		fmt.println("BLOCKED: input_source_from_fd failed")
+		os.exit(1)
+	}
+	defer rt.input_close(&src)
+
+	b := strings.builder_make(); defer strings.builder_destroy(&b)
+
+	p: rt.Program(Update_Panic_Model)
+	rt.program_init(&p, Update_Panic_Model{}, up_update, up_view)
+
+	one := [1]u8{'x'}
+	posix.write(pty.master, raw_data(one[:]), 1)
+
+	err := rt.run(&p, &src, &b, pty.slave)
+	_, panicked := err.(rt.Panicked_Error)
+	fmt.printfln("run() returned: %v", err)
+	fmt.printfln("model after recovery: a=%d b=%d (invariant a == b is %s)",
+		p.model.a, p.model.b, "HELD" if p.model.a == p.model.b else "BROKEN")
+
+	// Same caller-side simulation as mode_view_panic: run() does not restore
+	// the terminal itself, by design; the caller's own defer does.
+	rt.term_restore()
+
+	t: posix.termios
+	posix.tcgetattr(pty.slave, &t)
+	echo_on   := .ECHO in t.c_lflag
+	icanon_on := .ICANON in t.c_lflag
+	fmt.printfln("post-run termios: ECHO=%v ICANON=%v (both should be TRUE -- cooked mode restored)", echo_on, icanon_on)
+
+	// STILL guaranteed by Tier 1:
+	if !panicked {
+		fmt.println("FAIL: run() did not return Panicked_Error")
+		os.exit(1)
+	}
+	if !echo_on || !icanon_on {
+		fmt.println("FAIL: terminal line discipline was not restored")
+		os.exit(1)
+	}
+
+	// NO LONGER guaranteed -- asserted exactly, not permissively, so that a
+	// future change restoring the old behaviour FAILS here loudly instead of
+	// passing silently against a stale document.
+	if p.model.a != 1 {
+		fmt.printfln("FAIL: expected the pre-panic write to be visible (a == 1), got a = %d.", p.model.a)
+		fmt.println("      If a == 0, the by-value model round-trip (or an equivalent snapshot) is back --")
+		fmt.println("      update docs/superpowers/tier1-coverage-decision.md §5 and Program.update's comment.")
+		os.exit(1)
+	}
+	if p.model.b != 0 {
+		fmt.printfln("FAIL: expected the post-panic write NOT to have happened (b == 0), got b = %d", p.model.b)
+		os.exit(1)
+	}
+	fmt.println("PASS: update panic recovered under a real pty -- process survived, terminal restored, Panicked_Error returned;")
+	fmt.println("      and the model is HALF-MUTATED (a=1, b=0), which is the documented post-2026-07-27 guarantee, not a bug")
+}
+
 // --- view-panic: Tier 1 recovers -----------------------------------------
 
 View_Panic_Model :: struct { n: int }
 
-vp_update :: proc(m: View_Panic_Model, msg: any, alloc: mem.Allocator) -> (View_Panic_Model, rt.Cmd) {
-	m := m
+vp_update :: proc(m: ^View_Panic_Model, msg: any, alloc: mem.Allocator) -> rt.Cmd {
 	if _, is_key := msg.(rt.Key_Msg); is_key { m.n += 1 }
-	return m, rt.cmd_nil()
+	return rt.cmd_nil()
 }
 
 // Succeeds on the initial paint (n == 0), panics starting on the second call
@@ -232,8 +347,8 @@ wait_bounded :: proc(pid: posix.pid_t, timeout: time.Duration) -> (status: i32, 
 
 Bounds_View_Model :: struct {}
 
-bv_update :: proc(m: Bounds_View_Model, msg: any, alloc: mem.Allocator) -> (Bounds_View_Model, rt.Cmd) {
-	return m, rt.cmd_nil()
+bv_update :: proc(m: ^Bounds_View_Model, msg: any, alloc: mem.Allocator) -> rt.Cmd {
+	return rt.cmd_nil()
 }
 
 bv_view :: proc(m: Bounds_View_Model, alloc: mem.Allocator) -> string {
@@ -326,8 +441,8 @@ mode_view_bounds :: proc() {
 
 Bounds_Cmd_Model :: struct {}
 
-bc_update :: proc(m: Bounds_Cmd_Model, msg: any, alloc: mem.Allocator) -> (Bounds_Cmd_Model, rt.Cmd) {
-	return m, rt.cmd_nil()
+bc_update :: proc(m: ^Bounds_Cmd_Model, msg: any, alloc: mem.Allocator) -> rt.Cmd {
+	return rt.cmd_nil()
 }
 
 bc_view :: proc(m: Bounds_Cmd_Model, alloc: mem.Allocator) -> string { return "" }

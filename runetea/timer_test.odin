@@ -183,14 +183,13 @@ spin_tick_fn :: proc(env: rawptr, tk: time.Tick) -> any {
 	return box(Spin_Tick_Msg{n = e.n}, context.allocator)
 }
 
-spin_update :: proc(m: Spin_Model, msg: any, alloc: mem.Allocator) -> (Spin_Model, Cmd) {
-	m := m
+spin_update :: proc(m: ^Spin_Model, msg: any, alloc: mem.Allocator) -> Cmd {
 	if v, is := msg.(Spin_Tick_Msg); is {
 		m.fires += 1
-		if m.fires >= m.quit_after { return m, quit_cmd() }
-		return m, tick(5 * time.Millisecond, spin_tick_fn, Spin_Env{n = v.n + 1}, context.allocator)
+		if m.fires >= m.quit_after { return quit_cmd() }
+		return tick(5 * time.Millisecond, spin_tick_fn, Spin_Env{n = v.n + 1}, context.allocator)
 	}
-	return m, cmd_nil()
+	return cmd_nil()
 }
 
 spin_view :: proc(m: Spin_Model, alloc: mem.Allocator) -> string {
@@ -318,13 +317,12 @@ every_tick_fn :: proc(env: rawptr, tk: time.Tick) -> any {
 	return box(Spin_Tick_Msg{}, context.allocator)
 }
 
-every_update :: proc(m: Every_Model, msg: any, alloc: mem.Allocator) -> (Every_Model, Cmd) {
-	m := m
+every_update :: proc(m: ^Every_Model, msg: any, alloc: mem.Allocator) -> Cmd {
 	if _, is := msg.(Spin_Tick_Msg); is {
 		m.fires += 1
-		if m.fires >= 3 { return m, quit_cmd() }
+		if m.fires >= 3 { return quit_cmd() }
 	}
-	return m, cmd_nil()
+	return cmd_nil()
 }
 
 every_view :: proc(m: Every_Model, alloc: mem.Allocator) -> string {

@@ -462,8 +462,7 @@ batch_quit_leaf_run :: proc(env: rawptr, cancel: ^Cancel_Token) -> any {
 
 Batch_Quit_Model :: struct { armed: bool, count: ^int }
 
-batch_quit_update :: proc(m: Batch_Quit_Model, msg: any, alloc: mem.Allocator) -> (Batch_Quit_Model, Cmd) {
-	m := m
+batch_quit_update :: proc(m: ^Batch_Quit_Model, msg: any, alloc: mem.Allocator) -> Cmd {
 	if _, is_key := msg.(Key_Msg); is_key {
 		if !m.armed {
 			m.armed = true
@@ -486,11 +485,11 @@ batch_quit_update :: proc(m: Batch_Quit_Model, msg: any, alloc: mem.Allocator) -
 
 			c := batch(outer_batch, context.allocator)
 			delete(outer_batch)
-			return m, c
+			return c
 		}
-		return m, quit_cmd()
+		return quit_cmd()
 	}
-	return m, cmd_nil()
+	return cmd_nil()
 }
 
 batch_quit_view :: proc(m: Batch_Quit_Model, alloc: mem.Allocator) -> string { return "" }

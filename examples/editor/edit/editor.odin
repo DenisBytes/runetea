@@ -14,40 +14,59 @@ import "core:mem"
 import "core:strings"
 import rt "../../../runetea"
 
-// Fixed capacities, no [dynamic] anywhere in Model, and that is deliberate:
-// rt's update signature is `proc(model: T, msg: any, ...) -> (T, Cmd)` -- the
-// model is passed and returned BY VALUE. A [dynamic]Line field would survive
-// that copy only by aliasing (both the caller's old model and update()'s
-// working copy would point at the same backing store), and rt.run's guarded
-// update (guard.odin) can longjmp out of a panicking update AFTER an append
-// has already realloc'd that store -- leaving the surviving p.model's header
-// pointing at freed memory. Fixed arrays make the by-value copy the whole
-// truth.
+// Fixed capacities, no [dynamic] anywhere in Model, and that is still
+// deliberate -- though the reason has narrowed. Model is copied by value in
+// several places that remain (rt's `view` signature takes T by value; these
+// tests pass whole Models around as fixtures), and a [dynamic]Line field would
+// survive such a copy only by ALIASING: both copies would point at one backing
+// store. rt.run's guarded update (guard.odin) can longjmp out of a panicking
+// update after an append has already realloc'd that store, leaving the other
+// copy's header pointing at freed memory. Fixed arrays make a copy the whole
+// truth, with nothing shared behind it.
 //
 // NOTE this is NOT box()'s POD rule -- Model is never boxed; only Msgs are
 // (arena.odin's MESSAGE OWNERSHIP CONTRACT). It happens to be POD anyway.
 //
-// THE CAPACITIES ARE 32x64 AND NOT 64x128 FOR A TOOLCHAIN REASON, NOT A
-// DESIGN ONE, and it is worth knowing before anyone "generously" raises them.
-// LLVM code generation for a `Program(T)` blows up superlinearly in
-// sizeof(T). Measured on this toolchain, `odin build examples/editor`, wall
-// clock, with `-show-timings` attributing >96% of it to "LLVM API Code Gen":
+// THE CAPACITIES USED TO BE 32x64 FOR A TOOLCHAIN REASON, AND THAT REASON IS
+// GONE. Recorded because it shaped this file, not because it still binds:
+//
+// rt's update signature used to be `proc(model: T, msg: any, ...) -> (T, Cmd)`
+// -- model in by value, model out by value, assigned back into p.model by
+// apply(). LLVM code generation for that one call was superlinear in
+// sizeof(T), which put a hard ceiling on how big a RuneTea model could be.
+// Measured on this toolchain, `odin build examples/editor`, wall clock, with
+// `-show-timings` attributing >96% of it to "LLVM API Code Gen":
 //
 //   ~2 KiB model    1.3 s
 //   ~8 KiB model   10.1 s
 //   ~18 KiB model  122.2 s
 //   ~32 KiB model  did not finish in 150 s
 //
-// It is specific to instantiating rt's generic event loop, not to Odin's
-// handling of big structs in general: a control program that passes and
-// returns the same 32 KiB struct by value in a hot loop, with no rt in it at
-// all, compiles in 0.585 s and stays flat out to 64 KiB. So the practical
-// ceiling on a RuneTea model today is single-digit kilobytes, and a real
-// editor would have to keep its text buffer OUTSIDE the model (behind a
-// pointer into memory the model does not own) -- which is exactly the thing
-// the by-value signature otherwise discourages. Reported as a finding.
-MAX_LINES :: 32
-MAX_COLS  :: 64
+// That is why these were 32x64 (~8 KiB) and not 64x128, and the old comment
+// here warned people off "generously" raising them.
+//
+// The signature is now `proc(model: ^T, msg: any, ...) -> Cmd` -- see
+// rt.Program.update (runetea/tea.odin) for the full measurement table, the
+// bisection that pinned it to that single call, and the crash-safety property
+// the change cost. Build time is now FLAT in sizeof(T), so these capacities
+// were raised ~8x/4x -- a ~252 KiB Model against the old ~8 KiB one, and 4x
+// past the 64 KiB size that used to not finish compiling in 200 s at all.
+// This example is the regression test for that fix: if the ceiling ever comes
+// back, THIS is what stops compiling. (Measured after the change: the whole
+// example builds in ~0.9 s.)
+//
+// 250 AND NOT 256 FOR AN UNRELATED, MUCH SOFTER LIMIT. Odin emits
+// "Declaration of 'x' may cause a stack overflow" for any local whose type
+// exceeds exactly 262144 bytes (bisected on this toolchain: 262144 is silent,
+// 262145 warns). 256 lines puts Model at 264232 and trips it -- 33 warnings
+// across this file and editor_test.odin, which pass Models around as fixtures.
+// 250 lines puts it at 258048, just under. Note what this limit is and is not:
+// it is about STACK LOCALS in application code, not about the framework, and
+// the fix for an app that genuinely wants a bigger model is to heap-allocate
+// its Program -- unlike the old codegen ceiling, which no amount of
+// application-side care could work around.
+MAX_LINES :: 250
+MAX_COLS  :: 256
 VIEWPORT  :: 10   // text rows the view paints -- content taller than this scrolls
 TAB_WIDTH :: 4
 
@@ -230,8 +249,10 @@ word_left :: proc(m: ^Model) {
 // update
 // ---------------------------------------------------------------------------
 
-update :: proc(m: Model, msg: any, alloc: mem.Allocator) -> (Model, rt.Cmd) {
-	m := m
+// `m` is a POINTER -- mutate in place, return only the Cmd. See
+// rt.Program.update (runetea/tea.odin) for why, and for what a panic partway
+// through this proc now does (and no longer does) to the model.
+update :: proc(m: ^Model, msg: any, alloc: mem.Allocator) -> rt.Cmd {
 	switch v in msg {
 	case rt.Paste_Start_Msg:
 		// Bubble Tea's PasteMsg{Content string} does not exist here -- box()
@@ -248,12 +269,14 @@ update :: proc(m: Model, msg: any, alloc: mem.Allocator) -> (Model, rt.Cmd) {
 	case rt.Key_Msg:
 		return apply_key(m, v)
 	}
-	return m, rt.cmd_nil()
+	return rt.cmd_nil()
 }
 
-apply_key :: proc(m: Model, k: rt.Key_Msg) -> (Model, rt.Cmd) {
-	m := m
-
+// ^Model for the same reason update() takes one: Model is ~258 KiB now, so a
+// by-value in-and-out of this proc would be half a megabyte of memcpy per
+// keypress on top of reintroducing exactly the codegen blowup the pointer
+// signature exists to avoid.
+apply_key :: proc(m: ^Model, k: rt.Key_Msg) -> rt.Cmd {
 	// PASTED RUNES ARE TEXT, UNCONDITIONALLY. Checked before anything else,
 	// mirroring decode_keys' own precedence: inside a paste no escape
 	// sequence is decoded and no key semantics are applied, so a pasted "\n"
@@ -262,12 +285,12 @@ apply_key :: proc(m: Model, k: rt.Key_Msg) -> (Model, rt.Cmd) {
 	// quit binding would be the classic bracketed-paste bug.
 	if k.pasted {
 		switch {
-		case k.r == '\n' || k.r == '\r': split_line(&m)
-		case k.r >= 0x20:                insert_rune(&m, k.r)
+		case k.r == '\n' || k.r == '\r': split_line(m)
+		case k.r >= 0x20:                insert_rune(m, k.r)
 		}
 		m.last = .Paste
-		follow_cursor(&m)
-		return m, rt.cmd_nil()
+		follow_cursor(m)
+		return rt.cmd_nil()
 	}
 
 	#partial switch k.code {
@@ -275,7 +298,7 @@ apply_key :: proc(m: Model, k: rt.Key_Msg) -> (Model, rt.Cmd) {
 		if .Ctrl in k.mods {
 			switch k.r {
 			case 'c', 'q':
-				return m, rt.quit_cmd()
+				return rt.quit_cmd()
 			case 'i':
 				// THE KITTY PAYOFF, and the only binding in this file that
 				// cannot exist without it. On the legacy encoding Ctrl+I and
@@ -292,19 +315,19 @@ apply_key :: proc(m: Model, k: rt.Key_Msg) -> (Model, rt.Cmd) {
 				m.help = !m.help
 				m.last = .Toggle_Help
 			}
-			return m, rt.cmd_nil()
+			return rt.cmd_nil()
 		}
-		insert_rune(&m, k.r)
+		insert_rune(m, k.r)
 		m.last = .Insert
 
 	case .Space:
-		insert_rune(&m, ' '); m.last = .Insert
+		insert_rune(m, ' '); m.last = .Insert
 
 	case .Enter:
-		split_line(&m); m.last = .Newline
+		split_line(m); m.last = .Newline
 
 	case .Tab:
-		for _ in 0 ..< TAB_WIDTH { insert_rune(&m, ' ') }
+		for _ in 0 ..< TAB_WIDTH { insert_rune(m, ' ') }
 		m.last = .Indent
 
 	// BACKWARD delete: 0x7F on the wire. Removes the rune BEFORE the cursor,
@@ -319,7 +342,7 @@ apply_key :: proc(m: Model, k: rt.Key_Msg) -> (Model, rt.Cmd) {
 		} else if m.cy > 0 {
 			m.cy -= 1
 			m.cx = m.lines[m.cy].n
-			join_next(&m, m.cy)
+			join_next(m, m.cy)
 		}
 		m.last = .Backspace
 
@@ -333,24 +356,24 @@ apply_key :: proc(m: Model, k: rt.Key_Msg) -> (Model, rt.Cmd) {
 			for k := m.cx; k < l.n - 1; k += 1 { l.r[k] = l.r[k + 1] }
 			l.n -= 1
 		} else {
-			join_next(&m, m.cy)
+			join_next(m, m.cy)
 		}
 		m.last = .Delete
 
 	case .Left:
 		// `CSI 1;5D` vs `CSI D` -- the xterm modifier parameter, decoded by
 		// xterm_mods (input.odin) into k.mods.
-		if .Ctrl in k.mods { word_left(&m);  m.last = .Word_Left }
-		else               { move_left(&m);  m.last = .Left }
+		if .Ctrl in k.mods { word_left(m);  m.last = .Word_Left }
+		else               { move_left(m);  m.last = .Left }
 	case .Right:
-		if .Ctrl in k.mods { word_right(&m); m.last = .Word_Right }
-		else               { move_right(&m); m.last = .Right }
+		if .Ctrl in k.mods { word_right(m); m.last = .Word_Right }
+		else               { move_right(m); m.last = .Right }
 
 	case .Up:
-		if m.cy > 0 { m.cy -= 1; clamp_cx(&m) }
+		if m.cy > 0 { m.cy -= 1; clamp_cx(m) }
 		m.last = .Up
 	case .Down:
-		if m.cy < m.nlines - 1 { m.cy += 1; clamp_cx(&m) }
+		if m.cy < m.nlines - 1 { m.cy += 1; clamp_cx(m) }
 		m.last = .Down
 
 	case .Home:
@@ -363,18 +386,18 @@ apply_key :: proc(m: Model, k: rt.Key_Msg) -> (Model, rt.Cmd) {
 	case .Page_Up:
 		m.top = max(0, m.top - VIEWPORT)
 		m.cy  = max(0, m.cy - VIEWPORT)
-		clamp_cx(&m); m.last = .Page_Up
+		clamp_cx(m); m.last = .Page_Up
 	case .Page_Down:
 		m.top = min(max(0, m.nlines - VIEWPORT), m.top + VIEWPORT)
 		m.cy  = min(m.nlines - 1, m.cy + VIEWPORT)
-		clamp_cx(&m); m.last = .Page_Down
+		clamp_cx(m); m.last = .Page_Down
 
 	case .Escape:
-		return m, rt.quit_cmd()
+		return rt.quit_cmd()
 	}
 
-	follow_cursor(&m)
-	return m, rt.cmd_nil()
+	follow_cursor(m)
+	return rt.cmd_nil()
 }
 
 // ---------------------------------------------------------------------------

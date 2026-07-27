@@ -11,16 +11,15 @@ import "core:time"
 
 Counter :: struct { n: int, done: bool }
 
-counter_update :: proc(m: Counter, msg: any, alloc: mem.Allocator) -> (Counter, Cmd) {
-	m := m
+counter_update :: proc(m: ^Counter, msg: any, alloc: mem.Allocator) -> Cmd {
 	switch v in msg {
 	case Key_Msg:
-		if v.code == .Rune && v.r == 'q' { m.done = true; return m, quit_cmd() }
+		if v.code == .Rune && v.r == 'q' { m.done = true; return quit_cmd() }
 		m.n += 1
 	case Quit_Msg:
 		m.done = true
 	}
-	return m, cmd_nil()
+	return cmd_nil()
 }
 
 counter_view :: proc(m: Counter, alloc: mem.Allocator) -> string {
@@ -45,7 +44,7 @@ test_program_processes_keys_and_quits :: proc(t: ^testing.T) {
 @(test)
 test_program_recovers_from_a_panicking_update :: proc(t: ^testing.T) {
 	Boom :: struct { n: int }
-	boom_update :: proc(m: Boom, msg: any, alloc: mem.Allocator) -> (Boom, Cmd) {
+	boom_update :: proc(m: ^Boom, msg: any, alloc: mem.Allocator) -> Cmd {
 		panic("user update exploded")
 	}
 	boom_view :: proc(m: Boom, alloc: mem.Allocator) -> string { return "" }
@@ -63,6 +62,85 @@ test_program_recovers_from_a_panicking_update :: proc(t: ^testing.T) {
 	testing.expect(t, panicked, "a panicking Update must surface as Panicked_Error, not a crash")
 }
 
+// THE COST OF THE POINTER-BASED update SIGNATURE, PINNED AS A TEST.
+//
+// Program.update takes ^T rather than T -- see its own comment (tea.odin) for
+// the build-time measurements that bought that. What it cost is a real safety
+// property: with the old by-value signature, apply() did
+// `p.model, cmd = p.update(p.model, ...)`, and guarded()'s longjmp SKIPPED
+// that assignment, so a panicking update left p.model holding the last good
+// state by construction. With a pointer, update writes into p.model directly,
+// so a panic partway through leaves the model HALF-MUTATED.
+//
+// This test asserts that weaker reality rather than leaving it undocumented.
+// `Half_Mutated` carries an explicit invariant -- a == b, always -- and the
+// update below breaks it deliberately: it performs the first write, then
+// panics before the second. After recovery the model is observably
+// inconsistent, and this test says so out loud.
+//
+// Deliberately an EXACT equality assertion (a == 1, b == 0), not a permissive
+// "either value is fine". This is documentation of observed behaviour, and a
+// test that accepts every answer documents nothing. If a future change
+// restores the old guarantee -- an opt-in snapshot mechanism, say -- this test
+// SHOULD fail, and that failure is the signal to update the story in
+// Program.update's comment, apply()'s comment, and
+// docs/superpowers/tier1-coverage-decision.md §5. It is not a signal to
+// loosen the assertion here.
+//
+// The counterpart still holds and is asserted alongside: the PROCESS survives,
+// run() returns Panicked_Error carrying the panic text, and the session ends
+// (it does not loop back into update with the damaged model).
+Half_Mutated :: struct {
+	a: int,
+	b: int,   // INVARIANT: b == a at every point an outside observer can look
+}
+
+half_mutated_update :: proc(m: ^Half_Mutated, msg: any, alloc: mem.Allocator) -> Cmd {
+	if _, is_key := msg.(Key_Msg); is_key {
+		m.a += 1
+		panic("update exploded between two writes")
+		// m.b += 1 -- NEVER RUNS, and that is the entire point. longjmp jumps
+		// straight out of this proc back into apply(): no statement after the
+		// panic runs, no `defer` registered in this frame runs, and no
+		// hand-rolled `m^ = snapshot` restore line would run either. That is
+		// why the mitigation for this is STRUCTURAL (do the fallible work
+		// first, write into m^ last) and not a rollback an app can write.
+	}
+	return cmd_nil()
+}
+
+half_mutated_view :: proc(m: Half_Mutated, alloc: mem.Allocator) -> string { return "" }
+
+@(test)
+test_a_recovered_update_panic_can_leave_the_model_half_mutated :: proc(t: ^testing.T) {
+	src := input_source_from_bytes(transmute([]u8)string("x"))
+	defer input_close(&src)
+	b := strings.builder_make(); defer strings.builder_destroy(&b)
+
+	p: Program(Half_Mutated)
+	program_init(&p, Half_Mutated{}, half_mutated_update, half_mutated_view)
+
+	err := run(&p, &src, &b)
+	pe, panicked := err.(Panicked_Error)
+	defer delete(pe.message, context.allocator) // the caller owns it -- see Panicked_Error's own doc comment (tea.odin)
+
+	// Still guaranteed, unchanged by the signature change:
+	testing.expect(t, panicked, "a panicking Update must still surface as Panicked_Error, not a crash")
+	testing.expect(t, strings.contains(pe.message, "update exploded between two writes"),
+		"Panicked_Error must still carry the panic text")
+
+	// No longer guaranteed, and this is what that looks like:
+	testing.expectf(t, p.model.a == 1,
+		"the write that happened BEFORE the panic is visible in p.model: a = %d, want 1 "+
+		"(under the old by-value signature this was 0 -- longjmp skipped apply()'s assignment)", p.model.a)
+	testing.expectf(t, p.model.b == 0,
+		"the write that would have happened AFTER the panic did not: b = %d, want 0", p.model.b)
+	testing.expectf(t, p.model.a != p.model.b,
+		"Half_Mutated's own a == b invariant is BROKEN after a recovered update panic (a = %d, b = %d) -- "+
+		"Tier 1 guarantees the process survives, NOT that the model is consistent. See Program.update (tea.odin).",
+		p.model.a, p.model.b)
+}
+
 // T1 extension (docs/superpowers/tier1-coverage-decision.md): View was one of
 // the two unguarded user-code call sites spike-findings.md §4/addendum item 7
 // flagged. The view here succeeds on the FIRST call (n == 0, the initial
@@ -74,10 +152,9 @@ test_program_recovers_from_a_panicking_update :: proc(t: ^testing.T) {
 @(test)
 test_program_recovers_from_a_panicking_view :: proc(t: ^testing.T) {
 	View_Boom :: struct { n: int }
-	view_boom_update :: proc(m: View_Boom, msg: any, alloc: mem.Allocator) -> (View_Boom, Cmd) {
-		m := m
+	view_boom_update :: proc(m: ^View_Boom, msg: any, alloc: mem.Allocator) -> Cmd {
 		if _, is_key := msg.(Key_Msg); is_key { m.n += 1 }
-		return m, cmd_nil()
+		return cmd_nil()
 	}
 	view_boom_view :: proc(m: View_Boom, alloc: mem.Allocator) -> string {
 		if m.n > 0 { panic("view exploded") }
@@ -118,8 +195,8 @@ test_program_recovers_from_a_panicking_view :: proc(t: ^testing.T) {
 @(test)
 test_program_recovers_from_a_panicking_initial_view :: proc(t: ^testing.T) {
 	Init_View_Boom :: struct {}
-	init_view_boom_update :: proc(m: Init_View_Boom, msg: any, alloc: mem.Allocator) -> (Init_View_Boom, Cmd) {
-		return m, cmd_nil()
+	init_view_boom_update :: proc(m: ^Init_View_Boom, msg: any, alloc: mem.Allocator) -> Cmd {
+		return cmd_nil()
 	}
 	init_view_boom_view :: proc(m: Init_View_Boom, alloc: mem.Allocator) -> string {
 		panic("initial view exploded")
@@ -163,16 +240,15 @@ panicking_pool_cmd_run :: proc(env: rawptr, cancel: ^Cancel_Token) -> any {
 	panic("pool cmd exploded")
 }
 
-cmd_panic_update :: proc(m: Cmd_Panic_Model, msg: any, alloc: mem.Allocator) -> (Cmd_Panic_Model, Cmd) {
-	m := m
+cmd_panic_update :: proc(m: ^Cmd_Panic_Model, msg: any, alloc: mem.Allocator) -> Cmd {
 	switch v in msg {
 	case Key_Msg:
-		return m, cmd_from(panicking_pool_cmd_run, struct{}{}, context.allocator)
+		return cmd_from(panicking_pool_cmd_run, struct{}{}, context.allocator)
 	case Panicked_Msg:
 		m.got_panic_msg = true
-		return m, quit_cmd()
+		return quit_cmd()
 	}
-	return m, cmd_nil()
+	return cmd_nil()
 }
 
 cmd_panic_view :: proc(m: Cmd_Panic_Model, alloc: mem.Allocator) -> string { return "" }
@@ -231,7 +307,7 @@ test_program_survives_a_panicking_cmd :: proc(t: ^testing.T) {
 @(test)
 test_program_quits_from_an_async_init_cmd_with_no_keypress :: proc(t: ^testing.T) {
 	Idle :: struct {}
-	idle_update :: proc(m: Idle, msg: any, alloc: mem.Allocator) -> (Idle, Cmd) { return m, cmd_nil() }
+	idle_update :: proc(m: ^Idle, msg: any, alloc: mem.Allocator) -> Cmd { return cmd_nil() }
 	idle_view   :: proc(m: Idle, alloc: mem.Allocator) -> string { return "" }
 	quit_now    :: proc(env: rawptr, cancel: ^Cancel_Token) -> any { return box(Quit_Msg{}, context.allocator) }
 
@@ -363,16 +439,15 @@ slow_quit_cmd_run :: proc(env: rawptr, cancel: ^Cancel_Token) -> any {
 
 Slow_Quit_Model :: struct { armed: bool, finished: ^sync.Sema }
 
-slow_quit_update :: proc(m: Slow_Quit_Model, msg: any, alloc: mem.Allocator) -> (Slow_Quit_Model, Cmd) {
-	m := m
+slow_quit_update :: proc(m: ^Slow_Quit_Model, msg: any, alloc: mem.Allocator) -> Cmd {
 	if _, is_key := msg.(Key_Msg); is_key {
 		if !m.armed {
 			m.armed = true
-			return m, cmd_from(slow_quit_cmd_run, Slow_Quit_Env{finished = m.finished}, context.allocator)
+			return cmd_from(slow_quit_cmd_run, Slow_Quit_Env{finished = m.finished}, context.allocator)
 		}
-		return m, quit_cmd()
+		return quit_cmd()
 	}
-	return m, cmd_nil()
+	return cmd_nil()
 }
 
 slow_quit_view :: proc(m: Slow_Quit_Model, alloc: mem.Allocator) -> string { return "" }
@@ -418,17 +493,16 @@ test_run_returns_promptly_with_a_slow_cmd_still_in_flight :: proc(t: ^testing.T)
 // so it is exercised through run() and run_nbio() alike here.
 Enh_Model :: struct { seen: int, flags: Kitty_Flags, keys: int }
 
-enh_update :: proc(m: Enh_Model, msg: any, alloc: mem.Allocator) -> (Enh_Model, Cmd) {
-	m := m
+enh_update :: proc(m: ^Enh_Model, msg: any, alloc: mem.Allocator) -> Cmd {
 	switch v in msg {
 	case Keyboard_Enhancements_Msg:
 		m.seen += 1
 		m.flags = v.flags
 	case Key_Msg:
 		m.keys += 1
-		if v.code == .Rune && v.r == 'q' { return m, quit_cmd() }
+		if v.code == .Rune && v.r == 'q' { return quit_cmd() }
 	}
-	return m, cmd_nil()
+	return cmd_nil()
 }
 
 enh_view :: proc(m: Enh_Model, alloc: mem.Allocator) -> string { return "" }
@@ -500,20 +574,19 @@ paste_log :: proc(m: ^Paste_Log_Model, ch: u8) {
 	if m.n < len(m.log) { m.log[m.n] = ch; m.n += 1 }
 }
 
-paste_log_update :: proc(m: Paste_Log_Model, msg: any, alloc: mem.Allocator) -> (Paste_Log_Model, Cmd) {
-	m := m
+paste_log_update :: proc(m: ^Paste_Log_Model, msg: any, alloc: mem.Allocator) -> Cmd {
 	switch v in msg {
-	case Paste_Start_Msg: paste_log(&m, 'S')
-	case Paste_End_Msg:   paste_log(&m, 'E')
+	case Paste_Start_Msg: paste_log(m, 'S')
+	case Paste_End_Msg:   paste_log(m, 'E')
 	case Key_Msg:
 		if v.pasted {
-			paste_log(&m, 'p')
+			paste_log(m, 'p')
 		} else {
-			paste_log(&m, 'k')
-			if v.code == .Rune && v.r == 'q' { return m, quit_cmd() }
+			paste_log(m, 'k')
+			if v.code == .Rune && v.r == 'q' { return quit_cmd() }
 		}
 	}
-	return m, cmd_nil()
+	return cmd_nil()
 }
 
 paste_log_view :: proc(m: Paste_Log_Model, alloc: mem.Allocator) -> string { return "" }

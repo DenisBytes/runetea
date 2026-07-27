@@ -6,6 +6,13 @@ runs (`update`, `view`, Cmd procedures), not `update` alone.
 **Toolchain:** Odin dev-2026-07-nightly:819fdc7. Linux only. `core:`/`base:`
 only, no third-party dependencies.
 
+> **AMENDED 2026-07-27 — READ §5 BEFORE RELYING ON ANYTHING BELOW ABOUT
+> RECOVERY.** `Program.update` now takes `^T` instead of `T`, and that removed
+> a real safety property this document was written under: a recovered `update`
+> panic no longer leaves `p.model` in its last good state. It can leave the
+> model half-mutated, and an application cannot roll that back itself. Coverage
+> of `view` and Cmd procedures (§1–§4) is unaffected. §5 has the whole story.
+
 This is the fifth and last T1 decision. Spike-findings.md §4 claimed Tier 1
 "recovers a panic in user code." That was true for exactly one of the three
 places user code actually runs: `update`, guarded inside `apply()`. A panic
@@ -360,3 +367,120 @@ surface; no existing signature changed).
   `message-ownership-decision.md` §2 (Option B) describes ("an honest,
   immediate process abort" for a Cmd body on a pool worker). Flagged in §1(b)
   above; that document itself was left unedited, out of this task's scope.
+
+---
+
+## 5. AMENDMENT 2026-07-27 — Tier 1 no longer protects MODEL STATE
+
+**This section weakens a guarantee the rest of this document was written
+under.** Nothing above about *view* or *Cmd* coverage changes; §1(c)'s account
+of what each guard reclaims is still accurate as far as memory goes. What
+changed is a property that was never called out here explicitly, because at
+the time it came for free — and that is exactly why it needs calling out now
+that it does not.
+
+### 5.1 What changed
+
+`Program.update`'s signature changed from
+
+```odin
+update: proc(model: T, msg: any, alloc: mem.Allocator) -> (T, Cmd)
+```
+
+to
+
+```odin
+update: proc(model: ^T, msg: any, alloc: mem.Allocator) -> Cmd
+```
+
+`view` is unchanged (still by value), and `guarded()` itself is untouched.
+
+The reason is a measured toolchain defect, not a preference: LLVM code
+generation for `apply()`'s single by-value `update` call was superlinear in
+`sizeof(T)`, capping model size at single-digit kilobytes (32 KiB: 102 s to
+build; 64 KiB: did not finish in 200 s; pointer form: ~0.2 s flat out to
+256 KiB). The full measurement table and the bisection that pinned it to that
+one call live in `docs/superpowers/specs/2026-07-25-runetea-design.md` §5,
+under "DECISION REVERSED 2026-07-27".
+
+### 5.2 The property that was lost
+
+With the by-value signature, `apply()` did:
+
+```odin
+s.p.model, s.cmd = s.p.update(s.p.model, s.msg, s.alloc)
+```
+
+`update` worked on its own copy, and the result only reached `p.model` through
+that assignment. `guarded()`'s `longjmp` unwinds nothing and runs no `defer` —
+it jumps straight back to the `setjmp` in `guarded()`, **skipping the
+assignment entirely**. So a panicking `update` left `p.model` holding the last
+good state *by construction*, with no code anywhere written to make that
+happen. Tier 1 recovery therefore resumed from a model that was consistent, not
+merely intact.
+
+With `^T`, `update` writes into `p.model` directly. A panic partway through
+leaves it **half-mutated**: fields written before the panic point are updated,
+fields after it are not, and any invariant spanning the two is broken.
+
+### 5.3 What Tier 1 guarantees now, precisely
+
+After a recovered `update` panic:
+
+| | |
+|---|---|
+| **Guaranteed** | The process survives. The frame arena is reclaimed wholesale (`frame_reset`). The message is `box_free`'d exactly once. `run()` returns `Panicked_Error` carrying the panic text. The session ENDS — the loop does not feed further messages into `update` with the damaged model. The terminal is restored by the caller's own `defer` (unchanged; that was always the caller's job). |
+| **NOT guaranteed** | Anything at all about the contents of `p.model`. It may be fully updated, untouched, or inconsistent. |
+
+Because the session ends immediately, the exposure is bounded to whatever the
+**caller of `run()`** does with `p.model` after a `Panicked_Error` return.
+Callers should treat the model as suspect there — do not persist it, do not
+resume from it.
+
+### 5.4 An application cannot roll this back itself
+
+The obvious mitigation does not work, and it is worth being explicit about why
+so nobody writes it and believes it:
+
+```odin
+update :: proc(m: ^Model, msg: any, alloc: mem.Allocator) -> rt.Cmd {
+	old := m^                  // snapshot
+	defer if failed { m^ = old }   // NEVER RUNS
+	...
+}
+```
+
+`longjmp` skips the **application's** code exactly as thoroughly as it skips
+the framework's. It jumps out of `update` back into `apply()`: no statement
+after the panic point runs, no `defer` registered in `update`'s frame runs, and
+no error path inside `update` runs. There is nowhere to put a restore.
+
+**The mitigation that does work is structural:** do everything that can fail
+FIRST — compute into locals, bounds-check, assert, validate — and write into
+`m^` only once nothing further can panic. Then a panic leaves the model exactly
+as it was, because nothing had been written yet. This is a discipline for
+`update` authors, and it is the whole of the advice.
+
+### 5.5 Not fixed here: an opt-in snapshot
+
+A snapshot mechanism (`Program.snapshot_on_update: bool`, copy `p.model` aside
+before the guarded call, restore it on recovery) would restore the old
+guarantee for apps that want it, at the cost of one `sizeof(T)` copy per
+message. **It was deliberately NOT built as part of this change** — out of
+scope, and adding an opt-in safety feature nobody had asked for in the same
+change that removes an implicit one is how a trade-off gets obscured rather
+than recorded. Noted here as a known, viable option, not as a plan.
+
+### 5.6 Pinned by a test
+
+`runetea/tea_test.odin::test_a_recovered_update_panic_can_leave_the_model_half_mutated`
+drives a real `run()` session whose `update` writes one half of a two-field
+invariant, panics, and never writes the other. It asserts the resulting state
+**exactly** (`a == 1`, `b == 0`, `a != b`), not permissively — a test that
+accepted either answer would document nothing. If a future change restores the
+old guarantee, that test is designed to FAIL, and its failure is the signal to
+come back and rewrite this section.
+
+Also recorded in-code, at length, on `Program.update` and at `apply()`'s
+`guarded()` call (`runetea/tea.odin`), and in `examples/editor/edit/editor.odin`'s
+capacity comment — which existed *because of* the ceiling this change removed.

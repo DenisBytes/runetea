@@ -25,16 +25,17 @@ slow_cmd :: proc(env: rawptr, cancel: ^rt.Cancel_Token) -> any {
 
 Model :: struct { ready: bool, value: int }
 
-update :: proc(m: Model, msg: any, alloc: mem.Allocator) -> (Model, rt.Cmd) {
-	m := m
+// `m` is a POINTER: mutate in place, return only the Cmd. See
+// rt.Program.update (runetea/tea.odin).
+update :: proc(m: ^Model, msg: any, alloc: mem.Allocator) -> rt.Cmd {
 	switch v in msg {
 	case rt.Key_Msg:
-		if v.code == .Rune && v.r == 'q' { return m, rt.quit_cmd() }
+		if v.code == .Rune && v.r == 'q' { return rt.quit_cmd() }
 	case Ready_Msg:
 		m.ready = true; m.value = v.value
-		return m, rt.quit_cmd()
+		return rt.quit_cmd()
 	}
-	return m, rt.cmd_nil()
+	return rt.cmd_nil()
 }
 
 view :: proc(m: Model, alloc: mem.Allocator) -> string {

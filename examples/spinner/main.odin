@@ -48,19 +48,20 @@ spin_tick_cmd :: proc() -> rt.Cmd {
 
 Model :: struct { frame: int }
 
-update :: proc(m: Model, msg: any, alloc: mem.Allocator) -> (Model, rt.Cmd) {
-	m := m
+// `m` is a POINTER: mutate it in place, return only the Cmd. See
+// rt.Program.update (runetea/tea.odin).
+update :: proc(m: ^Model, msg: any, alloc: mem.Allocator) -> rt.Cmd {
 	switch v in msg {
 	case rt.Key_Msg:
 		if v.code == .Rune && (v.r == 'q' || (v.r == 'c' && .Ctrl in v.mods)) {
-			return m, rt.quit_cmd()
+			return rt.quit_cmd()
 		}
-		if v.code == .Escape { return m, rt.quit_cmd() }
+		if v.code == .Escape { return rt.quit_cmd() }
 	case Spin_Tick_Msg:
 		m.frame = (m.frame + 1) % len(FRAMES)
-		return m, spin_tick_cmd() // reissue -- see spin_tick_cmd's own comment
+		return spin_tick_cmd() // reissue -- see spin_tick_cmd's own comment
 	}
-	return m, rt.cmd_nil()
+	return rt.cmd_nil()
 }
 
 view :: proc(m: Model, alloc: mem.Allocator) -> string {

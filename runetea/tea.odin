@@ -33,7 +33,70 @@ Run_Error :: union { Killed_Error, Interrupted_Error, Panicked_Error, Terminal_E
 // different type mid-run -- use a `state` enum, or make T itself a vtable.
 Program :: struct($T: typeid) {
 	model:    T,
-	update:   proc(model: T, msg: any, alloc: mem.Allocator) -> (T, Cmd),
+
+	// BY POINTER, NOT BY VALUE -- and this cost a real safety property. Read
+	// both halves before writing an update proc.
+	//
+	// WHY POINTER. The original signature was
+	//   proc(model: T, msg: any, alloc: mem.Allocator) -> (T, Cmd)
+	// called as `p.model, cmd = p.update(p.model, msg, alloc)` in apply().
+	// That one by-value round-trip made LLVM codegen SUPERLINEAR in
+	// sizeof(T), which put a hard ceiling on how large a model a RuneTea app
+	// could have. Measured via .superpowers/bigprobe -- a minimal Program
+	// whose model is a [N]int -- as wall-clock `odin build` of the whole
+	// probe, BEFORE against a git-HEAD checkout of the old signature and
+	// AFTER against this tree, same machine, same toolchain:
+	//
+	//     model size   by value                by pointer
+	//        2 KiB       1.01 s                  1.04 s
+	//        8 KiB       2.28 s                  1.18 s
+	//       16 KiB       8.97 s                  1.17 s
+	//       32 KiB     105.91 s                  1.07 s
+	//       64 KiB     did not finish in 200 s   1.12 s
+	//      256 KiB     (not attempted)           1.27 s
+	//        1 MiB     (not attempted)           1.20 s
+	//
+	// The ~1.1 s floor in the right-hand column is the fixed cost of compiling
+	// runetea itself and linking; the MARGINAL cost of model size is now
+	// indistinguishable from noise out to 1 MiB, where the left-hand column
+	// was already unusable at 32 KiB.
+	//
+	// Bisected to this exact call, not to anything around it: instantiating
+	// Program(T) + program_init with no run() compiled in 0.6 s at 32 KiB;
+	// bypassing guarded()/setjmp entirely moved 85 s to 86 s; deleting JUST
+	// the update call from apply() moved 85 s to 0.7 s. `odin check` stayed at
+	// 0.25 s throughout, so it is codegen, not the front end -- and it is not
+	// generic Odin behaviour either: a control program passing and returning
+	// the same struct by value in a hot loop compiles in 0.5 s flat at 64 KiB.
+	// The full record is in docs/superpowers/specs/2026-07-25-runetea-design.md
+	// ("DECISION REVERSED -- update takes ^T").
+	//
+	// WHAT IT COST: TIER-1 RECOVERY NO LONGER PROTECTS MODEL STATE.
+	// With the by-value signature, a panicking update left p.model completely
+	// untouched -- guarded()'s longjmp skipped the `p.model = ...` assignment
+	// in apply(), so the model still held the LAST GOOD state and recovery
+	// resumed from something consistent by construction. With a pointer,
+	// update mutates p.model directly, so a panic partway through leaves the
+	// model HALF-MUTATED: some fields updated, some not, invariants between
+	// them possibly broken. Tier 1 still guarantees the process survives, the
+	// terminal is restored, the frame arena is reclaimed and run() returns
+	// Panicked_Error -- it does NOT guarantee anything about the contents of
+	// p.model afterwards.
+	//
+	// AN APP CANNOT ROLL THIS BACK ITSELF. The obvious mitigation --
+	// snapshotting `old := m^` at the top of update and restoring it on
+	// failure -- does not work, because longjmp skips the APP's code too: it
+	// jumps straight out of update back into apply(), so no restore line, no
+	// `defer`, and no error path inside update ever executes. The only
+	// mitigation that actually holds is STRUCTURAL: do everything that can
+	// fail FIRST (compute into locals, index-check, assert), and only write
+	// into m^ once nothing further can panic. Then a panic leaves the model
+	// exactly as it was, because nothing had been written yet.
+	//
+	// See docs/superpowers/tier1-coverage-decision.md §5 and apply()'s own
+	// comment at the guarded() call.
+	update:   proc(model: ^T, msg: any, alloc: mem.Allocator) -> Cmd,
+
 	view:     proc(model: T, alloc: mem.Allocator) -> string,
 	init_cmd: Cmd,
 	quit:     bool,
@@ -57,7 +120,7 @@ Program :: struct($T: typeid) {
 program_init :: proc(
 	p: ^Program($T),
 	model: T,
-	update: proc(model: T, msg: any, alloc: mem.Allocator) -> (T, Cmd),
+	update: proc(model: ^T, msg: any, alloc: mem.Allocator) -> Cmd,
 	view: proc(model: T, alloc: mem.Allocator) -> string,
 	init_cmd := Cmd{},
 ) {
@@ -75,7 +138,14 @@ quit_cmd :: proc() -> Cmd {
 }
 
 // Shared state for the guarded Update call. longjmp discards the frame, so the
-// inputs and outputs live outside it.
+// inputs and the one output live outside it.
+//
+// `cmd` is the ONLY output now: update mutates p.model through the ^T it is
+// handed, so the model does not travel back through here the way it did under
+// the by-value signature (Program.update's comment). A field that no longer
+// exists is a field that cannot be silently skipped by longjmp -- which was
+// precisely the mechanism that used to preserve the model on a panic, and is
+// precisely what no longer happens.
 @(private="file")
 Step :: struct($T: typeid) {
 	p:     ^Program(T),
@@ -410,14 +480,40 @@ apply :: proc(p: ^Program($T), msg: any, fa: ^Frame_Arena, disp: ^Dispatcher, r:
 		renderer_set_width(r, ws.w)
 	}
 
+	// THE MODEL IS PASSED BY POINTER -- update mutates p.model IN PLACE.
+	//
+	// This used to be `s.p.model, s.cmd = s.p.update(s.p.model, ...)`, and
+	// that assignment was doing double duty: it was also the mechanism that
+	// made a recovered update panic leave the model in its last good state,
+	// because longjmp skipped the store. That property is GONE and nothing
+	// here replaces it -- see Program.update's own comment for the build-time
+	// measurements that bought the trade and why an app cannot roll the
+	// mutation back itself (longjmp skips the app's code too, so no snapshot-
+	// restore line inside update ever runs).
+	//
+	// So, precisely, on the recovery path below:
+	//   GUARANTEED -- the process survives, the frame arena is reclaimed
+	//     wholesale, the message is box_free'd by the defer above, the
+	//     terminal is restored by the caller's own defer, and run() returns
+	//     Panicked_Error carrying the panic text.
+	//   NOT GUARANTEED -- anything at all about the contents of p.model. It
+	//     may be fully updated, untouched, or half-written with cross-field
+	//     invariants broken. run() ends the session immediately on this path
+	//     (it does not loop back into update with the damaged model), so the
+	//     exposure is bounded to whatever the CALLER of run() does with
+	//     p.model after the Panicked_Error return -- which is why callers
+	//     should treat the model as suspect there rather than, say, persisting
+	//     it to disk.
 	step := Step(T){p = p, msg = msg, alloc = frame_allocator(fa)}
 	info := guarded(proc(ud: rawptr) {
 		s := cast(^Step(T))ud
-		s.p.model, s.cmd = s.p.update(s.p.model, s.msg, s.alloc)
+		s.cmd = s.p.update(&s.p.model, s.msg, s.alloc)
 	}, &step)
 
 	if info.recovered {
 		// longjmp ran no defers: reclaim the failed iteration wholesale.
+		// Memory only -- p.model's CONTENT is not restored and cannot be
+		// (see above).
 		frame_reset(fa)
 		return Panicked_Error{message = info.message}
 	}

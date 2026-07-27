@@ -446,16 +446,17 @@ phase_signals :: proc() {
 
 Race_Model :: struct { n: int }
 
-race_update :: proc(m: Race_Model, msg: any, alloc: mem.Allocator) -> (Race_Model, rt.Cmd) {
-	m := m
+// `m` is a POINTER: mutate in place, return only the Cmd. See
+// rt.Program.update (runetea/tea.odin).
+race_update :: proc(m: ^Race_Model, msg: any, alloc: mem.Allocator) -> rt.Cmd {
 	switch v in msg {
 	case rt.Key_Msg:
 		if v.code == .Rune && v.r == 'q' {
-			return m, rt.quit_cmd()
+			return rt.quit_cmd()
 		}
 		m.n += 1
 	}
-	return m, rt.cmd_nil()
+	return rt.cmd_nil()
 }
 
 race_view :: proc(m: Race_Model, alloc: mem.Allocator) -> string {

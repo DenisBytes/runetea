@@ -122,6 +122,74 @@ Program :: struct($T: typeid) {
 }
 ```
 
+**DECISION REVERSED 2026-07-27 — `update` takes `^T`.** The signature above is
+superseded by:
+
+```odin
+update: proc(model: ^T, msg: any, alloc: mem.Allocator) -> Cmd,
+```
+
+`view` is unchanged (still by value). The reversal is forced by a measured
+toolchain defect, not a preference.
+
+**What was measured.** `apply()` (`runetea/tea.odin`) called the by-value form
+as `p.model, cmd = p.update(p.model, msg, alloc)`. LLVM code generation for
+that single call is superlinear in `sizeof(T)`, which put a hard ceiling on
+model size. Measured twice, independently, on the dev machine via
+`.superpowers/bigprobe` — a minimal `Program` whose model is `[N]int`:
+
+Wall-clock `odin build` of the whole probe. "Before" is a git-HEAD checkout of
+the old signature; "after" is the same probe against the pointer form. Same
+machine, same toolchain, back to back.
+
+| model size | before (by value) | after (by pointer) |
+|---|---|---|
+| 2 KiB | 1.01 s | 1.04 s |
+| 8 KiB | 2.28 s | 1.18 s |
+| 16 KiB | 8.97 s | 1.17 s |
+| 32 KiB | 105.91 s | 1.07 s |
+| 64 KiB | **did not finish in 200 s** | 1.12 s |
+| 256 KiB | (not attempted) | 1.27 s |
+| 1 MiB | (not attempted) | 1.20 s |
+
+The ~1.1 s floor in the right-hand column is the fixed cost of compiling
+`runetea` itself and linking. The *marginal* cost of model size is now
+indistinguishable from noise out to 1 MiB — 16x past the size that previously
+would not compile at all.
+
+**Bisected, not guessed.** It is not the generic instantiation: `Program(Model)`
+plus `program_init` with no `run()` compiled in 0.6 s at 32 KiB. It is not
+`guarded()`/`setjmp`: bypassing the guard entirely moved 85 s to 86 s. Deleting
+*just* the `update` call from `apply()` moved 85 s to 0.7 s. `odin check`
+stayed at 0.25 s throughout, so it is codegen, not the front end — and it is
+not generic Odin behaviour either: a control program passing and returning the
+same struct by value in a hot loop compiles in 0.5 s flat at 64 KiB.
+
+**THE COST — a real crash-safety property, genuinely lost.** With the by-value
+form, a panicking `update` left `p.model` untouched: `guarded()`'s `longjmp`
+skipped `apply()`'s assignment, so Tier-1 recovery resumed from a consistent
+previous state *by construction*. With a pointer, `update` mutates `p.model`
+directly and a panic partway through leaves the model **half-mutated** — some
+fields written, some not, cross-field invariants possibly broken. Tier 1 still
+guarantees the process survives, the terminal is restored, the frame arena is
+reclaimed and `run()` returns `Panicked_Error`. It guarantees **nothing** about
+the contents of `p.model` afterwards.
+
+An application cannot restore the old value itself. `longjmp` skips the app's
+own code too — it jumps out of `update` straight back into `apply()`, so a
+`m^ = snapshot` restore line, a `defer`, and any error path inside `update`
+alike never execute. **The only mitigation that holds is structural:** do
+everything that can fail first (compute into locals, bounds-check, assert), and
+write into `m^` only once nothing further can panic.
+
+This was weighed against the ceiling and the pointer form chosen deliberately.
+No opt-in snapshot mechanism was added; that is deliberately out of scope here.
+
+Pinned by `runetea/tea_test.odin::test_a_recovered_update_panic_can_leave_the_model_half_mutated`,
+which asserts the half-mutated state exactly rather than permissively. Full
+treatment: `Program.update`'s own comment and `apply()`'s in `runetea/tea.odin`,
+and `docs/superpowers/tier1-coverage-decision.md` §5.
+
 **Why parapoly for the root model.** Go's `Update(Msg) (Model, Cmd)` returns the
 *interface*, permitting mid-run model swapping. Odin has no interfaces, and
 `[dynamic]Program` fails with *"Invalid use of a non-specialized polymorphic type"*. The

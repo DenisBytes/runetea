@@ -147,10 +147,22 @@ which flagged this gap without yet closing it. T1's last decision closed it
 for all three:
 
 **Tier 1** (`assertion_failure_proc` + `setjmp`/`longjmp`, `guard.odin`):
-- **`update`** — unchanged since T0. A `panic()`, a failed `assert()`, or a
-  bad type assertion becomes `Panicked_Error`; `run()` returns cleanly, not a
-  crash. `tea_test.odin::test_program_recovers_from_a_panicking_update`;
+- **`update`** — a `panic()`, a failed `assert()`, or a bad type assertion
+  becomes `Panicked_Error`; `run()` returns cleanly, not a crash.
+  `tea_test.odin::test_program_recovers_from_a_panicking_update`;
   `guard_test.odin` for `assert()`/bad-type-assertion recovery directly.
+  **NARROWED 2026-07-27:** this covers the PROCESS, not the MODEL.
+  `Program.update` now takes `^T` and mutates `p.model` in place (forced by a
+  measured LLVM codegen blowup that capped model size at single-digit
+  kilobytes — see `specs/2026-07-25-runetea-design.md` §5, "DECISION REVERSED
+  2026-07-27"). Under the old by-value signature `longjmp` skipped `apply()`'s
+  `p.model = ...` store and the model survived a panic intact; now a panic
+  partway through `update` leaves it half-mutated, and an app cannot roll that
+  back itself because `longjmp` skips the app's code too. Full account, and
+  the structural mitigation that does work, in
+  `tier1-coverage-decision.md` §5; pinned by
+  `tea_test.odin::test_a_recovered_update_panic_can_leave_the_model_half_mutated`
+  and, under a real pty, by `tools/tier1check update-panic`.
 - **`view`** — NOW GUARDED. Both call sites (`run()`'s/`run_nbio()`'s initial
   paint and `apply()`'s per-iteration render) share one guarded helper,
   `guarded_render` (tea.odin), so there is exactly one code path to reason

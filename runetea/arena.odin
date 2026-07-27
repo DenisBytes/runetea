@@ -11,6 +11,14 @@ import "core:mem/virtual"
 // recovered panic the loop calls frame_reset to reclaim everything the failed
 // iteration allocated.
 //
+// MEMORY ONLY -- frame_reset says nothing about MODEL state. Since update
+// takes ^T (tea.odin's Program.update), a panic partway through update leaves
+// p.model half-mutated, and no amount of arena reclaim undoes that. Do not
+// read "the failed iteration is reclaimed wholesale" as "the iteration had no
+// effect": it had no effect on the HEAP, and possibly a large one on the
+// model. See Program.update's own comment and
+// docs/superpowers/tier1-coverage-decision.md §5.
+//
 // LIFETIME CONTRACT: frame_reset runs once per iteration, on the main thread,
 // and unconditionally reclaims (memory_block_dealloc) everything allocated
 // from this arena since the last reset -- including on the crash-recovery
