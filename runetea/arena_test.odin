@@ -83,6 +83,11 @@ test_box_rejects_non_pod_type :: proc(t: ^testing.T) {
 		s := cast(^Step)ud
 		s.boxed = box(Not_Pod_String{reason = "leaks or dangles either way"}, context.allocator)
 	}, &step)
+	// Panic_Info.message is a clone the CALLER owns (guard.odin) -- the same
+	// contract cmd.odin:520 honors with its own defer. Ignoring it here is
+	// what made this test one of the four guard.odin leak lines the suite
+	// used to print.
+	defer delete(info.message, context.allocator)
 
 	testing.expect(t, info.recovered, "box() must panic on a non-POD Msg type, not silently box it")
 	testing.expect(t, step.boxed == nil, "the guarded body must not have completed box()")

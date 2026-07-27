@@ -180,17 +180,22 @@ compose :: proc(cmds: []Cmd, kind: Compose_Kind, alloc: mem.Allocator) -> Cmd {
 // ever reach it either -- this proc calls itself rather than duplicating
 // that recursion at every call site.
 //
-// A never-started Tick/Every child (c.timer != nil) is deliberately left
-// alone: correctly releasing it needs timer.odin's own file-private
-// timer_handle_release, and the resulting leak -- Timer_Handle's own few
-// dozen bytes plus its cloned fn env, and ONLY if the caller also never
-// calls timer_stop on the handle they got back from tick()/every() -- is
-// the EXACT bounded, already-accepted cost Timer_Handle's own doc comment
-// (timer.odin) signs off on for a plain discarded Tick/Every ("discarding it
-// instead is fine and leaks nothing MORE than the bytes of the handle
-// itself"). Composing that Cmd into a batch/sequence that then gets
-// abandoned before ever starting it does not make this worse -- see
-// docs/superpowers/batch-sequence-decision.md for the full accounting.
+// A never-started Tick/Every child (c.timer != nil) has its SUBSYSTEM
+// reference released here (timer_handle_release, widened to package-visible
+// in timer.odin for exactly this call). That is the same reference
+// timer_dispatch's own failure-to-start branch releases for a Tick/Every that
+// never gets armed, and this is structurally the identical case: the handle
+// was built but never handed to the timer thread, so no other path will ever
+// release it. For a plain tick() -- refs = 1, no handle handed out -- that
+// release IS the free, handle and cloned fn env both. For
+// tick_cancellable/every the caller still holds its own reference and still
+// owes exactly one timer_stop, unchanged.
+//
+// An earlier version of this proc skipped timer children entirely, on the
+// strength of a claim in Timer_Handle's own doc comment that discarding a
+// handle "leaks nothing MORE than the bytes of the handle itself". That claim
+// was wrong (see timer.odin, where it is now corrected), so the leak it
+// licensed here was real, not accepted.
 @(private = "file")
 compose_free_unrun :: proc(cmds: []Cmd) {
 	for c in cmds {
@@ -200,7 +205,10 @@ compose_free_unrun :: proc(cmds: []Cmd) {
 			free(c.compose, c.compose.alloc)
 			continue
 		}
-		if c.timer != nil { continue }
+		if c.timer != nil {
+			timer_handle_release(c.timer)
+			continue
+		}
 		if c.env != nil { free(c.env, c.allocator) }
 	}
 }

@@ -54,6 +54,7 @@ test_dispatch_delivers_results_to_mailbox :: proc(t: ^testing.T) {
 	seen := make(map[string]bool); defer delete(seen)
 	for _ in 0 ..< len(urls) {
 		msg, ok := mailbox_recv(&m)
+		defer box_free(msg, context.allocator) // per-iteration: Odin scopes defer to the loop BODY, not the whole proc
 		testing.expect(t, ok, "expected a result")
 		if r, is := msg.(Fetch_Result); is { u := r.url; seen[msg_text_string(&u)] = true }
 	}
@@ -97,6 +98,7 @@ test_dispatch_recovers_a_panicking_cmd_on_the_pool :: proc(t: ^testing.T) {
 	// crash this test binary outright, not hang it -- a timeout wrapper
 	// would add machinery this specific failure mode doesn't need.
 	msg, ok := mailbox_recv(&m)
+	defer box_free(msg, context.allocator)
 	testing.expect(t, ok, "expected a result even though the Cmd panicked -- the mailbox must not just silently have nothing")
 	pm, is := msg.(Panicked_Msg)
 	testing.expect(t, is, "a panicking pool Cmd must deliver a Panicked_Msg, not vanish")
@@ -123,6 +125,7 @@ test_dispatch_recovers_a_panicking_cmd_when_detached :: proc(t: ^testing.T) {
 	dispatch(&d, cmd_from(panicking_detached_cmd_run, struct{}{}, context.allocator, detached = true))
 
 	msg, ok := mailbox_recv(&m)
+	defer box_free(msg, context.allocator)
 	testing.expect(t, ok, "expected a result even though the detached Cmd panicked")
 	pm, is := msg.(Panicked_Msg)
 	testing.expect(t, is, "a panicking detached Cmd must deliver a Panicked_Msg, not vanish or take the process down")
@@ -161,6 +164,10 @@ test_dispatch_delivers_a_zero_sized_result_pool :: proc(t: ^testing.T) {
 	dispatch(&d, cmd_from(empty_run, struct{}{}, context.allocator))
 
 	msg, ok := mailbox_recv(&m)
+	// A zero-sized box has a nil data pointer and so frees nothing (box_free's
+	// own doc comment) -- kept anyway so every drain in this file follows the
+	// same rule, and so this test keeps working if Empty_Result ever grows a field.
+	defer box_free(msg, context.allocator)
 	testing.expect(t, ok, "expected the zero-sized result to reach the mailbox")
 	_, is := msg.(Empty_Result)
 	testing.expect(t, is, "zero-sized Msg types must not be silently dropped")
@@ -179,6 +186,10 @@ test_dispatch_delivers_a_zero_sized_result_detached :: proc(t: ^testing.T) {
 	dispatch(&d, cmd_from(empty_run, struct{}{}, context.allocator, detached = true))
 
 	msg, ok := mailbox_recv(&m)
+	// A zero-sized box has a nil data pointer and so frees nothing (box_free's
+	// own doc comment) -- kept anyway so every drain in this file follows the
+	// same rule, and so this test keeps working if Empty_Result ever grows a field.
+	defer box_free(msg, context.allocator)
 	testing.expect(t, ok, "expected the zero-sized result to reach the mailbox")
 	_, is := msg.(Empty_Result)
 	testing.expect(t, is, "zero-sized Msg types must not be silently dropped")
@@ -215,6 +226,7 @@ test_detached_cmds_exceed_pool_width_without_deadlock :: proc(t: ^testing.T) {
 	got := 0
 	for _ in 0 ..< COORDS {
 		msg, ok := mailbox_recv(&m)
+		defer box_free(msg, context.allocator)
 		if !ok { break }
 		if _, is := msg.(Fetch_Result); is { got += 1 }
 	}
@@ -267,6 +279,14 @@ test_dispatcher_destroy_waits_for_detached_cmds :: proc(t: ^testing.T) {
 
 	// Only safe to reach here, after dispatcher_destroy has proven no
 	// detached Cmd can still be touching the mailbox.
+	//
+	// The drain is NOT part of what this test asserts (deliberately not
+	// draining before the destroy is the whole point, see this test's own
+	// comment above) -- it is ownership cleanup. The slow Cmd's result is
+	// sitting in the mailbox boxed and unclaimed, and mailbox_destroy will
+	// not free it: it deletes its ring buffer without knowing which allocator
+	// any message inside came from. Nothing else ever will, so this test must.
+	try_recv_and_free(&m)
 	mailbox_destroy(&m)
 }
 

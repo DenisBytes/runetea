@@ -35,13 +35,12 @@ measure_tick :: proc(d: ^rt.Dispatcher, m: ^rt.Mailbox, dur: time.Duration, samp
 	errs := make([]f64, samples); defer delete(errs)
 	for i in 0 ..< samples {
 		start := time.tick_now()
-		cmd, h := rt.tick(dur, tick_sample_fn, dur, context.allocator)
+		cmd := rt.tick(dur, tick_sample_fn, dur, context.allocator)
 		rt.dispatch(d, cmd)
 		_, ok := rt.mailbox_recv(m)
 		if !ok { fmt.eprintln("mailbox closed early"); os.exit(1) }
 		elapsed := time.tick_diff(start, time.tick_now())
 		errs[i] = time.duration_milliseconds(elapsed - dur)
-		rt.timer_stop(h)
 	}
 
 	min_e, max_e, sum := errs[0], errs[0], 0.0

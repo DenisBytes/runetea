@@ -82,8 +82,7 @@ bs_measure :: proc(t: ^testing.T, kind: Compose_Kind, n: int, dur: time.Duration
 	start := time.tick_now()
 	dispatch(&d, c)
 	for _ in 0 ..< n {
-		_, ok := mailbox_recv(&m)
-		testing.expect(t, ok, "expected a child's result")
+		testing.expect(t, recv_and_free(&m), "expected a child's result")
 	}
 	return time.tick_diff(start, time.tick_now())
 }
@@ -147,6 +146,7 @@ test_batch_containing_a_nested_batch_delivers_all_leaves :: proc(t: ^testing.T) 
 	seen := make(map[int]bool); defer delete(seen)
 	for _ in 0 ..< 3 {
 		msg, ok := mailbox_recv(&m)
+		defer box_free(msg, context.allocator) // per-iteration: Odin scopes defer to the loop BODY
 		testing.expect(t, ok, "expected a leaf result from the batch-of-batch")
 		if r, is := msg.(Order_Result); is { seen[r.tag] = true }
 	}
@@ -182,6 +182,7 @@ test_sequence_waits_for_a_nested_batch_to_fully_finish_before_continuing :: proc
 	first_two := make(map[int]bool); defer delete(first_two)
 	for _ in 0 ..< 2 {
 		msg, ok := mailbox_recv(&m)
+		defer box_free(msg, context.allocator) // per-iteration: Odin scopes defer to the loop BODY
 		testing.expect(t, ok, "expected one of the nested batch's two children")
 		if r, is := msg.(Order_Result); is { first_two[r.tag] = true }
 	}
@@ -189,6 +190,7 @@ test_sequence_waits_for_a_nested_batch_to_fully_finish_before_continuing :: proc
 		"the nested batch's two children must BOTH arrive before the sequence's own next step -- sequence must treat a nested batch as one step that finishes only once all of it has")
 
 	msg, ok := mailbox_recv(&m)
+	defer box_free(msg, context.allocator)
 	testing.expect(t, ok, "expected the sequence's final step result")
 	r, is := msg.(Order_Result)
 	testing.expect(t, is && r.tag == 3, "expected the final step's Order_Result specifically, arriving strictly after the nested batch's own two")
@@ -225,7 +227,7 @@ test_cancelled_batch_skips_all_unstarted_children :: proc(t: ^testing.T) {
 	dispatch(&d, batch(cmds, context.allocator))
 
 	dispatcher_destroy(&d) // must return promptly -- the coordinator sees cancel_requested on its very first check and never dispatches anything
-	_, ok := mailbox_try_recv(&m)
+	ok := try_recv_and_free(&m)
 	testing.expect(t, !ok, "a batch dispatched after cancellation must not run any of its children")
 
 	mailbox_destroy(&m)
@@ -251,7 +253,7 @@ test_cancelled_sequence_skips_all_unstarted_steps :: proc(t: ^testing.T) {
 	dispatch(&d, sequence(cmds, context.allocator))
 
 	dispatcher_destroy(&d)
-	_, ok := mailbox_try_recv(&m)
+	ok := try_recv_and_free(&m)
 	testing.expect(t, !ok, "a sequence dispatched after cancellation must not run any of its steps")
 
 	mailbox_destroy(&m)
@@ -301,13 +303,14 @@ test_cancelled_sequence_lets_the_in_flight_step_finish_but_starts_no_more :: pro
 	sync.sema_post(&release)                    // let step 0 finish
 
 	msg, ok := mailbox_recv(&m)
+	defer box_free(msg, context.allocator)
 	testing.expect(t, ok, "expected step 0's own result -- an already-dispatched step must run to completion, cooperative cancellation only")
 	r, is := msg.(Order_Result)
 	testing.expect(t, is && r.tag == 100, "expected step 0's result specifically")
 
-	_, ok2 := mailbox_try_recv(&m)
+	ok2 := try_recv_and_free(&m)
 	time.sleep(100 * time.Millisecond)
-	_, ok3 := mailbox_try_recv(&m)
+	ok3 := try_recv_and_free(&m)
 	testing.expect(t, !ok2 && !ok3, "step 1 must never be dispatched once cancellation was noticed before it started")
 
 	dispatcher_destroy(&d)
@@ -342,8 +345,7 @@ test_batch_coordinators_exceed_pool_width_without_deadlock :: proc(t: ^testing.T
 
 	got := 0
 	for _ in 0 ..< COORDS * CHILDREN_PER_BATCH {
-		_, ok := mailbox_recv(&m)
-		if !ok { break }
+		if !recv_and_free(&m) { break }
 		got += 1
 	}
 	testing.expect_value(t, got, COORDS * CHILDREN_PER_BATCH)
@@ -406,9 +408,23 @@ test_a_non_detached_coordinator_would_deadlock_against_its_own_children_on_a_nar
 	for i in 0 ..< COORDS {
 		dispatch(&d, cmd_from(fake_coord_run, Fake_Coord_Env{d = &d, wg = &wgs[i], timed_out = &timed_out[i]}, context.allocator))
 	}
-	for _ in 0 ..< COORDS {
-		_, ok := mailbox_recv(&m)
-		testing.expect(t, ok, "expected a result from every fake coordinator, timed out or not")
+	// 2*COORDS, not COORDS: each coordinator delivers its OWN result AND its
+	// child delivers one too, so this branch puts 2*COORDS messages in the
+	// mailbox. Draining only half of them left the other half sitting there
+	// for branch 2 below to consume instead of branch 2's own -- which made
+	// branch 2's assertion vacuous (it could return before its coordinators
+	// had written timed_out2 at all, reading the zeroed default) AND raced
+	// this test's deferred dispatcher_destroy against a detached coordinator
+	// still about to dispatch its child, orphaning that child's Task_Env and
+	// Cmd env in the pool queue. That was the intermittent
+	// cmd_from()/dispatch_ex() leak pair this suite used to print in roughly
+	// one run in three.
+	//
+	// Draining all 2*COORDS is also what makes the timed_out reads below
+	// well-defined: a coordinator's result reaches the mailbox strictly after
+	// it has written timed_out.
+	for _ in 0 ..< 2 * COORDS {
+		testing.expect(t, recv_and_free(&m), "expected a result from every fake coordinator and every child, timed out or not")
 	}
 	any_timed_out := false
 	for v in timed_out { if v { any_timed_out = true } }
@@ -422,9 +438,8 @@ test_a_non_detached_coordinator_would_deadlock_against_its_own_children_on_a_nar
 	for i in 0 ..< COORDS {
 		dispatch(&d, cmd_from(fake_coord_run, Fake_Coord_Env{d = &d, wg = &wgs2[i], timed_out = &timed_out2[i]}, context.allocator, detached = true))
 	}
-	for _ in 0 ..< COORDS {
-		_, ok := mailbox_recv(&m)
-		testing.expect(t, ok, "expected a result from every detached fake coordinator")
+	for _ in 0 ..< 2 * COORDS { // 2*COORDS -- see branch 1's own comment above
+		testing.expect(t, recv_and_free(&m), "expected a result from every detached fake coordinator and every child")
 	}
 	for v in timed_out2 {
 		testing.expect(t, !v, "a DETACHED coordinator must never time out waiting for its own pool-dispatched child, even on a narrow pool -- this is the mechanism compose_dispatch relies on")

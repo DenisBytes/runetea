@@ -33,15 +33,17 @@ spin_tick_fn :: proc(env: rawptr, t: time.Tick) -> any {
 	return rt.box(Spin_Tick_Msg{t = t}, context.allocator)
 }
 
+// Plain rt.tick, not rt.tick_cancellable: this Tick is a one-shot,
+// always-reissued animation frame with nothing that ever needs to cancel it
+// early (quitting ends the whole Program, which tears the Dispatcher -- and
+// its timer thread -- down on its own). tick() therefore hands back no
+// Timer_Handle and the caller owes nothing: the frame's handle and fn env are
+// freed by the timer subsystem the instant it fires. That is what makes this
+// two-line proc, called ~12 times a second for the whole session, allocation-
+// neutral -- see timer.odin's own comment on tick() for what it looked like
+// when it wasn't.
 spin_tick_cmd :: proc() -> rt.Cmd {
-	cmd, _ := rt.tick(FRAME_INTERVAL, spin_tick_fn, struct{}{}, context.allocator)
-	// The returned Timer_Handle is discarded here: this Tick is a one-shot,
-	// always-reissued animation frame with nothing that ever needs to cancel
-	// it early (quitting ends the whole Program, which tears the Dispatcher
-	// -- and its timer thread -- down on its own). Discarding it costs
-	// nothing but the handle's own few bytes, reclaimed the instant it fires
-	// -- see Timer_Handle's own doc comment on this exact tradeoff.
-	return cmd
+	return rt.tick(FRAME_INTERVAL, spin_tick_fn, struct{}{}, context.allocator)
 }
 
 Model :: struct { frame: int }

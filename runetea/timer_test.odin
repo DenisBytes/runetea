@@ -23,18 +23,21 @@ test_tick_fires_once_after_duration :: proc(t: ^testing.T) {
 	defer dispatcher_destroy(&d)
 
 	start := time.tick_now()
-	cmd, h := tick(30 * time.Millisecond, tick_result_fn, struct{}{}, context.allocator)
+	cmd := tick(30 * time.Millisecond, tick_result_fn, struct{}{}, context.allocator)
 	testing.expect(t, !cmd_is_nil(cmd), "a Cmd from tick() must not report as nil -- apply()/run() gate dispatch() on this")
 	dispatch(&d, cmd)
 
 	msg, ok := mailbox_recv(&m)
+	defer box_free(msg, context.allocator)
 	testing.expect(t, ok, "expected the tick to fire")
 	elapsed := time.tick_diff(start, time.tick_now())
 	testing.expectf(t, elapsed >= 25 * time.Millisecond, "tick fired too early: %v", elapsed)
 	_, is := msg.(Tick_Result)
 	testing.expect(t, is, "expected a Tick_Result")
 
-	timer_stop(h) // released purely to avoid a leak report; the timer already fired and released its own side
+	// No timer_stop, and nothing to clean up: a plain tick() hands out no
+	// handle at all, so the fire above already released the subsystem's only
+	// reference and freed both the handle and the cloned fn env.
 }
 
 @(test)
@@ -56,6 +59,7 @@ test_every_fires_repeatedly_without_reissue :: proc(t: ^testing.T) {
 	// every().
 	for i in 0 ..< 3 {
 		msg, ok := mailbox_recv(&m)
+		defer box_free(msg, context.allocator) // per-iteration: Odin scopes defer to the loop BODY
 		testing.expect(t, ok, "expected a repeated fire")
 		_, is := msg.(Tick_Result)
 		testing.expect(t, is, "expected a Tick_Result")
@@ -74,14 +78,14 @@ test_timer_stop_cancels_a_pending_tick :: proc(t: ^testing.T) {
 	dispatcher_init(&d, &m, 2)
 	defer dispatcher_destroy(&d)
 
-	cmd, h := tick(20 * time.Millisecond, tick_result_fn, struct{}{}, context.allocator)
+	cmd, h := tick_cancellable(20 * time.Millisecond, tick_result_fn, struct{}{}, context.allocator)
 	dispatch(&d, cmd)
 	timer_stop(h) // cancel well before the 20ms fire
 
 	// Give the would-be fire time to have happened if cancellation didn't
 	// take -- then prove nothing arrived.
 	time.sleep(60 * time.Millisecond)
-	_, ok := mailbox_try_recv(&m)
+	ok := try_recv_and_free(&m)
 	testing.expect(t, !ok, "a cancelled Tick must not deliver its message")
 }
 
@@ -98,7 +102,7 @@ test_timer_stop_stops_a_repeating_every :: proc(t: ^testing.T) {
 	cmd, h := every(15 * time.Millisecond, tick_result_fn, struct{}{}, context.allocator)
 	dispatch(&d, cmd)
 
-	_, ok := mailbox_recv(&m)
+	ok := recv_and_free(&m)
 	testing.expect(t, ok, "expected at least one fire before stopping")
 
 	timer_stop(h)
@@ -109,13 +113,13 @@ test_timer_stop_stops_a_repeating_every :: proc(t: ^testing.T) {
 	// than the interval.
 	drain_deadline := time.tick_add(time.tick_now(), 50 * time.Millisecond)
 	for time.tick_diff(time.tick_now(), drain_deadline) > 0 {
-		mailbox_try_recv(&m)
+		try_recv_and_free(&m)
 	}
 
 	got_after_stop := false
 	settle_deadline := time.tick_add(time.tick_now(), 60 * time.Millisecond)
 	for time.tick_diff(time.tick_now(), settle_deadline) > 0 {
-		if _, ok := mailbox_try_recv(&m); ok { got_after_stop = true }
+		if try_recv_and_free(&m) { got_after_stop = true }
 	}
 	testing.expect(t, !got_after_stop, "no fire should arrive once the drain window has passed timer_stop")
 }
@@ -134,20 +138,28 @@ test_dispatcher_destroy_tears_down_a_pending_every :: proc(t: ^testing.T) {
 	d: Dispatcher
 	dispatcher_init(&d, &m, 2)
 
-	cmd, _ := every(5 * time.Millisecond, tick_result_fn, struct{}{}, context.allocator)
+	cmd, h := every(5 * time.Millisecond, tick_result_fn, struct{}{}, context.allocator)
 	dispatch(&d, cmd)
 
 	// Let it fire at least once so the timer thread is definitely up and
 	// the Every is definitely mid-repeat, then tear down immediately --
 	// deliberately NOT calling timer_stop first, and deliberately not
 	// draining the mailbox: the point is to destroy while it is still live.
-	_, ok := mailbox_recv(&m)
+	ok := recv_and_free(&m)
 	testing.expect(t, ok, "expected at least one fire before destroying")
 
 	start := time.tick_now()
 	dispatcher_destroy(&d)
 	elapsed := time.tick_diff(start, time.tick_now())
 	testing.expectf(t, elapsed < 2 * time.Second, "dispatcher_destroy should return promptly, not hang -- took %v", elapsed)
+
+	// AFTER the destroy, never before -- the whole point of this test is that
+	// the teardown happens with the Every still live. every()'s handle still
+	// has to be released though (every() is refs = 2 and timer_stop is the
+	// only thing that ever releases the caller's half), and doing it here
+	// rather than skipping it is what proves the destroy path leaves the
+	// handle in a state where a late timer_stop is still correct and safe.
+	timer_stop(h)
 
 	// Only safe now that dispatcher_destroy has proven the timer thread
 	// (and pool, and every detached Cmd) is joined -- same precondition
@@ -176,8 +188,7 @@ spin_update :: proc(m: Spin_Model, msg: any, alloc: mem.Allocator) -> (Spin_Mode
 	if v, is := msg.(Spin_Tick_Msg); is {
 		m.fires += 1
 		if m.fires >= m.quit_after { return m, quit_cmd() }
-		c, _ := tick(5 * time.Millisecond, spin_tick_fn, Spin_Env{n = v.n + 1}, context.allocator)
-		return m, c
+		return m, tick(5 * time.Millisecond, spin_tick_fn, Spin_Env{n = v.n + 1}, context.allocator)
 	}
 	return m, cmd_nil()
 }
@@ -207,12 +218,96 @@ test_tick_drives_a_program_through_run :: proc(t: ^testing.T) {
 	b := strings.builder_make(); defer strings.builder_destroy(&b)
 
 	p: Program(Spin_Model)
-	init_cmd, _ := tick(5 * time.Millisecond, spin_tick_fn, Spin_Env{n = 0}, context.allocator)
+	init_cmd := tick(5 * time.Millisecond, spin_tick_fn, Spin_Env{n = 0}, context.allocator)
 	program_init(&p, Spin_Model{quit_after = 4}, spin_update, spin_view, init_cmd)
 
 	err := run(&p, &src, &b)
 	testing.expect(t, err == nil, "run should exit cleanly")
 	testing.expect_value(t, p.model.fires, 4)
+}
+
+// Counts allocations still outstanding in `track` that timer.odin itself made
+// -- i.e. the two things timer_new allocates per Tick/Every: the cloned fn env
+// and the Timer_Handle. Filtering by file rather than asserting
+// len(allocation_map) == 0 is deliberate: the SAME tracking allocator also
+// legitimately holds dispatcher_reap's one documented, bounded ^Thread leak
+// (cmd.odin's own WHY self_cleanup = false comment), which this test is not
+// about and must not be made to fail on.
+@(private = "file")
+timer_leak_count :: proc(track: ^mem.Tracking_Allocator) -> int {
+	n := 0
+	for _, entry in track.allocation_map {
+		if strings.contains(entry.location.file_path, "timer.odin") { n += 1 }
+	}
+	return n
+}
+
+// Drives a Spin_Model program to `ticks` fires with EVERY allocation in the
+// whole session (run()'s own, the reader thread's, the timer thread's, and
+// every tick()'s) routed through a private Tracking_Allocator, and reports how
+// much timer.odin state survived the session.
+@(private = "file")
+tick_program_timer_leaks :: proc(t: ^testing.T, ticks: int) -> int {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+
+	{
+		// Scoped, not restored by hand: every thread run() spawns inherits
+		// this context (init_context = context, see cmd.odin/tea.odin), so
+		// the timer thread's own `free(h, context.allocator)` resolves to
+		// THIS allocator too -- which is the whole point. Leaving the block
+		// restores the outer context automatically.
+		context.allocator = mem.tracking_allocator(&track)
+
+		// Open pipe, not input_source_from_bytes("") -- see
+		// test_tick_drives_a_program_through_run's own comment.
+		fds: [2]posix.FD
+		testing.expect(t, posix.pipe(&fds) == .OK, "pipe should succeed")
+		read_fd, write_fd := fds[0], fds[1]
+		defer posix.close(write_fd)
+		defer posix.close(read_fd)
+
+		src, ok := input_source_from_fd(read_fd)
+		testing.expect(t, ok, "input_source_from_fd should succeed")
+		defer input_close(&src)
+
+		b := strings.builder_make(); defer strings.builder_destroy(&b)
+
+		p: Program(Spin_Model)
+		init_cmd := tick(2 * time.Millisecond, spin_tick_fn, Spin_Env{n = 0}, context.allocator)
+		program_init(&p, Spin_Model{quit_after = ticks}, spin_update, spin_view, init_cmd)
+
+		err := run(&p, &src, &b)
+		testing.expect(t, err == nil, "run should exit cleanly")
+		testing.expect_value(t, p.model.fires, ticks)
+	}
+
+	// run() deliberately does NOT block on teardown: dispatcher_reap hands
+	// dispatcher_destroy (which is what joins the timer thread) to a
+	// background reaper thread bounded by QUIT_GRACE = 100ms (tea.odin). Wait
+	// past that bound before reading the map, or this could sample it while
+	// the timer thread is still releasing handles and report a leak that
+	// isn't one.
+	time.sleep(250 * time.Millisecond)
+	return timer_leak_count(&track)
+}
+
+// REGRESSION GATE for the leak this whole subsystem shipped with: a Tick used
+// EXACTLY the way tick()'s own doc comment prescribes -- reissued from
+// update() on every fire, Go's documented pattern -- must accumulate nothing.
+//
+// Two tick counts, not one, and that is the load-bearing part: the leak this
+// gates was LINEAR in fire count (one Timer_Handle + one fn env per fire), so
+// a partial fix that leaks a constant amount -- only the first tick, only the
+// one still pending at quit -- would sail through a single-count assertion.
+// Asserting the same zero at 4 and at 12 leaves no constant to hide in.
+@(test)
+test_repeated_ticks_through_run_leak_no_timer_state :: proc(t: ^testing.T) {
+	leaked_4  := tick_program_timer_leaks(t, 4)
+	leaked_12 := tick_program_timer_leaks(t, 12)
+	testing.expectf(t, leaked_4  == 0, "4 ticks left %d timer.odin allocation(s) outstanding; expected 0", leaked_4)
+	testing.expectf(t, leaked_12 == 0, "12 ticks left %d timer.odin allocation(s) outstanding; expected 0", leaked_12)
 }
 
 // Same integration, but for Every -- a single dispatch drives every quit-
@@ -253,7 +348,8 @@ test_every_drives_a_program_through_run_without_reissue :: proc(t: ^testing.T) {
 	b := strings.builder_make(); defer strings.builder_destroy(&b)
 
 	p: Program(Every_Model)
-	init_cmd, _ := every(5 * time.Millisecond, every_tick_fn, struct{}{}, context.allocator)
+	init_cmd, h := every(5 * time.Millisecond, every_tick_fn, struct{}{}, context.allocator)
+	defer timer_stop(h) // every() is refs = 2; nothing but timer_stop ever releases the caller's half, quitting the Program included
 	program_init(&p, Every_Model{}, every_update, every_view, init_cmd)
 
 	err := run(&p, &src, &b)
@@ -273,14 +369,14 @@ test_timer_handle_refcount_survives_stop_and_natural_completion_in_any_order :: 
 
 	// Order 1: stop AFTER the natural fire has already released the
 	// subsystem's own reference.
-	cmd1, h1 := tick(5 * time.Millisecond, tick_result_fn, struct{}{}, context.allocator)
+	cmd1, h1 := tick_cancellable(5 * time.Millisecond, tick_result_fn, struct{}{}, context.allocator)
 	dispatch(&d, cmd1)
-	_, ok1 := mailbox_recv(&m)
+	ok1 := recv_and_free(&m)
 	testing.expect(t, ok1, "expected the tick to fire")
 	timer_stop(h1) // must not double-free or crash even though the subsystem already released
 
 	// Order 2: stop BEFORE the timer would have fired.
-	cmd2, h2 := tick(50 * time.Millisecond, tick_result_fn, struct{}{}, context.allocator)
+	cmd2, h2 := tick_cancellable(50 * time.Millisecond, tick_result_fn, struct{}{}, context.allocator)
 	dispatch(&d, cmd2)
 	timer_stop(h2)
 	time.sleep(70 * time.Millisecond) // let the subsystem's own release happen too, if cancellation didn't suppress the fire outright
@@ -303,15 +399,13 @@ test_two_dispatchers_each_get_their_own_timer_thread :: proc(t: ^testing.T) {
 	defer dispatcher_destroy(&d1)
 	defer dispatcher_destroy(&d2)
 
-	c1, h1 := tick(10 * time.Millisecond, tick_result_fn, struct{}{}, context.allocator)
-	c2, h2 := tick(10 * time.Millisecond, tick_result_fn, struct{}{}, context.allocator)
+	c1 := tick(10 * time.Millisecond, tick_result_fn, struct{}{}, context.allocator)
+	c2 := tick(10 * time.Millisecond, tick_result_fn, struct{}{}, context.allocator)
 	dispatch(&d1, c1)
 	dispatch(&d2, c2)
 
-	_, ok1 := mailbox_recv(&m1)
-	_, ok2 := mailbox_recv(&m2)
-	timer_stop(h1)
-	timer_stop(h2)
+	ok1 := recv_and_free(&m1)
+	ok2 := recv_and_free(&m2)
 	testing.expect(t, ok1, "d1's tick should fire on d1's own mailbox")
 	testing.expect(t, ok2, "d2's tick should fire on d2's own mailbox")
 }

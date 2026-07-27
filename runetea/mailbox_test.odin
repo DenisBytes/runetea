@@ -4,6 +4,35 @@ import "core:testing"
 import "core:thread"
 import "core:time"
 
+// Test-only mirrors of what apply() (tea.odin) does for every message the
+// RUNTIME delivers: receive it, then box_free it. A test that drains a Mailbox
+// directly -- bypassing run()/apply() entirely -- takes on that second half
+// itself, and nothing else will ever do it (mailbox_destroy cannot: it does
+// not know which allocator each boxed message came from). Every one of the 49
+// `arena.odin:box()` leak lines this suite used to print was a test that had
+// forgotten, and a suite that always reports leaks cannot report a NEW one.
+//
+// Use these where the test cares only THAT a message arrived. Where the value
+// itself is needed, call mailbox_recv/mailbox_try_recv directly and pair it
+// with an explicit `defer box_free(msg, context.allocator)` -- the value has
+// to be read before the free, which a helper cannot express.
+//
+// context.allocator is the right allocator here by construction: every
+// producer thread in this package inherits the dispatching thread's context
+// (init_context = context, see cmd.odin/timer.odin), so a Cmd or Timer_Fn
+// boxing with `context.allocator` boxed with THIS one.
+recv_and_free :: proc(m: ^Mailbox) -> bool {
+	msg, ok := mailbox_recv(m)
+	box_free(msg, context.allocator)
+	return ok
+}
+
+try_recv_and_free :: proc(m: ^Mailbox) -> bool {
+	msg, ok := mailbox_try_recv(m)
+	box_free(msg, context.allocator)
+	return ok
+}
+
 N_PROD :: 4
 PER    :: 250
 

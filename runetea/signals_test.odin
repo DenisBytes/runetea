@@ -50,6 +50,7 @@ test_sigwinch_becomes_a_window_size_msg :: proc(t: ^testing.T) {
 	testing.expect_value(t, posix.pthread_kill(sw.native, SIGWINCH), posix.Errno.NONE)
 
 	msg, ok := mailbox_recv(&m)
+	defer box_free(msg, context.allocator)
 	testing.expect(t, ok, "expected a message from the signal watcher")
 	_, is_size := msg.(Window_Size_Msg)
 	testing.expect(t, is_size, "SIGWINCH should produce a Window_Size_Msg")
@@ -68,6 +69,7 @@ test_sigint_becomes_an_interrupt_msg :: proc(t: ^testing.T) {
 	testing.expect_value(t, posix.pthread_kill(sw.native, .SIGINT), posix.Errno.NONE)
 
 	msg, ok := mailbox_recv(&m)
+	defer box_free(msg, context.allocator)
 	testing.expect(t, ok, "expected a message from the signal watcher")
 	_, is_int := msg.(Interrupt_Msg)
 	testing.expect(t, is_int, "SIGINT should produce an Interrupt_Msg")

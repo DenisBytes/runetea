@@ -28,10 +28,14 @@ import "core:time"
 //     cmd.odin's own deliver_result (retry on Full, discard on Closed) --
 //     the same policy every other producer in this codebase already uses.
 //   - Cancellation is a refcounted, cooperative flag (Timer_Handle),
-//     structurally identical to cmd.odin's own Grace_Signal: one reference
-//     for the caller (released by timer_stop), one for the timer subsystem
-//     (released when the timer is naturally done). Whichever side releases
-//     last frees it.
+//     structurally identical to cmd.odin's own Grace_Signal. The timer
+//     subsystem ALWAYS holds one reference (released when the timer is
+//     naturally done); a caller who asked for a stoppable timer
+//     (tick_cancellable/every) holds a second, released by timer_stop.
+//     Whichever side releases last frees it. Plain tick() hands out no
+//     handle and therefore has exactly ONE reference -- see tick's own
+//     comment for why that asymmetry is the fix to a real leak, not an
+//     inconsistency.
 
 // Named-proc-plus-explicit-env replacement for Go's `func(time.Time) Msg`
 // closure -- same treatment Cmd.procedure already got (cmd.odin), and
@@ -50,20 +54,38 @@ import "core:time"
 Timer_Fn :: #type proc(env: rawptr, t: time.Tick) -> any
 
 // Cooperative, best-effort cancellation handle for a pending Tick or a
-// repeating Every, returned alongside the Cmd from tick()/every(). Pass it to
-// timer_stop to cancel; discarding it instead is fine and leaks nothing MORE
-// than the bytes of the handle itself once both sides (caller + subsystem)
-// have released their own reference -- see docs/superpowers/
-// tick-every-decision.md §b for the full "why must this be stoppable"
-// argument and the exact leak/lifetime tradeoff being made here.
+// repeating Every, returned alongside the Cmd by tick_cancellable()/every().
+// Pass it to timer_stop to cancel.
+//
+// YOU MUST CALL timer_stop ON EVERY HANDLE YOU ARE GIVEN, exactly once, even
+// if the timer already fired or already stopped on its own (both are
+// explicitly safe -- see timer_stop). timer_stop is the ONLY thing that ever
+// releases the caller's reference, so discarding a handle instead does not
+// merely "leak the bytes of the handle": it pins refs at 1 forever, so the
+// handle AND its cloned fn env are never freed. An earlier version of this
+// comment claimed discarding was fine; it was wrong, and it was wrong in a
+// way that mattered -- plain tick() used to hand out a handle too, and its
+// own documented usage pattern (reissue a fresh tick() from update() on every
+// fire) has no natural moment to call timer_stop at all, so it leaked one
+// handle + one fn env PER FIRE, forever, linear in tick count. That is what
+// the tick()/tick_cancellable() split below exists to make structurally
+// impossible rather than merely documented.
 //
 // Refcounted exactly like cmd.odin's Grace_Signal, for the identical
-// signal-then-free reason documented there: `refs` starts at 2 (one for
-// whoever holds the returned handle, released by timer_stop; one for the
-// timer subsystem itself, released in timer_fire once the timer is
-// naturally done -- fired-and-not-repeating, cancelled, or the session's
-// Mailbox has closed). Whichever side's release call brings it to 0 is
-// provably the last touch, so that side frees it.
+// signal-then-free reason documented there. `refs` starts at:
+//
+//   2 -- tick_cancellable()/every(): one for whoever holds the returned
+//        handle, released by timer_stop; one for the timer subsystem itself,
+//        released in timer_fire once the timer is naturally done
+//        (fired-and-not-repeating, cancelled, or the session's Mailbox has
+//        closed).
+//   1 -- plain tick(): the subsystem's reference and nothing else, because
+//        no handle is handed out at all. It is NOT reachable by any caller,
+//        so nothing can release it early and nothing can forget to release
+//        it late.
+//
+// Whichever side's release call brings it to 0 is provably the last touch, so
+// that side frees it.
 //
 // Fields past `cancelled` are internal bookkeeping the timer subsystem needs
 // across repeats -- not part of the public contract, but Odin has no
@@ -71,7 +93,7 @@ Timer_Fn :: #type proc(env: rawptr, t: time.Tick) -> any
 // opaque and only call timer_stop on it.
 Timer_Handle :: struct {
 	cancelled: bool, // touched only via sync.atomic_load/store
-	refs:      int,  // touched only via sync.atomic_add/atomic_sub; starts at 2
+	refs:      int,  // touched only via sync.atomic_add/atomic_sub; starts at 2, or at 1 for a plain tick() -- see above
 
 	fn:        Timer_Fn,
 	fn_env:    rawptr,
@@ -81,6 +103,14 @@ Timer_Handle :: struct {
 
 	target: time.Tick,          // Every only: the intended next-fire instant, tracked independent of "now" so a slow fire doesn't accumulate drift -- see timer_rearm
 	loop:   ^nbio.Event_Loop,    // captured once at dispatch time; same-thread rearms use it directly
+
+	// Shutdown sweep bookkeeping -- see timer_service_sweep_armed. Touched
+	// ONLY on the timer thread (timer_arm_initial/timer_fire/timer_rearm and
+	// the sweep itself all run there), so no synchronization: `refs` remains
+	// the only field in this struct with cross-thread traffic.
+	ts:        ^Timer_Service,    // owning service, so timer_fire can find the armed list
+	op:        ^nbio.Operation,   // the outstanding nbio timeout, alive until its callback runs; nil when none is armed
+	armed_idx: int,               // index into ts.armed, or -1 when not armed (set to -1 by timer_new -- zeroing would falsely read as index 0)
 
 	mailbox:   ^Mailbox,
 	wake:      proc(rawptr),
@@ -93,8 +123,51 @@ Timer_Handle :: struct {
 // dispatched and runs for its entire duration, independent of the wall
 // clock. To repeat, return another tick() from update() upon receiving the
 // message -- exactly Go's own documented pattern.
-tick :: proc(d: time.Duration, fn: Timer_Fn, env: $E, alloc: mem.Allocator) -> (Cmd, ^Timer_Handle) {
-	return timer_new(d, fn, env, alloc, repeat = false)
+//
+// RETURNS NO HANDLE, and that is the whole point. The Tick is owned end-to-
+// end by the timer subsystem: its Timer_Handle and cloned fn env are freed
+// when it fires, when its Mailbox has closed, or when the subsystem fails to
+// start -- always, with no cooperation required from the caller. There is
+// nothing to remember to release and nothing to forget.
+//
+// WHY THIS IS NOT SYMMETRIC WITH every(), which does hand back a handle:
+// docs/superpowers/tick-every-decision.md §b argues that "a timer that
+// cannot be stopped is a leak with a nicer name", and that argument is
+// entirely about Every -- a repeating timer nobody can stop is a live
+// background operation for the rest of the session, doing real work forever.
+// It was extended to Tick by symmetry, and that is precisely where it broke:
+// a one-shot Tick has no natural moment for the caller to call timer_stop
+// (the timer already fired, nothing tells the caller it fired, and "stop"
+// after the fact is meaningless), so the reissue-from-update() pattern this
+// very comment prescribes leaked a handle plus an fn env on EVERY fire --
+// ~60 pairs per second for a 60fps spinner, for the life of the process. The
+// fix is the same one this codebase already applies elsewhere (box() enforces
+// POD rather than documenting it; batch() forces the detached path at every
+// depth rather than trusting callers): make the common path structurally
+// incapable of leaking instead of requiring caller discipline it cannot
+// reasonably supply.
+//
+// NO CAPABILITY IS LOST: tick_cancellable below still covers the genuine
+// "cancel a one-shot before it fires" case, at the cost of an explicit
+// timer_stop the caller has actually opted into.
+tick :: proc(d: time.Duration, fn: Timer_Fn, env: $E, alloc: mem.Allocator) -> Cmd {
+	c, _ := timer_new(d, fn, env, alloc, repeat = false, caller_ref = false)
+	return c
+}
+
+// tick(), but stoppable: identical firing semantics, plus a Timer_Handle the
+// caller can pass to timer_stop to cancel the fire before it happens. For the
+// case a plain tick() cannot express -- a timeout that some other event may
+// make irrelevant before it elapses.
+//
+// THE CALLER MUST CALL timer_stop ON THE RETURNED HANDLE EXACTLY ONCE, even
+// if the Tick has already fired (safe and explicitly supported, see
+// timer_stop). Unlike tick(), this holds a second reference specifically so
+// the caller's `h` stays valid after the subsystem is done with it, and
+// timer_stop is the only thing that ever releases it. Do not reach for this
+// as the default -- if you are not going to cancel, use tick().
+tick_cancellable :: proc(d: time.Duration, fn: Timer_Fn, env: $E, alloc: mem.Allocator) -> (Cmd, ^Timer_Handle) {
+	return timer_new(d, fn, env, alloc, repeat = false, caller_ref = true)
 }
 
 // every(d, fn, env, alloc) -> a Cmd that, once dispatched, fires repeatedly
@@ -117,12 +190,24 @@ tick :: proc(d: time.Duration, fn: Timer_Fn, env: $E, alloc: mem.Allocator) -> (
 // preserving this specific secondary property isn't obligatory). What it
 // DOES guarantee is drift-free repetition relative to its own start --
 // see timer_rearm's comment.
+//
+// KEEPS the mandatory handle (refs = 2) that tick() above deliberately
+// dropped, and that is not an oversight either -- it is the one case §b's
+// argument actually applies to. An Every nobody ever stops keeps firing into
+// the Mailbox for the whole session; that is a live background operation, not
+// a few dozen stranded bytes, so "you forgot to stop it" is a genuine caller
+// error worth forcing the caller to confront. THE CALLER MUST CALL timer_stop
+// ON THE RETURNED HANDLE EXACTLY ONCE.
 every :: proc(d: time.Duration, fn: Timer_Fn, env: $E, alloc: mem.Allocator) -> (Cmd, ^Timer_Handle) {
-	return timer_new(d, fn, env, alloc, repeat = true)
+	return timer_new(d, fn, env, alloc, repeat = true, caller_ref = true)
 }
 
+// caller_ref: does the caller get its own reference (and therefore its own
+// obligation to timer_stop)? true for tick_cancellable/every, false for plain
+// tick, whose handle never leaves this package. See Timer_Handle's own
+// comment on `refs`.
 @(private = "file")
-timer_new :: proc(d: time.Duration, fn: Timer_Fn, env: $E, alloc: mem.Allocator, repeat: bool) -> (Cmd, ^Timer_Handle) {
+timer_new :: proc(d: time.Duration, fn: Timer_Fn, env: $E, alloc: mem.Allocator, repeat: bool, caller_ref: bool) -> (Cmd, ^Timer_Handle) {
 	fnenv, ferr := new(E, alloc)
 	if ferr != nil { return cmd_nil(), nil }
 	fnenv^ = env
@@ -132,30 +217,44 @@ timer_new :: proc(d: time.Duration, fn: Timer_Fn, env: $E, alloc: mem.Allocator,
 		free(fnenv, alloc)
 		return cmd_nil(), nil
 	}
-	h.refs     = 2
-	h.fn       = fn
-	h.fn_env   = rawptr(fnenv)
-	h.fn_alloc = alloc
-	h.dur      = d
-	h.repeat   = repeat
+	h.refs      = 2 if caller_ref else 1
+	h.armed_idx = -1 // NOT 0 -- see the field's own comment
+	h.fn        = fn
+	h.fn_env    = rawptr(fnenv)
+	h.fn_alloc  = alloc
+	h.dur       = d
+	h.repeat    = repeat
 
 	return Cmd{timer = h}, h
 }
 
-// Cancels a pending Tick or a repeating Every. Best-effort and cooperative,
-// same class as Cancel_Token (cmd.odin): if the timer thread has already
-// begun firing this instant, the message may still be delivered -- there is
-// no way to un-send something already in flight. Safe to call at most once
-// per handle (releases the caller's own reference, see Timer_Handle's own
-// comment) and safe to call even after the timer already fired/stopped on
-// its own. Safe with h == nil (mirrors cancel_requested's own nil handling).
+// Cancels a pending Tick (from tick_cancellable) or a repeating Every.
+// Best-effort and cooperative, same class as Cancel_Token (cmd.odin): if the
+// timer thread has already begun firing this instant, the message may still
+// be delivered -- there is no way to un-send something already in flight.
+// Safe to call even after the timer already fired or stopped on its own.
+//
+// Call it EXACTLY once per handle, never twice and never zero times: this
+// releases the caller's own reference (see Timer_Handle's own comment), so a
+// second call decrements a reference that no longer exists -- against a
+// handle the first call may already have freed -- and no call at all strands
+// the handle and its fn env for the life of the process. There is no handle
+// to get this wrong with for a plain tick(); that is deliberate.
+//
+// Safe with h == nil (mirrors cancel_requested's own nil handling).
 timer_stop :: proc(h: ^Timer_Handle) {
 	if h == nil { return }
 	sync.atomic_store(&h.cancelled, true)
 	timer_handle_release(h)
 }
 
-@(private = "file")
+// Package-visible, not file-private, for exactly one caller outside this
+// file: batch.odin's compose_free_unrun, which has to release the Tick/Every
+// children of a batch()/sequence() that gets abandoned before it is ever
+// dispatched. That release is the subsystem's own reference (nothing was ever
+// registered, so no other path will ever release it) -- structurally the same
+// case as timer_dispatch's own failure-to-start branch below.
+@(private = "package")
 timer_handle_release :: proc(h: ^Timer_Handle) {
 	// atomic_sub returns the value BEFORE the subtraction (same convention
 	// as cmd.odin's Grace_Signal, verified against this exact toolchain
@@ -203,6 +302,14 @@ Timer_Service :: struct {
 	// thread itself).
 	pending_mu: sync.Mutex,
 	pending:    [dynamic]^Timer_Handle,
+
+	// Every handle whose nbio timeout is currently outstanding. NO MUTEX, and
+	// none is needed: arming, firing, rearming and the shutdown sweep all run
+	// on the timer thread and nowhere else -- see timer_service_sweep_armed
+	// for what this exists for and why a plain list is enough. (The one read
+	// from another thread is the delete in timer_service_stop, which happens
+	// strictly after thread.join.)
+	armed: [dynamic]^Timer_Handle,
 }
 
 // Returns the running loop, starting the thread on the first call. nil means
@@ -286,6 +393,66 @@ timer_thread_body :: proc(th: ^thread.Thread) {
 		timer_service_drain_pending(ts)
 		nbio.tick()
 	}
+
+	// LAST statement, deliberately: it must run BEFORE the `defer
+	// nbio.release_thread_event_loop()` registered above (defers are LIFO at
+	// return), because that call is exactly what destroys the loop these
+	// operations live in.
+	timer_service_sweep_armed(ts)
+}
+
+// Releases every handle whose nbio timeout is still outstanding at shutdown.
+// Runs on the timer thread, after its loop has stopped being ticked and
+// before nbio.release_thread_event_loop tears the loop down.
+//
+// THIS CLOSES A REAL LEAK, not a theoretical one, and the design doc
+// (docs/superpowers/tick-every-decision.md §b) previously argued it could not
+// be closed at all: core:nbio's own loop teardown silently discards pending
+// operations without invoking their callbacks, so a Tick/Every still armed
+// when the session quits never reached timer_fire and never released the
+// subsystem's reference. The doc concluded "there is no window to call
+// timer_handle_release for it". There is: nbio.remove(op) cancels an
+// outstanding operation, and nbio.timeout_poly has returned the ^Operation to
+// pass it all along. The claim was wrong, and the leak it excused was the
+// ordinary case, not an edge case -- an Every that is doing its job is armed
+// essentially all the time, so it was armed at quit essentially always.
+//
+// nbio.remove's own two hard requirements are both met here by construction:
+// it must run on the loop's own thread (this is that thread), and the target
+// must not have had its callback invoked yet (a handle is in ts.armed only
+// between arming and the timer_fire that removes it -- and nothing can be
+// mid-callback, since the loop is no longer being ticked).
+@(private = "file")
+timer_service_sweep_armed :: proc(ts: ^Timer_Service) {
+	for h in ts.armed {
+		nbio.remove(h.op)
+		h.op        = nil
+		h.armed_idx = -1
+		timer_handle_release(h)
+	}
+	clear(&ts.armed)
+}
+
+// ts.armed membership. Both run on the timer thread only -- see
+// Timer_Service.armed's own comment. Removal is swap-with-last plus a stored
+// index rather than a linear scan: a loaded session (tools/racecheck's timer
+// phase dispatches thousands of concurrent Ticks) would otherwise make every
+// single fire O(len(armed)).
+@(private = "file")
+timer_armed_add :: proc(ts: ^Timer_Service, h: ^Timer_Handle) {
+	h.armed_idx = len(ts.armed)
+	append(&ts.armed, h)
+}
+
+@(private = "file")
+timer_armed_remove :: proc(ts: ^Timer_Service, h: ^Timer_Handle) {
+	idx := h.armed_idx
+	if idx < 0 { return }
+	last := len(ts.armed) - 1
+	ts.armed[idx] = ts.armed[last]        // self-assignment when idx == last, which is correct and needs no special case
+	ts.armed[idx].armed_idx = idx
+	pop(&ts.armed)
+	h.armed_idx = -1
 }
 
 // Arms every handle appended to ts.pending since the last drain. Runs on the
@@ -304,17 +471,25 @@ timer_service_drain_pending :: proc(ts: ^Timer_Service) {
 	if handles == nil { return }
 	defer delete(handles)
 
-	for h in handles { timer_arm_initial(h) }
+	for h in handles { timer_arm_initial(ts, h) }
 }
 
 @(private = "file")
-timer_arm_initial :: proc(h: ^Timer_Handle) {
+timer_arm_initial :: proc(ts: ^Timer_Service, h: ^Timer_Handle) {
 	if sync.atomic_load(&h.cancelled) {
 		timer_handle_release(h)
 		return
 	}
+	h.ts     = ts
 	h.target = time.tick_add(time.tick_now(), h.dur)
-	nbio.timeout_poly(h.dur, h, timer_fire, l = h.loop)
+	timer_armed_add(ts, h)
+	// Storing the returned ^Operation AFTER the call that arms it is safe
+	// only because an nbio timeout never completes synchronously: core:nbio's
+	// timeout_exec (impl_linux.odin) either enqueues an io_uring SQE or, for
+	// duration <= 0, pushes onto l.completed -- both of which are reaped by a
+	// LATER nbio.tick(), never by exec itself. If that ever stopped holding,
+	// timer_fire could run (and free h) before this assignment landed.
+	h.op = nbio.timeout_poly(h.dur, h, timer_fire, l = h.loop)
 }
 
 // Called from dispatcher_destroy (cmd.odin), LAST -- after the pool and
@@ -349,12 +524,26 @@ timer_service_stop :: proc(ts: ^Timer_Service) {
 	thread.join(th)
 	thread.destroy(th)
 
-	// Defensive, not load-bearing: by this point no producer can still be
-	// appending to ts.pending (see this proc's own doc comment on why), so
-	// the timer thread's own last drain (timer_service_drain_pending, inside
-	// its loop) should already have emptied it. delete on a nil dynamic
-	// array is a no-op either way.
+	// Anything still in ts.pending here was registered but never armed: the
+	// timer thread's loop checks stop_requested BEFORE its drain, so a handle
+	// appended in the last instant before this call can legitimately lose
+	// that race and never reach timer_arm_initial. Nothing else will ever
+	// release those, so release them here -- the thread is joined, so this is
+	// single-threaded and cannot race the drain. Not merely tidy: with plain
+	// tick()'s single reference, this release is what actually frees the
+	// handle and its fn env, and skipping it would put back a slice of the
+	// very per-Tick leak this design removes.
+	//
+	// delete on a nil dynamic array is a no-op, so the common case (the
+	// thread's own last drain already emptied it) costs nothing.
+	for h in ts.pending { timer_handle_release(h) }
 	delete(ts.pending)
+
+	// The handles themselves were already released by the timer thread's own
+	// timer_service_sweep_armed; only the backing array is left to reclaim,
+	// and only from here, after the join that proves nobody is still touching
+	// it.
+	delete(ts.armed)
 }
 
 // Handles a Cmd produced by tick()/every() -- called from dispatch()
@@ -424,6 +613,13 @@ timer_dispatch :: proc(d: ^Dispatcher, h: ^Timer_Handle) {
 // the right default here too).
 @(private = "file")
 timer_fire :: proc(op: ^nbio.Operation, h: ^Timer_Handle) {
+	// This callback IS the end of `op`'s life (nbio.remove after a callback
+	// has run is a documented use-after-free), so drop out of the shutdown
+	// sweep list first thing, before any path below can return or free h.
+	// timer_rearm re-adds if this is a repeating Every that continues.
+	timer_armed_remove(h.ts, h)
+	h.op = nil
+
 	if sync.atomic_load(&h.cancelled) {
 		timer_handle_release(h)
 		return
@@ -497,6 +693,12 @@ timer_rearm :: proc(h: ^Timer_Handle) {
 	}
 	h.target = next
 
+	// Back into the shutdown sweep list (timer_fire dropped this handle out
+	// of it on entry): from here until the NEXT timer_fire there is once
+	// again an outstanding operation that nbio's own loop teardown would
+	// otherwise discard without ever releasing the handle.
+	timer_armed_add(h.ts, h)
+
 	// timeout_poly here too, for the same reason as timer_dispatch's own
 	// comment, even though THIS call happens to be same-thread (timer_fire
 	// and timer_rearm both run on the timer thread) and so wasn't the one
@@ -504,5 +706,5 @@ timer_rearm :: proc(h: ^Timer_Handle) {
 	// throughout this file, rather than a same-thread-only shortcut here and
 	// a cross-thread-safe path in timer_dispatch, is not worth the risk of
 	// the two silently diverging later.
-	nbio.timeout_poly(time.tick_diff(now, next), h, timer_fire, l = h.loop)
+	h.op = nbio.timeout_poly(time.tick_diff(now, next), h, timer_fire, l = h.loop)
 }

@@ -19,7 +19,7 @@ loop (`tea.odin`'s `run()`) completely untouched.
 
 | File | What |
 |---|---|
-| `runetea/timer.odin` (new) | `tick`, `every`, `timer_stop`, `Timer_Fn`, `Timer_Handle`, `Timer_Service` — the dedicated timer thread and its wire-up |
+| `runetea/timer.odin` (new) | `tick`, `tick_cancellable`, `every`, `timer_stop`, `Timer_Fn`, `Timer_Handle`, `Timer_Service` — the dedicated timer thread and its wire-up (`tick_cancellable` added 2026-07-27, see §3's corrections) |
 | `runetea/cmd.odin` (+~20 lines) | `Cmd.timer: ^Timer_Handle` field; `dispatch()` special-cases it; `Dispatcher.timers: Timer_Service` field; `dispatcher_destroy` stops it last; `cmd_is_nil` fixed to check `.timer` too (see §5); `deliver_result` widened to package-visible for reuse |
 | `runetea/timer_test.odin` (new) | 9 tests: firing, repetition, cancellation (both orders), teardown-while-pending, two independent Dispatchers, and two full `Program`/`run()` integration tests |
 | `tools/racecheck/main.odin` (+~140 lines) | Phase G: concurrent multi-thread dispatch, cancellation racing fires, 40 create/destroy rounds each tearing down while repeating `Every`s are still mid-fire |
@@ -91,31 +91,95 @@ to say so, and Go's Bubble Tea has no answer to this at all (see §4's own
 discussion of what Go's `Tick`/`Every` actually are) — this is a genuine
 capability RuneTea's port adds, not a gap it merely papers over.
 
-`tick`/`every` both return `(Cmd, ^Timer_Handle)`. `timer_stop(h)` sets a
-cooperative `cancelled` flag — best-effort, same class as `Cancel_Token`
-(`cmd.odin`): if the timer thread has already begun firing at the instant
-`timer_stop` runs, the message may still be delivered; there is no way to
-un-send something already in flight.
+`timer_stop(h)` sets a cooperative `cancelled` flag — best-effort, same
+class as `Cancel_Token` (`cmd.odin`): if the timer thread has already begun
+firing at the instant `timer_stop` runs, the message may still be
+delivered; there is no way to un-send something already in flight.
 
 `Timer_Handle` is refcounted exactly like `cmd.odin`'s own `Grace_Signal`,
-for the identical reason: `refs` starts at 2 (one for the caller, released
-by `timer_stop`; one for the timer subsystem itself, released once the
-timer is naturally done — fired-and-not-repeating, cancelled, or the
-Mailbox has closed). Whichever side's release brings it to 0 frees it. This
-is not incidental reuse of a pattern for its own sake — it is the same
-signal-then-free hazard `Grace_Signal`'s own comment documents (a woken
-waiter can still be touching shared memory after the signaling call has
-already returned), applied to a second, structurally identical problem.
+for the identical reason — the same signal-then-free hazard
+`Grace_Signal`'s own comment documents (a woken waiter can still be
+touching shared memory after the signaling call has already returned),
+applied to a second, structurally identical problem. Whichever side's
+release brings `refs` to 0 frees it.
 
-**Honest limit:** a `Tick`/`Every` still pending at the *exact* moment the
-whole session quits has its `Timer_Handle` leaked — `core:nbio`'s own
+### CORRECTION (2026-07-27): the API this section originally described was
+### `tick`/`every` **both** returning `(Cmd, ^Timer_Handle)` with `refs`
+### starting at 2. That was wrong for `Tick`, and wrong in a way that leaked.
+
+The argument above — "a timer that cannot be stopped is a leak with a nicer
+name" — is entirely about **`Every`**. A repeating timer nobody can stop is
+a live background operation for the rest of the session, doing real work
+forever. Extending it to `Tick` by symmetry is where it broke:
+
+- `refs` starting at 2 means the *caller's* reference is released by
+  `timer_stop` and by nothing else.
+- A one-shot `Tick` has no natural moment to call `timer_stop`. It already
+  fired; nothing tells the caller it fired; "stop" after the fact is
+  meaningless.
+- So the pattern `tick`'s own doc comment prescribes — reissue a fresh
+  `tick()` from `update()` on every fire, Go's documented pattern — went
+  `2 → 1` and stopped, **per fire**. One `Timer_Handle` plus one cloned
+  `fn_env`, leaked every single time, linear in tick count. A 60fps spinner
+  leaked ~60 pairs per second for the life of the process. Measured
+  directly: `test_tick_drives_a_program_through_run` at `quit_after = 4`
+  leaked 4+4 allocations; at 12, 12+12.
+
+`Timer_Handle`'s doc comment also asserted that discarding a handle "leaks
+nothing MORE than the bytes of the handle itself once both sides have
+released their own reference" — self-contradictory, since discarding is
+precisely what skips the caller-side release that sentence depends on. That
+claim had propagated: `batch.odin`'s `compose_free_unrun` cited it as
+license to skip never-started `Tick`/`Every` children entirely.
+
+**The API is now:**
+
+| | returns | `refs` | caller obligation |
+|---|---|---|---|
+| `tick(d, fn, env, alloc)` | `Cmd` | 1 | **none** |
+| `tick_cancellable(d, fn, env, alloc)` | `(Cmd, ^Timer_Handle)` | 2 | exactly one `timer_stop` |
+| `every(d, fn, env, alloc)` | `(Cmd, ^Timer_Handle)` | 2 | exactly one `timer_stop` |
+
+Plain `tick` hands out no handle at all, so its single reference is not
+reachable by any caller: nothing can release it early, and nothing can
+forget to release it late. This is the same move this codebase already
+makes elsewhere — `box()` *enforces* POD rather than documenting it,
+`batch()` *forces* the detached path at every depth rather than trusting
+callers — rather than documenting a discipline callers cannot reasonably
+supply. No capability is lost: `tick_cancellable` still covers "cancel a
+one-shot before it fires", at the cost of an explicit `timer_stop` the
+caller has actively opted into.
+
+`every` keeps `refs = 2`, unchanged, and that is correct: an unstopped
+`Every` really is a caller error, for exactly the reason this section
+argues at the top.
+
+### CORRECTION (2026-07-27): the "honest limit" below was also wrong.
+
+The original text read: *"a `Tick`/`Every` still pending at the exact moment
+the whole session quits has its `Timer_Handle` leaked — `core:nbio`'s own
 `_destroy` silently discards any still-pending operation on loop teardown
 (no callback, no removal hook exposed for a bulk sweep), so there is no
-window to call `timer_handle_release` for it. This is bounded (at most one
-leaked handle per still-pending timer at quit time, a few dozen bytes each)
-and does not grow with session length — an acceptable, deliberate tradeoff,
-not a leak that matters in practice, but a real one, not something this
-design silently gets right.
+window to call `timer_handle_release` for it."*
+
+Two things were wrong with it.
+
+1. **It understated the scope.** Normal, non-pending, successfully-fired
+   `Tick`s leaked too — see the correction above. The pending-at-quit case
+   was not the limit; it was a footnote on a much larger leak.
+2. **There is a window.** `core:nbio` exposes `remove(target: ^Operation)`,
+   which cancels an outstanding operation, and `timeout_poly` has returned
+   the `^Operation` all along. `Timer_Service` now keeps an `armed` list
+   (timer-thread-only, no mutex needed) and the timer thread sweeps it —
+   `nbio.remove` then `timer_handle_release` — as its last act before
+   `nbio.release_thread_event_loop()`. `nbio.remove`'s two requirements
+   (same thread as the loop; callback not yet invoked) are both satisfied
+   by construction there. `timer_service_stop` separately releases anything
+   still sitting in `ts.pending`, which is the other never-armed case: the
+   timer thread checks `stop_requested` *before* its drain, so a handle
+   appended in the last instant can legitimately lose that race.
+
+Net: there is no longer a pending-at-quit `Timer_Handle` leak of any kind.
 
 ---
 
@@ -391,9 +455,11 @@ every run, under ThreadSanitizer — clean across all 13 runs in §9.2.
 
 ## 10. Honest limits, stated directly
 
-- A `Tick`/`Every` still pending at the exact instant the session quits
-  leaks its `Timer_Handle` (§3) — bounded, one-time, does not grow with
-  session length, not a correctness issue.
+- ~~A `Tick`/`Every` still pending at the exact instant the session quits
+  leaks its `Timer_Handle`.~~ **Fixed 2026-07-27** — see §3's second
+  correction. `nbio.remove` gives the timer thread a window to release
+  still-armed handles at shutdown, which the original write-up wrongly
+  concluded did not exist.
 - `every` does not align to wall-clock multiples of its interval the way
   Go's does (§5) — two independent `Every`s will not necessarily tick in
   lockstep with each other, only internally drift-free relative to their

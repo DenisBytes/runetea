@@ -746,13 +746,24 @@ timer_dispatch_driver_run :: proc(data: rawptr) {
 	dr := cast(^Timer_Dispatch_Driver)data
 	for i in 0 ..< dr.count {
 		n := dr.id*1_000_000 + i
-		cmd, h := rt.tick(time.Duration(1 + i%5) * time.Millisecond, timer_fire_fn, n, context.allocator)
-		rt.dispatch(dr.d, cmd)
+		dur := time.Duration(1 + i%5) * time.Millisecond
 		if i % 3 == 0 {
-			// Race cancellation against the fire itself from a DIFFERENT
-			// thread than the timer thread that will (or won't) deliver it
-			// -- some win, some lose, both must be safe either way.
+			// tick_cancellable, so cancellation can race the fire itself from
+			// a DIFFERENT thread than the timer thread that will (or won't)
+			// deliver it -- some win, some lose, both must be safe either
+			// way. refs = 2 here, so the free happens on whichever of the two
+			// releases lands second.
+			cmd, h := rt.tick_cancellable(dur, timer_fire_fn, n, context.allocator)
+			rt.dispatch(dr.d, cmd)
 			rt.timer_stop(h)
+		} else {
+			// Plain tick: refs = 1, subsystem-owned, freed by the timer
+			// thread alone. Deliberately exercised alongside the cancellable
+			// path in the SAME loop -- the single-reference free is the path
+			// with no second holder to serialize against, so it is the one
+			// that most needs a race gate.
+			cmd := rt.tick(dur, timer_fire_fn, n, context.allocator)
+			rt.dispatch(dr.d, cmd)
 		}
 	}
 }

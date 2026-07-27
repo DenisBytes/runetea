@@ -12,8 +12,18 @@ Quit_Msg :: struct {}
 
 Killed_Error      :: struct {}
 Interrupted_Error :: struct {}
+
+// THE CALLER OWNS `message` AND MUST delete() IT (with the same
+// context.allocator run() was called under). It is guarded()'s own cloned
+// panic string (guard.odin: the clone is mandatory, the original lives in a
+// frame longjmp discards), handed onward rather than freed, precisely so the
+// panic text outlives run(). That is the ONE allocation any Run_Error carries
+// -- everything else in this union is plain data or a static string. Note the
+// contrast with cmd.odin:520, which is the same Panic_Info consumed INSIDE
+// the runtime and therefore does its own `defer delete(info.message, ...)`.
 Panicked_Error    :: struct { message: string }
-Terminal_Error    :: struct { detail: string }
+
+Terminal_Error    :: struct { detail: string } // `detail` is a static string literal; nothing to free
 
 Run_Error :: union { Killed_Error, Interrupted_Error, Panicked_Error, Terminal_Error }
 

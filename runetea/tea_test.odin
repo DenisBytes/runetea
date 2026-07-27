@@ -58,7 +58,8 @@ test_program_recovers_from_a_panicking_update :: proc(t: ^testing.T) {
 	program_init(&p, Boom{}, boom_update, boom_view)
 
 	err := run(&p, &src, &b)
-	_, panicked := err.(Panicked_Error)
+	pe, panicked := err.(Panicked_Error)
+	defer delete(pe.message, context.allocator) // the caller owns it -- see Panicked_Error's own doc comment (tea.odin)
 	testing.expect(t, panicked, "a panicking Update must surface as Panicked_Error, not a crash")
 }
 
@@ -91,7 +92,8 @@ test_program_recovers_from_a_panicking_view :: proc(t: ^testing.T) {
 	program_init(&p, View_Boom{}, view_boom_update, view_boom_view)
 
 	err := run(&p, &src, &b)
-	_, panicked := err.(Panicked_Error)
+	pe, panicked := err.(Panicked_Error)
+	defer delete(pe.message, context.allocator) // the caller owns it -- see Panicked_Error's own doc comment (tea.odin)
 	testing.expect(t, panicked, "a panicking View must surface as Panicked_Error, not a crash")
 
 	// Constraint d's decision, pinned: the loop does not go blank or freeze
@@ -139,7 +141,8 @@ test_program_recovers_from_a_panicking_initial_view :: proc(t: ^testing.T) {
 	program_init(&p, Init_View_Boom{}, init_view_boom_update, init_view_boom_view)
 
 	err := run(&p, &src, &b)
-	_, panicked := err.(Panicked_Error)
+	pe, panicked := err.(Panicked_Error)
+	defer delete(pe.message, context.allocator) // the caller owns it -- see Panicked_Error's own doc comment (tea.odin)
 	testing.expect(t, panicked, "a panicking initial View must surface as Panicked_Error, not a crash, and must not hang waiting for input that never comes")
 
 	out := strings.to_string(b)
