@@ -75,7 +75,12 @@ test_decode_double_escape :: proc(t: ^testing.T) {
 // The sequences chosen here are deliberately ones that are OUT of T1-H's
 // scope rather than merely unimplemented: bracketed paste start/end, a Kitty
 // keyboard flags report, an SGR mouse report, and F13 (CSI 25~, beyond the
-// F1-F12 vocabulary Key_Code carries). This test used to use "\e[5~", which
+// F1-F12 vocabulary Key_Code carries). The flags report is a KEY-level
+// assertion and stays true after T1-K taught the decoder to read it: it is
+// never a Key_Msg, and with `enh` omitted (as here, and as every caller
+// outside the two event-loop hosts does) it is still consumed whole and
+// dropped -- see test_kitty_flags_reply_becomes_an_enhancements_msg for the
+// other half. This test used to use "\e[5~", which
 // was a fine example of "unsupported" when the decoder had no tilde table at
 // all; PageUp is decoded now, so keeping it would have made the test assert
 // the opposite of the feature.
@@ -242,6 +247,30 @@ key_cases := [?]Key_Case{
 	{"\eO5A", {{code = .Up, mods = {.Ctrl}}, {}}, 1},
 	{"\eO2P", {{code = .F1, mods = {.Shift}}, {}}, 1},
 
+	// -- T1-K: Kitty's event-type sub-parameter on the LEGACY encodings --
+	//
+	// With Report_Event_Types enabled a terminal does NOT move modified arrow
+	// and tilde keys to CSI-u; it keeps the legacy form and hangs the event
+	// type off the modifier field. Every one of these was a cleanly-ignored
+	// sequence before T1-K (csi_params rejects ':' and still does -- these go
+	// through csi_event_type's separate stripping pass instead), so the whole
+	// block is the non-vacuity lever for that pass: drop it and every row here
+	// reports 0 keys instead of 1.
+	{"\e[1;5:1A", {{kind = .Press,   code = .Up,    mods = {.Ctrl}}, {}}, 1},
+	{"\e[1;5:2A", {{kind = .Repeat,  code = .Up,    mods = {.Ctrl}}, {}}, 1},
+	{"\e[1;5:3A", {{kind = .Release, code = .Up,    mods = {.Ctrl}}, {}}, 1},
+	{"\e[1;2:3D", {{kind = .Release, code = .Left,  mods = {.Shift}}, {}}, 1},
+	{"\e[1;1:2B", {{kind = .Repeat,  code = .Down}, {}}, 1},
+	{"\e[3;5:3~", {{kind = .Release, code = .Delete, mods = {.Ctrl}}, {}}, 1},
+	{"\e[5;1:2~", {{kind = .Repeat,  code = .Page_Up}, {}}, 1},
+	{"\e[15;2:3~",{{kind = .Release, code = .F5,    mods = {.Shift}}, {}}, 1},
+	{"\e[1;5:3P", {{kind = .Release, code = .F1,    mods = {.Ctrl}}, {}}, 1},
+	// An event type this decoder has no name for is still a real keypress --
+	// the SAME answer kitty_decode gives for "\e[97;1:9u", by construction.
+	{"\e[1;5:9A", {{kind = .Press,   code = .Up,    mods = {.Ctrl}}, {}}, 1},
+	// Present-but-empty sub-parameter: press, again matching "\e[97;1:u".
+	{"\e[1;5:A",  {{kind = .Press,   code = .Up,    mods = {.Ctrl}}, {}}, 1},
+
 	// -- T1-J: Kitty keyboard protocol, CSI <code> [;<mods>[:<ev>]] u ---
 	//
 	// These live in THIS table on purpose: it is what subjects them to
@@ -391,11 +420,12 @@ test_split_at_every_byte_boundary :: proc(t: ^testing.T) {
 			}
 		}
 	}
-	// Floor raised from 100 to 500 when T1-J added the Kitty block (531 split
-	// points at the time of writing, up from 186). The floor exists so deleting
-	// a chunk of the table cannot quietly make this test vacuous, so it has to
-	// track the table's actual size.
-	testing.expectf(t, checked >= 500, "only %d split points exercised -- table shrank?", checked)
+	// Floor raised from 100 to 500 when T1-J added the Kitty block, and from
+	// 500 to 600 when T1-K added the legacy event-type block (608 split points
+	// at the time of writing, up from 531, up from 186). The floor exists so
+	// deleting a chunk of the table cannot quietly make this test vacuous, so
+	// it has to track the table's actual size.
+	testing.expectf(t, checked >= 600, "only %d split points exercised -- table shrank?", checked)
 }
 
 // A complete sequence followed by a partial one: the complete prefix must be
@@ -663,31 +693,113 @@ test_ctrl_open_bracket_leaves_sequences_alone :: proc(t: ^testing.T) {
 // T1-J: Kitty keyboard protocol.
 // ---------------------------------------------------------------------------
 
-// THE DISPATCH TRAP. 'u' is now a key final byte, but four other `CSI ... u`
-// forms share it and none of them is a keypress:
-//   CSI ? <flags> u   the Kitty flags-query REPLY
+// THE DISPATCH TRAP. 'u' is a key final byte, but four other `CSI ... u` forms
+// share it and NONE of them is a keypress:
+//   CSI ? <flags> u            the flags-query REPLY  (decoded: see below)
 //   CSI = <flags> ; <mode> u   set flags
-//   CSI > <flags> u   push flags
-//   CSI < <n> u       pop flags
+//   CSI > <flags> u            push flags
+//   CSI < <n> u                pop flags
 // All four carry a private prefix byte (0x3C-0x3F) where a digit belongs, and
-// all four must stay cleanly ignored -- consumed whole, nothing emitted --
-// exactly as they were before 'u' meant anything. A decoder that reads the
-// prefix byte as part of a parameter would report the flags word as a keypress.
+// none may ever produce a Key_Msg. A decoder that read the prefix byte as part
+// of a parameter would report the flags word as a keypress.
+//
+// The last three are things a PROGRAM writes -- term.odin writes two of them
+// itself -- so one arriving on the INPUT stream is an echo, not information,
+// and stays cleanly ignored. The reply is the one the terminal sends, and
+// T1-K decodes it; that is a different test, below.
 @(test)
 test_kitty_non_key_csi_u_forms_are_ignored :: proc(t: ^testing.T) {
 	out := make([dynamic]Key_Msg); defer delete(out)
+	enh := make([dynamic]Keyboard_Enhancements_Msg); defer delete(enh)
 	for seq in ([?]string{
-		"\e[?1u", "\e[?0u", "\e[?31u",     // flags reply
 		"\e[=1u", "\e[=5;1u", "\e[=0;3u",  // set flags
-		"\e[>1u", "\e[>0u",                // push flags
-		"\e[<1u", "\e[<u",                 // pop flags
+		"\e[>1u", "\e[>0u",                // push flags   (our own enable sequence, echoed)
+		"\e[<1u", "\e[<u",                 // pop flags    (our own teardown sequence, echoed)
+		"\e[?u",                           // the QUERY itself -- not a reply, no flags word
 		"\e[u",                            // no parameters at all
 	}) {
-		clear(&out)
-		n := decode_keys(transmute([]u8)seq, &out)
+		clear(&out); clear(&enh)
+		n := decode_keys(transmute([]u8)seq, &out, {}, &enh)
 		testing.expectf(t, n == len(seq), "%q: consumed %d, want %d", seq, n, len(seq))
 		testing.expectf(t, len(out) == 0, "%q: emitted %d keys, want 0 (%v)",
 			seq, len(out), out[:])
+		testing.expectf(t, len(enh) == 0, "%q: emitted %d enhancement msgs, want 0",
+			seq, len(enh))
+	}
+}
+
+// T1-K: `CSI ? <flags> u`, the terminal's answer to the `CSI ? u` query
+// term_enter_raw sends after pushing. Decoded into a Keyboard_Enhancements_Msg
+// so an application can find out what it actually got -- the push itself is
+// fire-and-forget, and a terminal may enable fewer flags than were asked for
+// (or, with no Kitty support, never reply at all).
+@(test)
+test_kitty_flags_reply_becomes_an_enhancements_msg :: proc(t: ^testing.T) {
+	out := make([dynamic]Key_Msg); defer delete(out)
+	enh := make([dynamic]Keyboard_Enhancements_Msg); defer delete(enh)
+	Case :: struct { seq: string, want: Kitty_Flags }
+	for c in ([?]Case{
+		{"\e[?0u",  {}},
+		{"\e[?1u",  {.Disambiguate}},
+		{"\e[?3u",  {.Disambiguate, .Report_Event_Types}},
+		{"\e[?31u", {.Disambiguate, .Report_Event_Types, .Alternate_Keys,
+		             .All_Keys_As_Escapes, .Associated_Text}},
+		// A bit this decoder has no name for: a newer protocol revision. The
+		// known bits still report honestly; the unknown one is dropped rather
+		// than transmuted into a Kitty_Flags value with no matching member.
+		{"\e[?33u", {.Disambiguate}},
+	}) {
+		clear(&out); clear(&enh)
+		n := decode_keys(transmute([]u8)c.seq, &out, {}, &enh)
+		testing.expectf(t, n == len(c.seq), "%q: consumed %d, want %d", c.seq, n, len(c.seq))
+		testing.expectf(t, len(out) == 0, "%q: emitted %d keys, want 0", c.seq, len(out))
+		if !testing.expectf(t, len(enh) == 1, "%q: emitted %d enhancement msgs, want 1",
+			c.seq, len(enh)) { continue }
+		testing.expectf(t, enh[0].flags == c.want, "%q: flags %v, want %v",
+			c.seq, enh[0].flags, c.want)
+	}
+
+	// `enh = nil` (the default, and what every caller passed before T1-K) puts
+	// the reply straight back on the cleanly-ignored path -- consumed whole,
+	// nothing emitted, no nil-deref.
+	clear(&out)
+	n := decode_keys(transmute([]u8)string("\e[?1u"), &out)
+	testing.expect_value(t, n, 5)
+	testing.expect_value(t, len(out), 0)
+
+	// It must not swallow neighbouring keys, and a key must not swallow it.
+	clear(&out); clear(&enh)
+	n = decode_keys(transmute([]u8)string("a\e[?1u\e[A"), &out, {}, &enh)
+	testing.expect_value(t, n, 9)
+	testing.expect_value(t, len(enh), 1)
+	if testing.expect_value(t, len(out), 2) {
+		testing.expect_value(t, out[0], Key_Msg{code = .Rune, r = 'a'})
+		testing.expect_value(t, out[1], Key_Msg{code = .Up})
+	}
+}
+
+// The reply is a normal CSI as far as the byte scanner is concerned, so it
+// obeys the same HOLD-BACK CONTRACT as every key sequence: every proper prefix
+// must consume nothing and emit nothing (bar the documented lone-ESC case).
+// It cannot ride in key_cases -- that table's rows are Key_Msg -- so the split
+// is done here by hand.
+@(test)
+test_kitty_flags_reply_holds_back_when_split :: proc(t: ^testing.T) {
+	out := make([dynamic]Key_Msg); defer delete(out)
+	enh := make([dynamic]Keyboard_Enhancements_Msg); defer delete(enh)
+	seq := "\e[?31u"
+	b := transmute([]u8)seq
+	for k in 1 ..< len(b) {
+		clear(&out); clear(&enh)
+		n := decode_keys(b[:k], &out, {}, &enh)
+		if k == 1 {
+			testing.expectf(t, n == 1 && len(out) == 1 && out[0] == Key_Msg{code = .Escape},
+				"%q[:1]: got n=%d %v, want the documented lone-ESC resolution", seq, n, out[:])
+			continue
+		}
+		testing.expectf(t, n == 0 && len(out) == 0 && len(enh) == 0,
+			"%q[:%d]: got n=%d keys=%v enh=%v, want a complete hold-back",
+			seq, k, n, out[:], enh[:])
 	}
 }
 
@@ -769,19 +881,45 @@ test_kitty_ignores_legacy_flags :: proc(t: ^testing.T) {
 	}
 }
 
-// Sub-parameter acceptance is SCOPED TO THE 'u' FINAL, deliberately. Every
-// other final byte still rejects ':' outright, which is what keeps SGR mouse
-// reports, DECRPM replies and the Kitty legacy-key extension on the
-// cleanly-ignored path rather than in some half-parsed state. Pinning it here
-// so widening csi_params later is a conscious act with a failing test attached.
+// csi_params ITSELF still rejects ':', which is the load-bearing half of the
+// arrangement (read its doc comment). T1-K taught the decoder Kitty's
+// event-type extension on the legacy finals -- `CSI 1;5:3A` DOES decode now --
+// but it did so with a separate stripping pass (csi_event_type), not by
+// widening this parser. Asserted directly, not just through decode_keys,
+// because the whole point is that the general parameter parser's contract did
+// not move: everything else that carries sub-parameters (SGR colour, SGR
+// mouse, DECRPM) still lands on the cleanly-ignored path because of this.
+@(test)
+test_csi_params_still_rejects_colons :: proc(t: ^testing.T) {
+	for p in ([?]string{"1;5:3", "1:2", "38:2::1:2:3", ":", "0;10:5"}) {
+		_, _, ok := csi_params(transmute([]u8)p)
+		testing.expectf(t, !ok, "csi_params(%q) accepted a ':' sub-parameter", p)
+	}
+	// ...and the same runs without the ':' are still fine, so the rejection is
+	// about the separator and not about the digits around it.
+	for p in ([?]string{"1;5", "1", "", "0;10"}) {
+		_, _, ok := csi_params(transmute([]u8)p)
+		testing.expectf(t, ok, "csi_params(%q) should still parse", p)
+	}
+}
+
+// Sub-parameter acceptance stays SCOPED: the 'u' final has its own parser
+// (kitty_params) and the legacy finals get exactly ONE sub-parameter in
+// exactly ONE position (csi_event_type). Anything else with a ':' in it is
+// still cleanly ignored rather than half-parsed. Pinning it here so widening
+// that later is a conscious act with a failing test attached.
 @(test)
 test_subparams_are_rejected_outside_csi_u :: proc(t: ^testing.T) {
 	out := make([dynamic]Key_Msg); defer delete(out)
 	for seq in ([?]string{
-		"\e[1;5:3A",   // Kitty's event-type extension on a legacy arrow key
-		"\e[3;5:3~",   // ...and on a tilde key
-		"\e[1:2A",
+		"\e[1:2A",     // sub-parameter on the KEY field, not the modifier field
+		"\e[1;5:3:4A", // two sub-parameters: not the event-type grammar
+		// A non-digit sub-parameter. It has to be a byte in the CSI PARAMETER
+		// range (0x30-0x3F) to reach csi_event_type at all -- a letter there
+		// would simply be the sequence's final byte, ending the CSI early.
+		"\e[1;5:<A",
 		"\e[<0;10:5M", // SGR mouse with a stray sub-parameter
+		"\e[38:2::1:2:3m", // SGR colour -- many sub-parameters, not a key at all
 	}) {
 		clear(&out)
 		n := decode_keys(transmute([]u8)seq, &out)

@@ -7,16 +7,81 @@ Winsize :: struct {
 	ws_row, ws_col, ws_xpixel, ws_ypixel: u16,
 }
 
+// The Kitty keyboard protocol's progressive-enhancement flags, one bit each.
+// The comment on each member is its PROTOCOL VALUE, and the enum's numeric
+// order is what makes `transmute(u8)Kitty_Flags{...}` equal that value --
+// member n is bit n is 1<<n, exactly the protocol's own numbering (see
+// x/ansi's KittyDisambiguateEscapeCodes .. KittyReportAssociatedKeys). That
+// identity is load-bearing in both directions (kitty_push_seq encodes with
+// it, input.odin's kitty_flags_reply decodes with it), so members must never
+// be reordered or inserted mid-block; test_kitty_flag_values_match_the
+// _protocol pins it.
+Kitty_Flag :: enum u8 {
+	Disambiguate,        // 1  -- the whole point: resolves the C0 collisions
+	Report_Event_Types,  // 2  -- press/repeat/release
+	Alternate_Keys,      // 4
+	All_Keys_As_Escapes, // 8
+	Associated_Text,     // 16
+}
+Kitty_Flags :: bit_set[Kitty_Flag; u8]
+
 Term_State :: struct {
-	fd:         posix.FD,
-	saved:      posix.termios,
-	raw_active: bool,
+	fd:           posix.FD,
+	saved:        posix.termios,
+	raw_active:   bool,
+	// True for exactly the interval in which ONE entry of ours could be on
+	// the terminal's keyboard stack. See term_enter_raw's second ordering
+	// invariant and term_restore_c's POP-EXACTLY-ONCE comment -- this flag is
+	// the whole mechanism that stops the normal teardown and the crash-signal
+	// teardown from both popping.
+	kitty_active: bool,
 }
 
 // Process-global: signal handlers take no arguments and must reach this.
 g_term: Term_State
 
-term_enter_raw :: proc(fd: posix.FD) -> bool {
+// CSI < 1 u -- pop ONE entry from the terminal's keyboard stack.
+//
+// A static string, not a formatted one, because term_restore_c writes it from
+// a signal handler: write(2) is async-signal-safe, fmt and the allocator are
+// not. The explicit "1" is redundant (the protocol's default count is 1) and
+// kept anyway: this is the sequence whose count MUST be exactly one, and a
+// reader should not have to know the default to see that. Typed `string`
+// rather than an untyped literal so raw_data() can take its (static,
+// read-only) data pointer.
+@(private="file")
+KITTY_POP: string : "\e[<1u"
+
+// Builds "CSI > <flags> u" (push) followed by "CSI ? u" (query) into `buf`,
+// returning the filled prefix. Hand-formatted rather than fmt.bprintf'd: this
+// runs while the tty is already raw and half-configured, and the whole
+// keyboard path is meant to stay allocation-free so it reads the same on both
+// sides (the pop, which is signal-context, cannot allocate at all).
+//
+// The push is FIRE-AND-FORGET by design: a terminal with no Kitty support
+// ignores an unknown CSI, keys keep arriving in the legacy encoding, and
+// input.odin decodes those exactly as before. The query is how the
+// application finds out which of the two it got -- the reply (CSI ? <flags> u)
+// comes back through the ordinary input path as a Keyboard_Enhancements_Msg.
+@(private="file")
+kitty_push_seq :: proc(kb: Kitty_Flags, buf: []u8) -> []u8 {
+	v := transmute(u8)kb                  // == the protocol's flag word, see Kitty_Flag
+	n := copy(buf, "\e[>")
+	if v >= 10 { buf[n] = '0' + v / 10; n += 1 }
+	buf[n] = '0' + v % 10; n += 1
+	buf[n] = 'u'; n += 1
+	n += copy(buf[n:], "\e[?u")           // RequestKittyKeyboard
+	return buf[:n]
+}
+
+// `kb` defaults to {}, which means DO NOT TOUCH the terminal's keyboard mode:
+// nothing is written, nothing is pushed, and the paired teardown in
+// term_restore_c stays a no-op. Opting in is the application's call, not the
+// framework's -- unlike Bubble Tea, run() does not own the terminal here (the
+// app calls term_enter_raw itself, and the golden tests drive run() with a
+// plain pipe), so the layer that entered raw mode is the layer that gets to
+// decide, and a terminal that never opted in must see zero keyboard sequences.
+term_enter_raw :: proc(fd: posix.FD, kb: Kitty_Flags = {}) -> bool {
 	if posix.tcgetattr(fd, &g_term.saved) != .OK { return false }
 
 	// ORDERING INVARIANT: raw_active must be true for the entire interval in
@@ -53,6 +118,56 @@ term_enter_raw :: proc(fd: posix.FD) -> bool {
 		g_term.raw_active = false
 		return false
 	}
+
+	if kb == {} { return true }
+
+	// THE KEYBOARD PUSH MUST COME AFTER tcsetattr, not before. TCSAFLUSH
+	// DISCARDS pending input, and the query below asks the terminal to send
+	// some: push+query written first would race the mode change, and a reply
+	// that arrived in the meantime would be thrown away by the very flush that
+	// puts us in raw mode. Nothing would break -- the reply is informational --
+	// but the app would silently never learn what it got, on exactly the fast
+	// terminals that answer quickest.
+	//
+	// SECOND ORDERING INVARIANT, the mirror of raw_active's above:
+	// kitty_active must be true for the entire interval in which an entry of
+	// ours could be on the terminal's keyboard stack, so it goes true BEFORE
+	// the write, not after. A crash signal landing between the two calls sees
+	// kitty_active == true and pops -- possibly popping an entry that was
+	// never pushed. That is the right way round to be wrong here, for two
+	// reasons. Popping an entry we did not push is only harmful if some OTHER
+	// program's entry is underneath, and at this instant we know the process
+	// above us is a shell that has not pushed anything (shells do not use this
+	// protocol; a parent TUI would have popped before spawning us) -- and the
+	// protocol makes popping an empty stack a no-op. Setting the flag after
+	// the write instead would leave the opposite window, in which the push
+	// HAS landed but restore no-ops: the terminal is stranded in a keyboard
+	// mode nothing will ever undo, which is permanent, user-visible, and
+	// exactly the failure this pairing exists to prevent.
+	g_term.kitty_active = true
+
+	buf: [16]u8   // max "\e[>31u\e[?u" == 11 bytes
+	seq := kitty_push_seq(kb, buf[:])
+	if posix.write(fd, raw_data(seq), len(seq)) <= 0 {
+		// Roll back: NOTHING went out (EIO once the far end of the pty is gone
+		// is the realistic case), so there is nothing for restore to pop.
+		//
+		// A SHORT write deliberately does NOT roll back. The push is the first
+		// six bytes of `seq` and the query the rest, so a write that moved
+		// anything at all most likely moved the push -- and the asymmetry from
+		// the ordering invariant above applies unchanged: a pop against a stack
+		// we never pushed to is a no-op, while a push that restore skips is
+		// permanent. Assume pushed whenever it is not certain we did not.
+		//
+		// Either way this still returns TRUE, because raw mode itself
+		// SUCCEEDED. Returning false here would be the worse bug by far: every
+		// call site's failure branch is `eprintln("not a tty"); os.exit(1)`,
+		// placed BEFORE the `defer term_restore()`, so it would exit leaving
+		// the tty raw. The keyboard push is an enhancement; raw mode is the
+		// contract, and the terminal's reply (or its absence) is how an
+		// application learns which it got.
+		g_term.kitty_active = false
+	}
 	return true
 }
 
@@ -60,9 +175,44 @@ term_restore :: proc() {
 	term_restore_c()
 }
 
-// Async-signal-safe: tcsetattr(2) only. No allocation, no locks.
+// Async-signal-safe: tcsetattr(2) and write(2), both on POSIX's own list. No
+// allocation, no fmt, no locks, and the only bytes written are a STATIC string
+// (KITTY_POP) -- a formatted sequence would need a buffer and a formatter, and
+// neither is safe to reach from a signal handler that may have interrupted the
+// allocator mid-update.
 //
-// Emits no escape sequences (FIX 5, final fix-wave report). This used to
+// THE SINGLE TEARDOWN POINT. term_restore() is a one-line wrapper around this,
+// and guard.odin's crash_handler calls it directly, so the orderly path and
+// the crash-signal path share one implementation rather than two that can
+// drift. That is what makes the flag checks below sufficient.
+//
+// POP EXACTLY ONCE. `CSI > <flags> u` PUSHES onto the terminal's keyboard
+// stack and `CSI < 1 u` POPS one entry, so an unpaired pop is not a harmless
+// no-op -- it eats an entry belonging to whoever is above us (the shell, a
+// parent TUI), leaving THAT program's keyboard mode silently wrong. Exactly
+// the hazard the alt-screen note below describes, with a stack behind it. The
+// guard is `kitty_active`: popped if and only if we pushed, and cleared
+// immediately, so a crash handler that pops and a `defer term_restore()` that
+// runs afterwards cannot both pop.
+//
+// ORDERING: termios FIRST, the keyboard pop SECOND. The two are independent
+// layers (kernel line discipline vs terminal-emulator state) so neither
+// depends on the other, which leaves two tie-breakers, and both point the same
+// way. (1) This runs from a crash handler; the only thing that can stop it
+// half-way is a SECOND fatal signal, so the more catastrophic restoration goes
+// first. A tty stranded in raw mode has no echo, no line editing and no
+// Ctrl+C -- the user must blind-type `reset`. A tty stranded with an extra
+// keyboard-stack entry still echoes and still line-edits; with Disambiguate it
+// does not even change ordinary printable keys. (2) tcsetattr cannot block,
+// write CAN (a full tty output queue), and blocking mid-crash before the line
+// discipline is back would be the worst of both. Writing the pop after the
+// TCSAFLUSH also means it is never at risk from that flush.
+//
+// The write targets a real tty by construction -- kitty_active can only be
+// true if tcgetattr succeeded on this fd -- so it can only fail with EIO once
+// the far end is gone, never SIGPIPE the way a pipe would.
+//
+// Emits no OTHER escape sequences (FIX 5, final fix-wave report). This used to
 // unconditionally write "\e[?1049l\e[?25h" -- leave alt screen, show
 // cursor -- on every exit path, but nothing in this package or its
 // examples ever writes the corresponding entry sequences ("\e[?1049h",
@@ -75,11 +225,22 @@ term_restore :: proc() {
 // position that was never saved, which is actively wrong output, not
 // merely a harmless no-op. T2/T3 may start hiding the cursor and/or
 // entering the alt screen; this restore must grow to match exactly that
-// when it does, and no more in the meantime.
+// when it does, and no more in the meantime. The Kitty pop above is the
+// first thing to meet that bar: it is written ONLY when this process
+// actually pushed.
+//
+// The two flags are checked INDEPENDENTLY rather than nested under one
+// early return, so that neither restoration can ever be skipped because of
+// the other's state.
 term_restore_c :: proc "c" () {
-	if !g_term.raw_active { return }
-	posix.tcsetattr(g_term.fd, .TCSAFLUSH, &g_term.saved)
-	g_term.raw_active = false
+	if g_term.raw_active {
+		posix.tcsetattr(g_term.fd, .TCSAFLUSH, &g_term.saved)
+		g_term.raw_active = false
+	}
+	if g_term.kitty_active {
+		posix.write(g_term.fd, raw_data(KITTY_POP), len(KITTY_POP))
+		g_term.kitty_active = false
+	}
 }
 
 // core:sys/posix exposes neither ioctl nor a winsize struct; only the per-OS

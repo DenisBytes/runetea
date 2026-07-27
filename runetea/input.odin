@@ -85,6 +85,22 @@ Key_Msg :: struct {
 	mods: Modifiers,
 }
 
+// What the terminal answered when term_enter_raw asked "CSI ? u" which
+// keyboard enhancements it actually enabled. `flags` is the terminal's word,
+// not ours: a terminal is free to enable fewer flags than were pushed, and one
+// with no Kitty support at all never replies, so an app that gets no
+// Keyboard_Enhancements_Msg is on the legacy encoding. Bubble Tea's
+// KeyboardEnhancementsMsg, ported -- its SupportsEventTypes() and friends are
+// spelled `.Report_Event_Types in msg.flags` here.
+//
+// POD, and it has to be: box() rejects anything with a pointer in it (see
+// arena.odin's MESSAGE OWNERSHIP CONTRACT), and this crosses a thread boundary
+// through the mailbox like every other Msg. Kitty_Flags is a bit_set over u8,
+// so this is 1 byte with nothing to own.
+Keyboard_Enhancements_Msg :: struct {
+	flags: Kitty_Flags,
+}
+
 // Expected length in bytes of the UTF-8 sequence introduced by lead byte `b`,
 // per RFC 3629's lead-byte pattern. Used to tell "sequence not fully arrived
 // yet" apart from "invalid byte" -- something utf8.decode_rune's width
@@ -230,18 +246,20 @@ CSI_MAX_PARAMS :: 4
 // with their byte length intact, which the caller computes independently of
 // this proc.
 //
-// THE ':' REJECTION IS LOAD-BEARING AND STAYS. T1-J added Kitty CSI-u decoding,
-// which does need sub-parameters -- but it got its OWN parser (kitty_params),
-// reached only from the 'u' final byte, rather than this one being widened.
-// Sub-parameters appear in plenty of non-key sequences (SGR colour with
-// `38:2::r:g:b`, DECRPM replies, Kitty's own event-type extension on legacy
-// arrow keys, `CSI 1;5:3A`), and every one of them currently lands on the
-// cleanly-ignored path BECAUSE of this rejection. Accepting ':' here would
-// silently promote them to "parsed", where the sub-parameter values would be
-// read as though they were ';'-separated parameters -- e.g. `CSI 1;5:3A` would
-// become Ctrl+Up with the release flag thrown away. Scoping the new grammar to
-// the one final byte that defines it keeps that impossible by construction.
-// test_subparams_are_rejected_outside_csi_u pins it.
+// THE ':' REJECTION IS LOAD-BEARING AND STAYS, and it has now survived two
+// features that each "needed" sub-parameters. T1-J added Kitty CSI-u decoding
+// and gave it its OWN parser (kitty_params), reached only from the 'u' final
+// byte. T1-K added Kitty's event-type extension on the LEGACY finals
+// (`CSI 1;5:3A`) and did it with a separate PASS (csi_event_type) that strips
+// the sub-parameter before this proc ever sees the bytes. Neither widened this
+// one, because sub-parameters appear in plenty of sequences that are not keys
+// at all -- SGR colour with `38:2::r:g:b`, DECRPM replies, SGR mouse -- and
+// every one of them lands on the cleanly-ignored path BECAUSE of this
+// rejection. Accepting ':' here would silently promote them to "parsed", with
+// the sub-parameter values read as though they were ';'-separated parameters:
+// `CSI <0;10:5M` would become a plausible-looking something instead of an
+// ignored mouse report. test_subparams_are_rejected_outside_csi_u pins it, and
+// test_csi_params_still_rejects_colons pins this proc directly.
 csi_params :: proc(p: []u8) -> (params: [CSI_MAX_PARAMS]int, count: int, ok: bool) {
 	for k in 0 ..< CSI_MAX_PARAMS { params[k] = -1 }
 	if len(p) == 0 { return params, 0, true }
@@ -265,6 +283,66 @@ csi_params :: proc(p: []u8) -> (params: [CSI_MAX_PARAMS]int, count: int, ok: boo
 		}
 	}
 	return params, count, true
+}
+
+// Kitty's EVENT-TYPE EXTENSION ON THE LEGACY ENCODINGS, split off ahead of
+// csi_params so that csi_params' ':' rejection can stay exactly as strict as
+// it is (read its comment: that rejection is what keeps SGR colour, SGR mouse
+// and DECRPM replies on the cleanly-ignored path, and widening it would
+// silently reinterpret their sub-parameters as ';' parameters).
+//
+// With Report_Event_Types enabled, a terminal does NOT switch modified arrows
+// and tilde keys to CSI-u; it keeps the legacy form and hangs the event type
+// off the modifier field as a sub-parameter:
+//
+//   CSI 1;5:3 A     Ctrl+Up, RELEASE          CSI 3;5:3 ~   Ctrl+Delete, release
+//   CSI 1;1:2 A     Up, auto-repeat
+//
+// So this strips " : <event-type>" off the end of the parameter run and hands
+// back the plain "1;5" head for the ordinary parsers, plus the Key_Kind it
+// encoded. Port of ultraviolet's parseKittyKeyboardExt (decoder.go), with its
+// shape requirements made explicit rather than falling out of a params API:
+//
+//   - the ':' must sit in the SECOND ';' field, i.e. exactly one ';' before
+//     it. That is the modifier field, the only place the extension puts it.
+//     `CSI 1:2 A` (a sub-parameter on the key field) is not this grammar and
+//     stays cleanly ignored, as does anything with a private prefix, since the
+//     head still has to survive csi_params afterwards;
+//   - exactly ONE sub-parameter follows, digits only. A second ':' means some
+//     other grammar we do not know, and guessing at it would be how a mouse or
+//     colour sequence gets promoted to a fake keypress.
+//
+// Value mapping matches kitty_decode's exactly -- 2 repeat, 3 release, absent/
+// empty/anything else press -- because the two are the same protocol field
+// reached by two routes, and a decoder that called `CSI 97;1:9u` a press but
+// `CSI 1;1:9A` a nothing would be indefensible.
+csi_event_type :: proc(p: []u8) -> (head: []u8, kind: Key_Kind, ok: bool) {
+	colon := -1
+	semis := 0
+	for c, k in p {
+		switch c {
+		case ':':
+			if colon >= 0 { return nil, .Press, false }   // a second ':': not this grammar
+			colon = k
+		case ';':
+			if colon >= 0 { return nil, .Press, false }   // ';' AFTER the ':': not this grammar
+			semis += 1
+		}
+	}
+	if colon < 0 { return p, .Press, true }               // no sub-parameter at all: the common case
+	if semis != 1 { return nil, .Press, false }           // not on the modifier field
+
+	v := 0
+	for c in p[colon + 1:] {
+		if c < '0' || c > '9' { return nil, .Press, false }
+		if v > 9999 { return nil, .Press, false }
+		v = v * 10 + int(c - '0')
+	}
+	switch v {
+	case 2: return p[:colon], .Repeat, true
+	case 3: return p[:colon], .Release, true
+	}
+	return p[:colon], .Press, true
 }
 
 // CSI <param>* ~ -- the "tilde" keys. Table from ultraviolet's key_table.go.
@@ -326,12 +404,13 @@ csi_letter_code :: proc(final: u8) -> (code: Key_Code, ok: bool) {
 // so nothing here consults `legacy` -- doing so would put back the ambiguity
 // the terminal just went to the trouble of eliminating.
 //
-// NOTHING ENABLES THIS YET, and that is safe: no terminal emits CSI-u key
-// events unless asked to (the enabling sequence and its teardown are a separate
-// task, deliberately kept away from the async-signal-safe restore path). Until
-// then this code is inert, because the only CSI-u forms a terminal sends
-// unbidden are the flag-report replies, and those all carry a private prefix
-// byte that kitty_params rejects.
+// T1-K TURNED IT ON. term_enter_raw(fd, kb) pushes `CSI > <flags> u` when the
+// application opts in (term.odin), and only then does a terminal start
+// emitting CSI-u key events -- decoding stayed unconditional and simply went
+// from inert to live. Decoding is still safe with the protocol OFF for the
+// same reason it always was: the only CSI-u form a terminal sends unbidden is
+// the flags reply, which carries a private prefix byte kitty_params rejects
+// and kitty_flags_reply handles as its own Msg.
 // ---------------------------------------------------------------------------
 
 // The Kitty modifier parameter is 1 + a bitmask, same shape as xterm's and a
@@ -501,6 +580,38 @@ kitty_params :: proc(p: []u8) -> (kp: Kitty_Params, ok: bool) {
 	return kp, true
 }
 
+// `CSI ? <flags> u` -- the terminal's REPLY to the "CSI ? u" query
+// term_enter_raw sends after pushing (term.odin). The only unsolicited CSI-u
+// form a terminal produces, and the one member of the private-prefix family
+// that is not a request: `CSI = ... u` (set), `CSI > ... u` (push) and
+// `CSI < ... u` (pop) are things a PROGRAM writes, so seeing one on the input
+// stream means something echoed our own output back, and decoding it would
+// report the flags we asked for as though the terminal had confirmed them.
+// Hence the exact prefix match here instead of a "skip any private prefix"
+// rule -- and test_kitty_non_key_csi_u_forms_are_ignored still pins the other
+// three as cleanly ignored.
+//
+// The flags word is MASKED to the five bits Kitty_Flag defines. A terminal
+// reporting a bit we have no name for is a terminal running a newer protocol
+// revision than this decoder; dropping the bit is lossy but honest, and
+// transmuting it in would produce a Kitty_Flags value with a set bit that no
+// enum member covers, which is worse than lossy.
+//
+// A bare `CSI ? u` (no flags digits) is not a reply -- it is the QUERY, i.e.
+// our own bytes echoed back -- and reports ok = false, leaving it on the
+// cleanly-ignored path.
+kitty_flags_reply :: proc(p: []u8) -> (flags: Kitty_Flags, ok: bool) {
+	if len(p) < 2 || p[0] != '?' { return {}, false }
+	v := 0
+	for c in p[1:] {
+		if c < '0' || c > '9' { return {}, false }
+		if v > 9999 { return {}, false }
+		v = v * 10 + int(c - '0')
+	}
+	// Bit n == Kitty_Flag(n) == protocol value 1<<n; see Kitty_Flag (term.odin).
+	return transmute(Kitty_Flags)u8(v & 0x1f), true
+}
+
 // Decodes a COMPLETE `CSI <params> u` into a key event. See the block comment
 // above for the wire format.
 //
@@ -585,18 +696,27 @@ csi_decode :: proc(p: []u8, has_intermed: bool, final: u8, legacy: Legacy_Key_En
 	// stay cleanly ignored exactly as they were before 'u' meant anything.
 	if final == 'u' { return kitty_decode(p) }
 
-	params, count := csi_params(p) or_return
+	// Kitty's event-type sub-parameter rides on the LEGACY encodings too, so
+	// it is peeled off here, before csi_params ever sees the bytes -- see
+	// csi_event_type for the grammar and for why this is a separate pass
+	// rather than a widening of csi_params. `head` is the parameter run with
+	// the ":<event-type>" removed, which is what the two parsers below expect;
+	// everything past this point is exactly the code that ran before, plus a
+	// `kind` that is .Press for every sequence without the extension.
+	head, kind := csi_event_type(p) or_return
+
+	params, count := csi_params(head) or_return
 
 	if final == '~' {
 		if count == 0 || count > 2 { return {}, false }
 		code := csi_tilde_code(params[0], legacy) or_return
-		if count == 1 { return Key_Msg{code = code}, true }
+		if count == 1 { return Key_Msg{kind = kind, code = code}, true }
 		mods := xterm_mods(params[1]) or_return
-		return Key_Msg{code = code, mods = mods}, true
+		return Key_Msg{kind = kind, code = code, mods = mods}, true
 	}
 
 	code := csi_letter_code(final) or_return
-	if count == 0 { return Key_Msg{code = code}, true }
+	if count == 0 { return Key_Msg{kind = kind, code = code}, true }
 	if count > 2 { return {}, false }
 	// The first parameter of a modified cursor/function key is always 1 (the
 	// "one key" repeat count); anything else is a different sequence that
@@ -605,9 +725,9 @@ csi_decode :: proc(p: []u8, has_intermed: bool, final: u8, legacy: Legacy_Key_En
 	id := params[0]
 	if id < 0 { id = 1 }
 	if id != 1 { return {}, false }
-	if count == 1 { return Key_Msg{code = code}, true }
+	if count == 1 { return Key_Msg{kind = kind, code = code}, true }
 	mods := xterm_mods(params[1]) or_return
-	return Key_Msg{code = code, mods = mods}, true
+	return Key_Msg{kind = kind, code = code, mods = mods}, true
 }
 
 // SS3: ESC O <digits>* <GL byte>. The digit run is the same 1+bitmask
@@ -651,34 +771,39 @@ ss3_decode :: proc(mod_digits: []u8, gl: u8) -> (key: Key_Msg, ok: bool) {
 // Vocabulary: printable runes; C0 control bytes per decode_c0's policy;
 // Enter/Tab/Space/Backspace/Escape; arrows, Home, End, Page_Up, Page_Down,
 // Insert, Delete and F1-F12 in their CSI-tilde, CSI-letter and SS3 encodings;
-// xterm modifier parameters (Shift/Alt/Ctrl/Meta) on all of those; and the
+// xterm modifier parameters (Shift/Alt/Ctrl/Meta) on all of those; the
 // Kitty keyboard protocol's CSI-u key events, including press/repeat/release
-// event types and the alternate-key and text sub-parameter forms.
+// event types and the alternate-key and text sub-parameter forms; Kitty's
+// event-type sub-parameter on the LEGACY encodings (CSI 1;5:3 A,
+// CSI 3;5:3 ~); and the terminal's keyboard-enhancement reply
+// (CSI ? <flags> u), which is the one thing here that is not a Key_Msg and so
+// goes to `enh` instead of `out`.
 //
-// NOTHING TURNS KITTY ON YET. Decoding it is unconditional and inert: a
-// terminal never emits CSI-u key events unless the application asks for them,
-// and the enabling sequence plus its teardown are a separate task, deliberately
-// kept out of this one so they land nowhere near the async-signal-safe restore
-// path in term.odin.
+// `enh` is OPTIONAL and defaults to nil, which drops the reply on the
+// cleanly-ignored path exactly as this decoder did before it understood it.
+// The two output streams also mean ORDER BETWEEN THEM IS NOT PRESERVED: a
+// buffer containing both keys and a reply reports all its keys, then the
+// reply. Harmless in practice -- the reply arrives once, in answer to a query
+// term_enter_raw writes before any key can be pressed -- and cheaper than the
+// tagged-union output stream the alternative would need.
+//
+// TURNING KITTY ON is the application's call, via term_enter_raw(fd, kb)
+// (term.odin). Decoding is unconditional and does not consult that: a terminal
+// simply never emits these forms unless it was asked to.
 //
 // DOCUMENTED LIMITATIONS -- each of these is a separate future unit, and each
 // is CLEANLY IGNORED here (consumed whole, nothing emitted) rather than
 // leaking bytes as garbage runes:
 //   - mouse reporting (X10, SGR: CSI M ..., CSI < ... M/m);
 //   - bracketed paste (CSI 200~ / CSI 201~ and the text between them);
-//   - the Kitty keyboard protocol's NON-key CSI-u forms: the flags reply
-//     (CSI ? <flags> u) and the set/push/pop requests (CSI = / > / < ... u).
-//     Those are terminal state, not keypresses, and want a Msg vocabulary this
-//     decoder does not have;
+//   - the Kitty keyboard protocol's set/push/pop REQUESTS
+//     (CSI = / > / < ... u). Those are bytes a program writes, so one arriving
+//     on the input stream is an echo, not information. (The fourth member of
+//     that family, the flags reply CSI ? <flags> u, IS decoded now -- see
+//     kitty_flags_reply and `enh`.);
 //   - Kitty's Super/Hyper/CapsLock/NumLock modifier bits, which Modifiers has
 //     no member for -- see kitty_mods for why they are masked rather than
 //     folded onto Meta;
-//   - Kitty's event-type extension on the LEGACY key encodings
-//     (CSI 1;5:3 A, CSI 3;5:3 ~), which needs ':' sub-parameters on final bytes
-//     other than 'u'. See csi_params for why that rejection is load-bearing and
-//     was not widened; this is the one thing the Kitty-enabling task will have
-//     to revisit, since a terminal with event types on reports modified arrow
-//     and tilde keys in exactly this form;
 //   - Kitty functional keys Key_Code has no member for: F13-F35, the whole
 //     keypad block, the media keys, and the lone modifier keypresses;
 //   - focus in/out (CSI I / CSI O);
@@ -767,7 +892,12 @@ ss3_decode :: proc(mod_digits: []u8, gl: u8) -> (key: Key_Msg, ok: bool) {
 // it is treated as a real Escape keypress, and the second ESC byte is left
 // for the next loop iteration to resolve on its own terms -- as a lone
 // trailing Escape, as the start of a new sequence, or as another double-ESC.
-decode_keys :: proc(data: []u8, out: ^[dynamic]Key_Msg, legacy: Legacy_Key_Encoding = {}) -> (consumed: int) {
+decode_keys :: proc(
+	data:   []u8,
+	out:    ^[dynamic]Key_Msg,
+	legacy: Legacy_Key_Encoding = {},
+	enh:    ^[dynamic]Keyboard_Enhancements_Msg = nil,
+) -> (consumed: int) {
 	i := 0
 	for i < len(data) {
 		b := data[i]
@@ -806,6 +936,21 @@ decode_keys :: proc(data: []u8, out: ^[dynamic]Key_Msg, legacy: Legacy_Key_Encod
 					// stuck.
 					i += 2
 					continue
+				}
+				// `CSI ? <flags> u` is not a key and never was; before this
+				// it fell through csi_decode to the cleanly-ignored path. It
+				// is dispatched HERE rather than inside csi_decode because it
+				// produces a different Msg type entirely, and csi_decode's
+				// whole signature is "a Key_Msg or nothing". Consumption is
+				// identical either way, so a caller that passes enh = nil
+				// (every existing one, and the golden harness) sees precisely
+				// the old behaviour.
+				if final == 'u' && pe == j {
+					if fl, fok := kitty_flags_reply(data[ps:pe]); fok {
+						if enh != nil { append(enh, Keyboard_Enhancements_Msg{flags = fl}) }
+						i = j + 1
+						continue
+					}
 				}
 				if key, ok := csi_decode(data[ps:pe], pe != j, final, legacy); ok {
 					append(out, key)

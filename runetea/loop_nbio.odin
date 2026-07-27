@@ -109,6 +109,7 @@ run_nbio :: proc(p: ^Program($T), fd: posix.FD, out: ^strings.Builder, flush_fd:
 	defer {
 		delete(rc.pending)
 		delete(rc.keys)
+		delete(rc.enh)
 		// Any entries still sitting unflushed (only reachable if the mailbox
 		// closed mid-flush -- see nbio_flush_backlog) were boxed but never
 		// handed to apply(), so nothing else will ever free them; box_free
@@ -172,6 +173,10 @@ Nbio_Read_Ctx :: struct {
 	buf:         [1024]u8,
 	pending:     [dynamic]u8,        // undecoded tail (partial escape/UTF-8 sequence)
 	keys:        [dynamic]Key_Msg,   // scratch, reused every callback
+	// The terminal's answer to term_enter_raw's keyboard-enhancement query
+	// (term.odin) -- a different Msg type, so decode_keys reports it on its
+	// own stream. Scratch, reused every callback, same as `keys`.
+	enh:         [dynamic]Keyboard_Enhancements_Msg,
 	legacy:      Legacy_Key_Encoding, // copy of Program.legacy; see its comment
 	// Boxed (via context.allocator), not raw Key_Msg -- box()'s own MESSAGE
 	// OWNERSHIP CONTRACT (arena.odin) requires anything that reaches the
@@ -216,7 +221,8 @@ nbio_on_read :: proc(op: ^nbio.Operation) {
 	n := op.read.read
 	append(&rc.pending, ..rc.buf[:n])
 	clear(&rc.keys)
-	consumed := decode_keys(rc.pending[:], &rc.keys, rc.legacy)
+	clear(&rc.enh)
+	consumed := decode_keys(rc.pending[:], &rc.keys, rc.legacy, &rc.enh)
 	if consumed > 0 { remove_range(&rc.pending, 0, consumed) }
 
 	// Boxed here, once per key, via context.allocator -- same convention as
@@ -224,6 +230,7 @@ nbio_on_read :: proc(op: ^nbio.Operation) {
 	// mailbox is a genuine box() allocation. See Nbio_Read_Ctx's own comment
 	// on `backlog` for why this replaced sending rc.keys' elements directly.
 	for k in rc.keys { append(&rc.backlog, box(k, context.allocator)) }
+	for e in rc.enh  { append(&rc.backlog, box(e, context.allocator)) }
 	nbio_flush_backlog(rc)
 }
 

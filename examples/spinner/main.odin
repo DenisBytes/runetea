@@ -74,7 +74,25 @@ main :: proc() {
 	// so a crash landing in that window is only recoverable if a handler
 	// already exists to catch it (see install_crash_handlers' doc comment).
 	rt.install_crash_handlers()
-	if !rt.term_enter_raw(fd) { fmt.eprintln("not a tty"); os.exit(1) }
+	// Opt IN to the Kitty keyboard protocol's disambiguation flag. The default
+	// is {} -- touch nothing -- because the application owns the terminal here,
+	// not the framework (rt.run() never enters raw mode itself). With
+	// .Disambiguate the terminal stops collapsing Ctrl+I onto Tab, Ctrl+M onto
+	// Enter and Ctrl+[ onto Escape, so those become distinguishable keypresses
+	// instead of a Legacy_Key_Encoding coin-flip; a terminal that does not
+	// speak the protocol ignores the sequence and everything keeps working on
+	// the legacy encoding.
+	//
+	// Deliberately NOT .Report_Event_Types: with event types on, every key
+	// arrives twice (press and release), and this update() -- like most
+	// straightforward Bubble Tea-shaped apps -- does not filter on
+	// Key_Msg.kind, so it would count each keystroke twice. Opting into that
+	// is a decision an app makes together with the matching `if key.kind !=
+	// .Press { ... }` check.
+	//
+	// The matching pop is written by rt.term_restore() below, and by the
+	// crash-signal path -- exactly once between them, whichever runs.
+	if !rt.term_enter_raw(fd, {.Disambiguate}) { fmt.eprintln("not a tty"); os.exit(1) }
 	defer rt.term_restore()
 
 	src, ok := rt.input_source_from_fd(fd)

@@ -410,3 +410,74 @@ test_run_returns_promptly_with_a_slow_cmd_still_in_flight :: proc(t: ^testing.T)
 	sync.sema_wait(&finished)
 	time.sleep(150 * time.Millisecond)
 }
+
+// T1-K, end to end: the terminal's answer to term_enter_raw's keyboard query
+// has to reach update() as a Msg, not just be understood by the decoder.
+// It travels a different path from a Key_Msg -- decode_keys reports it on a
+// second output stream, and BOTH event-loop hosts have to box and forward it --
+// so it is exercised through run() and run_nbio() alike here.
+Enh_Model :: struct { seen: int, flags: Kitty_Flags, keys: int }
+
+enh_update :: proc(m: Enh_Model, msg: any, alloc: mem.Allocator) -> (Enh_Model, Cmd) {
+	m := m
+	switch v in msg {
+	case Keyboard_Enhancements_Msg:
+		m.seen += 1
+		m.flags = v.flags
+	case Key_Msg:
+		m.keys += 1
+		if v.code == .Rune && v.r == 'q' { return m, quit_cmd() }
+	}
+	return m, cmd_nil()
+}
+
+enh_view :: proc(m: Enh_Model, alloc: mem.Allocator) -> string { return "" }
+
+@(test)
+test_keyboard_enhancements_msg_reaches_update :: proc(t: ^testing.T) {
+	// CSI ? 3 u -- "disambiguation and event types are on" -- then a keypress
+	// to end the session. The key is there to prove the reply does not swallow
+	// what follows it.
+	script := "\e[?3uq"
+	want := Kitty_Flags{.Disambiguate, .Report_Event_Types}
+
+	{
+		fds: [2]posix.FD
+		testing.expect(t, posix.pipe(&fds) == .OK, "pipe should succeed")
+		posix.write(fds[1], raw_data(script), len(script))
+		posix.close(fds[1])
+
+		src, ok := input_source_from_fd(fds[0])
+		testing.expect(t, ok, "input_source_from_fd should succeed")
+		b := strings.builder_make(); defer strings.builder_destroy(&b)
+
+		p: Program(Enh_Model)
+		program_init(&p, Enh_Model{}, enh_update, enh_view)
+		err := run(&p, &src, &b)
+		input_close(&src)
+		posix.close(fds[0])
+
+		testing.expect(t, err == nil, "run should exit cleanly")
+		testing.expectf(t, p.model.seen == 1, "run(): update saw %d enhancement msgs, want 1", p.model.seen)
+		testing.expectf(t, p.model.flags == want, "run(): flags %v, want %v", p.model.flags, want)
+		testing.expectf(t, p.model.keys == 1, "run(): update saw %d keys, want 1", p.model.keys)
+	}
+
+	{
+		fds: [2]posix.FD
+		testing.expect(t, posix.pipe(&fds) == .OK, "pipe should succeed")
+		posix.write(fds[1], raw_data(script), len(script))
+		posix.close(fds[1])
+
+		b := strings.builder_make(); defer strings.builder_destroy(&b)
+		p: Program(Enh_Model)
+		program_init(&p, Enh_Model{}, enh_update, enh_view)
+		err := run_nbio(&p, fds[0], &b)
+		posix.close(fds[0])
+
+		testing.expect(t, err == nil, "run_nbio should exit cleanly")
+		testing.expectf(t, p.model.seen == 1, "run_nbio(): update saw %d enhancement msgs, want 1", p.model.seen)
+		testing.expectf(t, p.model.flags == want, "run_nbio(): flags %v, want %v", p.model.flags, want)
+		testing.expectf(t, p.model.keys == 1, "run_nbio(): update saw %d keys, want 1", p.model.keys)
+	}
+}

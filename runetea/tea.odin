@@ -270,6 +270,10 @@ reader_thread :: proc(th: ^thread.Thread) {
 
 	buf: [1024]u8
 	keys := make([dynamic]Key_Msg);  defer delete(keys)
+	// The terminal's answer to term_enter_raw's keyboard-enhancement query
+	// (term.odin). A second output stream because it is a different Msg type,
+	// not a Key_Msg -- see decode_keys' note on the ordering that costs.
+	enh  := make([dynamic]Keyboard_Enhancements_Msg); defer delete(enh)
 	pending: [dynamic]u8;            defer delete(pending)
 
 	for !sync.atomic_load(&rd.stop) {
@@ -285,33 +289,44 @@ reader_thread :: proc(th: ^thread.Thread) {
 		append(&pending, ..buf[:n])
 
 		clear(&keys)
-		consumed := decode_keys(pending[:], &keys, rd.legacy)
+		clear(&enh)
+		consumed := decode_keys(pending[:], &keys, rd.legacy, &enh)
 		if consumed > 0 { remove_range(&pending, 0, consumed) }
 
-		for k in keys {
-			// Boxed on the heap, not the frame arena: this crosses a thread
-			// boundary and outlives any single frame.
-			msg := box(k, context.allocator)
-			// FULL vs CLOSED must be handled differently (FIX 1, final
-			// fix-wave report). The reader reads up to 1024 bytes per
-			// read() and can send in a tight loop, while the main loop does
-			// decode + render + write() per message -- the reader always
-			// wins, and >1000 pasted characters is enough to fill the
-			// 256-slot mailbox. Treating Full the same as Closed (as this
-			// code used to, via a single `if !mailbox_send(...) { return
-			// }`) made the reader exit WITHOUT calling mailbox_close, so the
-			// main loop drained the queued messages and then blocked
-			// forever in mailbox_recv -- no keyboard, no EOF, no error,
-			// unkillable except by an external signal. Full is transient:
-			// the main loop keeps draining concurrently, so spin until it
-			// makes room. Closed is terminal: run() is tearing down and
-			// nothing sent from here on can ever be received.
-			for {
-				result := mailbox_send(rd.mailbox, msg)
-				if result == .Ok { break }
-				if result == .Closed { return }
-				thread.yield()
-			}
+		// Boxed on the heap, not the frame arena: these cross a thread
+		// boundary and outlive any single frame.
+		for k in keys { if reader_send(rd.mailbox, box(k, context.allocator)) { return } }
+		for e in enh  { if reader_send(rd.mailbox, box(e, context.allocator)) { return } }
+	}
+}
+
+// Blocks until `msg` is in the mailbox, or until the mailbox closes.
+// Returns true if it closed -- the caller must then stop reading entirely.
+//
+// FULL vs CLOSED must be handled differently (FIX 1, final fix-wave report),
+// which is the whole reason this is not a bare `if !mailbox_send(...)`. The
+// reader reads up to 1024 bytes per read() and can send in a tight loop, while
+// the main loop does decode + render + write() per message -- the reader
+// always wins, and >1000 pasted characters is enough to fill the 256-slot
+// mailbox. Treating Full the same as Closed (as this code used to) made the
+// reader exit WITHOUT calling mailbox_close, so the main loop drained the
+// queued messages and then blocked forever in mailbox_recv -- no keyboard, no
+// EOF, no error, unkillable except by an external signal. Full is transient:
+// the main loop keeps draining concurrently, so spin until it makes room.
+// Closed is terminal: run() is tearing down and nothing sent from here on can
+// ever be received.
+//
+// A proc rather than an inlined loop because there are now two kinds of
+// message to send (keys and the keyboard-enhancement reply) and Odin has no
+// closures to capture `rd` with -- two copies of this reasoning would be two
+// copies to get wrong.
+@(private="file")
+reader_send :: proc(mbox: ^Mailbox, msg: any) -> (closed: bool) {
+	for {
+		switch mailbox_send(mbox, msg) {
+		case .Ok:     return false
+		case .Closed: return true
+		case .Full:   thread.yield()
 		}
 	}
 }
