@@ -100,7 +100,14 @@ display_width :: proc(s: string, opts := Width_Options{}) -> int {
 	return total + plain_width(s[seg:], opts)
 }
 
-@(private = "file")
+// PACKAGE-PRIVATE, not file-private (T3-A). The cell renderer walks a view line
+// with EXACTLY display_width's own escape-vs-content split -- same ESC scan,
+// same skip_escape, same segment boundaries -- because a cell grid that
+// disagreed with display_width about where an escape ends would disagree with
+// rows_for_line about how many rows a line takes, and the full-screen repaint
+// (which the diff renderer must reproduce cell for cell) is driven by
+// rows_for_line. One scanner, one answer.
+@(private = "package")
 ESC :: 0x1B
 @(private = "file")
 BEL :: 0x07
@@ -122,7 +129,7 @@ BEL :: 0x07
 // scan below stops at the first byte that cannot legally belong to a CSI and
 // resumes ordinary measurement AT that byte, so one stray "\e[" cannot silently
 // zero out the whole rest of a line.
-@(private = "file")
+@(private = "package")
 skip_escape :: proc(s: string, start: int) -> int {
 	i := start + 1
 	if i >= len(s) { return len(s) }   // bare trailing ESC
@@ -176,31 +183,80 @@ skip_escape :: proc(s: string, start: int) -> int {
 // reconstruction below.
 @(private = "file")
 plain_width :: proc(s: string, opts: Width_Options) -> int {
-	if len(s) == 0 { return 0 }
-
-	it := utf8.decode_grapheme_iterator_make(s)
 	total := 0
-
-	// One cluster held back at a time: its END (and therefore its correct
-	// byte span) is only known once the NEXT cluster's byte_index is read,
-	// or the iterator is exhausted (end = len(s)). This is the byte-span
-	// reconstruction defect 1 requires -- consecutive byte_index values,
-	// never it.text.
-	prev_start := -1
-	prev_width := 0
+	ci := cluster_iter_make(s, opts)
 	for {
-		_, g, ok := utf8.decode_grapheme_iterate(&it)
+		_, w, ok := cluster_next(&ci)
 		if !ok { break }
-		if prev_start >= 0 {
-			total += corrected_cluster_width(s[prev_start:g.byte_index], prev_width, opts)
-		}
-		prev_start = g.byte_index
-		prev_width = g.width
-	}
-	if prev_start >= 0 {
-		total += corrected_cluster_width(s[prev_start:], prev_width, opts)
+		total += w
 	}
 	return total
+}
+
+// THE CLUSTER LOOP plain_width used to inline, lifted out verbatim (T3-A) so
+// the cell renderer can walk the SAME clusters with the SAME corrected widths
+// instead of re-deriving them. This is the single most delicate loop in this
+// file -- the byte-span reconstruction defect 1 forces -- and having two copies
+// of it was never an option: a cell grid that split clusters differently from
+// display_width would put a caret in the wrong column and a diff in the wrong
+// cell, silently.
+//
+// The span it yields is a byte-exact subslice of the ORIGINAL string, which is
+// what the renderer needs: it stores those bytes in a cell and writes them back
+// to the terminal unchanged.
+//
+// `s` MUST NOT CONTAIN ESC. Callers split on escapes first (display_width's own
+// pre-pass, and the renderer's identical one) -- see display_width for why the
+// split is sound on bytes.
+@(private = "package")
+Cluster_Iter :: struct {
+	s:          string,
+	opts:       Width_Options,
+	it:         utf8.Grapheme_Iterator,
+	// One cluster is held back at a time: its END (and therefore its correct
+	// byte span) is only known once the NEXT cluster's byte_index is read, or
+	// the iterator is exhausted (end = len(s)). -1 means "nothing held back
+	// yet"; -2 means "the held-back cluster was the last one and has already
+	// been yielded", i.e. the iterator is finished.
+	prev_start: int,
+	prev_width: int,
+}
+
+@(private = "package")
+cluster_iter_make :: proc(s: string, opts := Width_Options{}) -> (ci: Cluster_Iter) {
+	ci.s = s
+	ci.opts = opts
+	ci.it = utf8.decode_grapheme_iterator_make(s)
+	ci.prev_start = -1
+	return
+}
+
+// Yields the next cluster's byte span and its CORRECTED display width (0, 1 or
+// 2). ok=false once the string is exhausted.
+@(private = "package")
+cluster_next :: proc(ci: ^Cluster_Iter) -> (span: string, width: int, ok: bool) {
+	if len(ci.s) == 0 || ci.prev_start == -2 { return "", 0, false }
+	for {
+		_, g, more := utf8.decode_grapheme_iterate(&ci.it)
+		if !more { break }
+		if ci.prev_start >= 0 {
+			sp := ci.s[ci.prev_start:g.byte_index]
+			w  := corrected_cluster_width(sp, ci.prev_width, ci.opts)
+			ci.prev_start = g.byte_index
+			ci.prev_width = g.width
+			return sp, w, true
+		}
+		ci.prev_start = g.byte_index
+		ci.prev_width = g.width
+	}
+	if ci.prev_start >= 0 {
+		sp := ci.s[ci.prev_start:]
+		w  := corrected_cluster_width(sp, ci.prev_width, ci.opts)
+		ci.prev_start = -2
+		return sp, w, true
+	}
+	ci.prev_start = -2
+	return "", 0, false
 }
 
 // Cap on runes inspected per cluster for the VS16/RI/leading-mark checks

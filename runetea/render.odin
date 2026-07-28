@@ -5,9 +5,15 @@ import "core:strings"
 // Naive inline renderer: rewind over the previous frame and repaint.
 //
 // Deliberately has no cell buffer and no diffing. At 60fps this pushes ~104 KB/s
-// for a completely static screen -- fine locally, unusable over ssh. T3 replaces
-// it with a diffed cell renderer, gated behind the golden-byte harness because
-// that code fails silently and has no oracle (spec §10, §13.1).
+// for a completely static screen -- fine locally, unusable over ssh.
+//
+// T3-A ADDS THE DIFFED CELL RENDERER AS A THIRD MODE (.Diff, below) rather than
+// replacing this one. The same ~104 KB/s static screen costs 0 bytes there,
+// measured. It is a third mode and not a rewrite of .Full_Screen for the reason
+// the spec gives for being afraid of this code at all (§10, §13.1 -- "no oracle
+// and fails silently"): the full-screen repaint is the REFERENCE the diff is
+// checked against, frame for frame, so it has to keep existing and keep being
+// byte-for-byte what it always was. See diff_oracle_test.odin.
 //
 // REWIND COUNTS PHYSICAL ROWS, NOT LOGICAL LINES (fixed T1). A terminal wraps
 // any line wider than its column count into 2+ physical rows; \e[1A moves the
@@ -63,6 +69,50 @@ Renderer :: struct {
 	// ALWAYS 0 IN FULL-SCREEN MODE: that path places the cursor with an absolute
 	// CUP, so there is no relative offset to remember and nothing to walk back.
 	cursor_up:  int,
+
+	// --- T3-A, .Diff ONLY. Untouched (and unallocated) in the other two modes.
+	//
+	// TWO SCREENS, NOT ONE PLUS A DIFF LIST. `front` selects which of these two
+	// holds the state currently ON THE TERMINAL; the other is scratch for the
+	// frame being built. They alternate rather than one being copied into the
+	// other at the end, so a frame costs one O(cells) copy total -- and that
+	// copy is also what compacts the cluster-byte pool (screen_copy).
+	// A RENDERER IS USED THROUGH A POINTER AND MUST NOT BE COPIED BY VALUE in
+	// .Diff mode: both Screens hold a ^Style_Table pointing at `styles` below,
+	// i.e. into this very struct, so a by-value copy would leave the copy's
+	// screens interning into the ORIGINAL's table. Nothing in this package
+	// copies a Renderer (run() and run_nbio() both keep one local and pass
+	// &r everywhere), and render_diff re-establishes the two back-pointers on
+	// every frame so that even a copy heals itself on its next render -- but the
+	// rule is written down rather than left to be rediscovered.
+	screens:      [2]Screen,
+	front:        int,
+	styles:       Style_Table,
+	// Reused across frames so a frame allocates nothing: SGR accumulation
+	// scratch, and the per-row dirty mask the emitter expands wide pairs into.
+	sgr_scratch:  [dynamic]u8,
+	dirty:        [dynamic]bool,
+	// False until the two screens have been sized. Also the flag that says
+	// "nothing here is allocated", which is what makes renderer_destroy safe to
+	// call on a renderer that never ran in diff mode.
+	grid_ready:   bool,
+	// The next frame must be painted from a known-blank terminal: the first
+	// frame, a resize, a renderer_clear, a style-table overflow, or any frame
+	// that had to fall back to a plain repaint because the size was unknown.
+	// ALWAYS SET, NEVER CLEARED, BY ANYTHING THAT INVALIDATES THE MODEL -- the
+	// one rule that keeps "what we think is on screen" from quietly becoming
+	// fiction.
+	force_repaint: bool,
+	// WHERE THE EMITTER BELIEVES THE TERMINAL'S CURSOR AND SGR ARE, as opposed
+	// to where the MODEL's cursor is (screens[front].x/y, which tracks what the
+	// repaint stream would have done). The two are deliberately separate: the
+	// diff writes a completely different byte stream from the repaint, so the
+	// only thing that may drive a cursor-move decision is what the diff itself
+	// emitted. emit_x may equal cols, meaning "pending wrap" -- which never
+	// compares equal to a real column, so the next write always re-homes.
+	emit_x:       int,
+	emit_y:       int,
+	emit_style:   u16,
 }
 
 // Which of the two renderers a Renderer is.
@@ -87,9 +137,17 @@ Renderer :: struct {
 //                 buffer (term_enter_raw's `alt`), though nothing here requires
 //                 that -- the first frame's \e[J clears whatever the shell left
 //                 below it either way.
+//   .Diff         (T3-A) The SAME frame .Full_Screen paints, delivered as the
+//                 minimum set of writes that turns what is already on screen
+//                 into it. An identical consecutive frame costs ZERO bytes; a
+//                 changed cell costs a cursor move and that cell. Needs the
+//                 terminal's width AND height (it is modelling a viewport);
+//                 with either unknown it degrades to exactly .Full_Screen's
+//                 byte stream for that frame -- see render_diff.
 Render_Mode :: enum u8 {
 	Inline,
 	Full_Screen,
+	Diff,
 }
 
 // Where the application wants the terminal's cursor left at the end of a frame.
@@ -143,6 +201,37 @@ renderer_init :: proc(
 	r.term_width = term_width
 	r.term_height = term_height
 	r.cursor_up = 0
+
+	r.grid_ready    = false
+	r.force_repaint = true
+	r.front         = 0
+	r.emit_x, r.emit_y = 0, 0
+	r.emit_style    = 0
+}
+
+// Releases the cell grids. NO-OP unless this Renderer actually ran in .Diff
+// mode with a known size -- the other two modes never allocate, so every call
+// site written before T3-A is free to add this (or not) with no behavioural
+// change. Safe to call twice, and safe to call on a zero-value Renderer.
+//
+// This is the only proc in the file that owns memory, and the leak audit in
+// tools/test.sh is the reason it is a hard requirement rather than a nicety:
+// a diff-mode Renderer that is never destroyed shows up as a new, unallowlisted
+// leak site and fails the gate.
+renderer_destroy :: proc(r: ^Renderer) {
+	if !r.grid_ready { return }
+	screen_destroy(&r.screens[0])
+	screen_destroy(&r.screens[1])
+	style_table_destroy(&r.styles)
+	delete(r.sgr_scratch)
+	delete(r.dirty)
+	r.sgr_scratch = nil
+	r.dirty       = nil
+	r.grid_ready  = false
+	// A destroyed grid is not a valid model of anything; if this Renderer is
+	// somehow used again it must repaint from scratch rather than diff against
+	// freed state.
+	r.force_repaint = true
 }
 
 // DECTCEM -- `CSI ? 25 l` hides the cursor, `CSI ? 25 h` shows it. Named
@@ -195,6 +284,13 @@ ED :: "\e[J"
 // whatever width was in effect then, so the very next rewind is still
 // correct even if a resize lands in between (see the resize-mid-run test).
 renderer_set_width :: proc(r: ^Renderer, term_width: int) {
+	// In .Diff mode a width change resizes the viewport the cell grid models,
+	// and every cell's position within it. Nothing survives that, so the model
+	// is discarded and the next frame repaints from a real \e[2J -- the same
+	// answer render_diff gives for its own first frame. Set unconditionally
+	// rather than only when the value changed: a redundant repaint costs one
+	// frame, and a missed one is a permanently wrong screen.
+	if r.mode == .Diff && term_width != r.term_width { r.force_repaint = true }
 	r.term_width = term_width
 }
 
@@ -205,6 +301,7 @@ renderer_set_width :: proc(r: ^Renderer, term_width: int) {
 // not retroactively touch last_rows (a mid-run resize would make the very next
 // REWIND wrong) simply has no analogue in a mode that never rewinds.
 renderer_set_height :: proc(r: ^Renderer, term_height: int) {
+	if r.mode == .Diff && term_height != r.term_height { r.force_repaint = true }
 	r.term_height = term_height
 }
 
@@ -272,6 +369,31 @@ line_fills_its_rows :: proc(line: string, term_width: int) -> bool {
 // acquire a byte belonging to the other -- see
 // test_inline_mode_emits_no_full_screen_escapes, which pins exactly that.
 renderer_render :: proc(r: ^Renderer, view: string, cur := Cursor{}) {
+	// THE LINE SPLIT MOVED ABOVE THE DECTCEM PAIR (T3-A) and emits no bytes, so
+	// the output is unchanged for both older modes. .Diff needs the lines before
+	// it can decide whether this frame writes anything at all -- and that
+	// decision is what its own hide/show is conditioned on (a hidden-then-shown
+	// cursor around zero painting would cost 12 bytes on an identical frame,
+	// which is the entire point of the mode).
+	lines := strings.split_lines(view)
+	defer delete(lines)
+	// A trailing "\n" in view is a terminator, not content: split_lines yields
+	// one trailing empty element for it ("a\nb\n" -> ["a","b",""]), which would
+	// otherwise paint a permanent, silent extra blank row every frame. Drop
+	// exactly one -- a second "\n" ("a\n\n" -> ["a","",""]) IS content (one
+	// real blank line) and must survive, matching wc -l / editor semantics.
+	// Must come after the defer above: Odin evaluates defer arguments at the
+	// defer statement, so the original full-length slice is still what gets
+	// freed even though `lines` is reassigned to a shorter view below.
+	if len(lines) > 1 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+
+	if r.mode == .Diff {
+		render_diff(r, lines, cur)
+		return
+	}
+
 	// HIDE WHILE ANYTHING MOVES. Two things can move the cursor in this frame:
 	// placing one (cur.show), and walking last frame's parked one back home
 	// (r.cursor_up > 0, inline only). Either way the user would otherwise watch
@@ -291,23 +413,10 @@ renderer_render :: proc(r: ^Renderer, view: string, cur := Cursor{}) {
 		strings.write_string(r.out, CURSOR_HIDE)
 	}
 
-	lines := strings.split_lines(view)
-	defer delete(lines)
-	// A trailing "\n" in view is a terminator, not content: split_lines yields
-	// one trailing empty element for it ("a\nb\n" -> ["a","b",""]), which would
-	// otherwise paint a permanent, silent extra blank row every frame. Drop
-	// exactly one -- a second "\n" ("a\n\n" -> ["a","",""]) IS content (one
-	// real blank line) and must survive, matching wc -l / editor semantics.
-	// Must come after the defer above: Odin evaluates defer arguments at the
-	// defer statement, so the original full-length slice is still what gets
-	// freed even though `lines` is reassigned to a shorter view below.
-	if len(lines) > 1 && lines[len(lines)-1] == "" {
-		lines = lines[:len(lines)-1]
-	}
-
 	switch r.mode {
 	case .Inline:      render_inline(r, lines, cur)
 	case .Full_Screen: render_full_screen(r, lines, cur)
+	case .Diff:        unreachable()   // handled above, before the DECTCEM pair
 	}
 
 	if hide { strings.write_string(r.out, CURSOR_SHOW) }
@@ -363,21 +472,66 @@ renderer_render :: proc(r: ^Renderer, view: string, cur := Cursor{}) {
 // nothing is dropped.
 @(private = "file")
 render_full_screen :: proc(r: ^Renderer, lines: []string, cur: Cursor) {
-	strings.write_string(r.out, HOME)
+	rows, _ := paint_frame(r.out, nil, nil, lines, cur, r.term_width, r.term_height)
+	r.last_rows = rows
+}
+
+// THE FULL-SCREEN FRAME, EMITTED AND/OR MODELLED (T3-A split this out of
+// render_full_screen; the byte stream is unchanged, statement for statement).
+//
+// `out != nil` writes the repaint's bytes. `scr != nil` applies the SAME frame
+// to a cell model -- the terminal operation each byte sequence stands for, in
+// the same order. Both may be non-nil; either may be nil.
+//
+// WHY ONE PROC AND NOT TWO. The diff renderer's target grid must be exactly
+// "the screen the full-screen repaint would have produced". Written as two
+// procedures -- one emitting bytes, one laying out cells -- those two would be a
+// pair of hand-maintained transcriptions of the same frame shape, and the day
+// they disagreed the diff would render a screen the repaint never would, with
+// nothing to notice. Here every frame decision (which lines fit, where the
+// \r\n goes, whether the EL is emitted, whether the trailing \r\n\e[J is) is
+// made ONCE and fed to both sinks, so they cannot drift apart. What the byte
+// stream MEANS -- what \e[K does to a row, what \r\n does at the bottom of the
+// screen -- is not shared, and that is precisely what the diff oracle checks:
+// it replays the real bytes through an independent emulator (diff_oracle_test)
+// and compares against what the diff renderer, driven by this model, produced.
+//
+// Returns the physical row count (Renderer.last_rows' value) and ok=false if
+// the style table overflowed while modelling (the caller forces a repaint).
+@(private = "file")
+paint_frame :: proc(
+	out:     ^strings.Builder,
+	scr:     ^Screen,
+	scratch: ^[dynamic]u8,
+	lines:   []string,
+	cur:     Cursor,
+	term_width, term_height: int,
+) -> (rows: int, ok: bool) {
+	ok = true
+	if out != nil { strings.write_string(out, HOME) }
+	if scr != nil { screen_goto(scr, 0, 0) }
 
 	// `cline` is clamped the same way the inline path clamps it, so a negative or
 	// past-the-end line index behaves identically in both modes.
 	cline      := clamp(cur.line, 0, len(lines) - 1)
-	rows       := 0   // physical rows painted so far
 	painted    := 0   // logical lines painted so far
 	rows_above := 0   // physical rows above the cursor's own logical line
 	for line, i in lines {
-		need := rows_for_line(line, r.term_width)
-		if r.term_height > 0 && rows + need > r.term_height { break }
-		if painted > 0 { strings.write_string(r.out, "\r\n") }
+		need := rows_for_line(line, term_width)
+		if term_height > 0 && rows + need > term_height { break }
+		if painted > 0 {
+			if out != nil { strings.write_string(out, "\r\n") }
+			if scr != nil { screen_cr(scr); screen_index(scr) }
+		}
 		if i == cline { rows_above = rows }
-		strings.write_string(r.out, line)
-		if !line_fills_its_rows(line, r.term_width) { strings.write_string(r.out, EL) }
+		if out != nil { strings.write_string(out, line) }
+		if scr != nil {
+			if !screen_write(scr, line, scratch) { ok = false }
+		}
+		if !line_fills_its_rows(line, term_width) {
+			if out != nil { strings.write_string(out, EL) }
+			if scr != nil { screen_el0(scr) }
+		}
 		rows    += need
 		painted += 1
 	}
@@ -385,22 +539,22 @@ render_full_screen :: proc(r: ^Renderer, lines: []string, cur: Cursor) {
 	// let cursor_cell's clamp pull it back to the last painted row -- one clamp,
 	// in one place, rather than a second rule here that could disagree with it.
 	if cline >= painted { rows_above = rows }
-	r.last_rows = rows
 
 	switch {
 	case painted == 0:
 		// Nothing was painted, so the cursor is still at 1;1 (column 1, no
 		// pending wrap) and ED from there blanks the whole screen. No \r\n: it
 		// would step over the top row and leave it holding the previous frame.
-		strings.write_string(r.out, ED)
-	case r.term_height <= 0 || rows < r.term_height:
+		if out != nil { strings.write_string(out, ED) }
+		if scr != nil { screen_ed0(scr) }
+	case term_height <= 0 || rows < term_height:
 		// A row below the frame exists (or the height is unknown, in which case
 		// "do not guess" cuts the other way: a stale tail left on screen is a
 		// visible, permanent lie, while the \r\n's worst case is one scroll on a
 		// frame that already exactly filled a screen we were never told the size
 		// of).
-		strings.write_string(r.out, "\r\n")
-		strings.write_string(r.out, ED)
+		if out != nil { strings.write_string(out, "\r\n"); strings.write_string(out, ED) }
+		if scr != nil { screen_cr(scr); screen_index(scr); screen_ed0(scr) }
 	}
 
 	// ABSOLUTE CUP, not the inline mode's relative walk -- simpler, and with no
@@ -409,8 +563,470 @@ render_full_screen :: proc(r: ^Renderer, lines: []string, cur: Cursor) {
 	// reason than inline's: a caret on a line TRUNCATION dropped would otherwise
 	// point at a row this frame never wrote.
 	if cur.show && painted > 0 {
-		prow, col := cursor_cell(cur, rows_above, rows, r.term_width)
-		write_cup(r.out, prow + 1, col + 1)
+		prow, col := cursor_cell(cur, rows_above, rows, term_width)
+		if out != nil { write_cup(out, prow + 1, col + 1) }
+		if scr != nil { screen_goto(scr, col, prow) }
+	}
+	return
+}
+
+// ============================================================================
+// THE DIFF RENDERER (T3-A)
+// ============================================================================
+//
+// WHAT IT IS: .Full_Screen's frame, delivered as the smallest set of writes
+// that turns the screen already in front of the user into it. The frame itself
+// -- which lines fit, where they wrap, what gets erased -- is decided by
+// paint_frame, the SAME proc that emits .Full_Screen's bytes, driving a cell
+// model instead of (or as well as) a byte stream. So this mode never invents a
+// frame of its own; it only re-delivers .Full_Screen's.
+//
+// WHY THAT SPLIT IS THE WHOLE DESIGN. The spec's warning (§10, §13.1) is that a
+// diff renderer "has no oracle and fails silently". It has one here, and this
+// is what makes the oracle possible: the reference output for any frame
+// sequence is just the same sequence through .Full_Screen, and the invariant is
+// "replaying the diff bytes through a VT100 lands on exactly the same screen
+// and cursor as replaying the repaint bytes". That is checked, fuzzed, over
+// hundreds of random frame sequences, in diff_oracle_test.odin -- and
+// independently against pyte (a third-party VT100 emulator) by tools/difftest.
+//
+// WHAT IT COSTS ON THE WIRE:
+//   identical consecutive frame ....... 0 bytes
+//   one changed cell .................. a cursor move + that cell
+//   a cleared tail .................... a cursor move + \e[K
+//   nothing ever re-sent that is already on screen.
+//
+// WHAT IT COSTS IN CPU: one O(cols*rows) copy plus one O(cols*rows) compare per
+// frame, whether or not anything changed. That is the deliberate trade -- the
+// resource this mode exists to conserve is the TERMINAL LINK (104 KB/s of
+// repaint at 60fps is unusable over ssh), not the local CPU.
+//
+// KNOWN LIMITS, stated rather than discovered later:
+//   * NEEDS A KNOWN WIDTH AND HEIGHT. It models a viewport; without one there
+//     is nothing to model. With either unknown the frame degrades to
+//     .Full_Screen's exact byte stream and the model is invalidated, so the
+//     first frame after a size arrives repaints in full.
+//   * VIEWS MAY CONTAIN STYLING, NOT MOTION. SGR escapes are tracked per cell.
+//     Any other escape (cursor movement, OSC, DCS) is consumed for width
+//     purposes -- exactly as display_width already does -- and otherwise
+//     ignored, which means a view that moves the terminal's cursor itself is
+//     lying to the model. .Full_Screen tolerates that; this mode cannot.
+//   * A WIDE CLUSTER LANDING ON THE RIGHT MARGIN is modelled as written IN that
+//     column (see screen.odin's header). xterm-family terminals instead leave
+//     the cell blank and wrap the cluster. This is the same one-cell optimism
+//     rows_for_line and line_fills_its_rows have always had, not a new one.
+
+// Fault injection for the oracle's non-vacuity proof. "" -- the default, and
+// what every real build compiles -- costs nothing: each site below is a `when`
+// on a compile-time constant, so the faults are not present in the binary at
+// all. See diff_oracle_test.odin for what each one is supposed to break and the
+// test that proves the oracle catches it.
+//
+//   repaint      the "diff" is a plain full repaint. MUST STILL PASS -- this is
+//                the control that proves the harness works before it has to
+//                catch anything.
+//   skip_cell    drops the last changed cell of every row.
+//   drop_style   never re-emits SGR.
+//   narrow_wide  advances the cursor by one column after a wide cluster.
+//   no_pair_expand  drops the wide-cell expansion in emit_row. MUST NOT
+//                DIVERGE, and that is a finding, not an oversight -- see
+//                emit_row's own note on why the expansion is currently
+//                provably inert, and diff_oracle_test for the assertion that
+//                pins it.
+//   no_cursor    never issues the frame's final cursor move.
+DIFF_FAULT :: #config(RUNETEA_DIFF_FAULT, "")
+
+// SGR reset. Named because the diff emitter's entire style discipline rests on
+// "the accumulated style bytes reproduce the style exactly WHEN APPLIED TO A
+// DEFAULT TERMINAL" -- so every transition out of a non-default style goes
+// through this constant first.
+@(private = "file")
+SGR_RESET :: "\e[0m"
+// ED (erase in display, mode 2): the whole screen, cursor unmoved.
+@(private = "file")
+ED2 :: "\e[2J"
+
+// A run of UNCHANGED cells shorter than this is rewritten rather than skipped:
+// a CHA (\e[<n>G) costs 4-6 bytes, so hopping over three unchanged narrow cells
+// costs more than repainting them. Only ever applied to runs of width-1 cells
+// (see emit_row) -- hopping is mandatory across a wide cluster, where rewriting
+// half of one is not a cheaper way to do the same thing, it is a corruption.
+@(private = "file")
+GAP_MERGE_MAX :: 4
+
+// \e[K is used instead of writing spaces only when it replaces at least this
+// many cell writes. Below that it is pure overhead (3 bytes plus a possible SGR
+// reset, against 1 byte per space).
+@(private = "file")
+EL_MIN_RUN :: 4
+
+@(private = "file")
+render_diff :: proc(r: ^Renderer, lines: []string, cur: Cursor, allow_retry := true) {
+	when DIFF_FAULT == "repaint" {
+		// INJECTED FAULT (control case): not a diff at all. The oracle must
+		// still pass -- see this file's DIFF_FAULT note.
+		rows, _ := paint_frame(r.out, nil, nil, lines, cur, r.term_width, r.term_height)
+		r.last_rows     = rows
+		r.force_repaint = true
+		return
+	} else {
+
+	// NO SIZE, NO VIEWPORT, NO MODEL. Same "do not guess" rule rows_for_line
+	// states for an unknown width -- and the same consequence: the frame is
+	// simply .Full_Screen's, byte for byte, including its DECTCEM pair. The
+	// model is invalidated so that the first frame after a real size arrives
+	// (a Window_Size_Msg, or the initial term_size in run()) repaints in full
+	// rather than diffing against a screen it never modelled.
+	if r.term_width <= 0 || r.term_height <= 0 {
+		hide := cur.show
+		if hide { cursor_hide_arm(); strings.write_string(r.out, CURSOR_HIDE) }
+		rows, _ := paint_frame(r.out, nil, nil, lines, cur, r.term_width, r.term_height)
+		r.last_rows = rows
+		if hide { strings.write_string(r.out, CURSOR_SHOW) }
+		r.force_repaint = true
+		return
+	}
+
+	diff_grid_ensure(r)
+	// See Renderer.screens: cheap insurance against a by-value copy, two stores
+	// a frame.
+	r.screens[0].styles = &r.styles
+	r.screens[1].styles = &r.styles
+
+	prev := &r.screens[r.front]
+	cur_s := &r.screens[1 - r.front]
+
+	// Captured BEFORE it is cleared: everything downstream (whether the frame
+	// counts as "changed", whether the \e[2J prologue is written) keys off the
+	// value this frame started with.
+	repaint := r.force_repaint
+	if repaint {
+		// After the prologue below the terminal is provably blank, at the
+		// default SGR, cursor home. Making the model say the same thing is what
+		// re-synchronises the two.
+		screen_blank(prev)
+		r.emit_x, r.emit_y = 0, 0
+		r.emit_style       = 0
+		r.force_repaint    = false
+	}
+
+	// cur_s starts as what is on screen and has this frame applied to it, in
+	// exactly the operations .Full_Screen's bytes stand for. Starting from the
+	// PREVIOUS state rather than from blank is not an optimisation: the repaint
+	// does not rewrite every cell in every case (a line flush with the right
+	// margin emits no \e[K; a frame that fills the viewport emits no trailing
+	// \e[J), so "what is on screen afterwards" genuinely depends on what was on
+	// screen before.
+	screen_copy(cur_s, prev)
+	rows, ok := paint_frame(nil, cur_s, &r.sgr_scratch, lines, cur, r.term_width, r.term_height)
+	r.last_rows = rows
+
+	if !ok {
+		// The style table overflowed (STYLE_TABLE_MAX). Interning any further
+		// style would have to alias it onto an existing index, which would make
+		// two visibly different cells compare equal -- a silent wrong screen,
+		// the exact failure mode this whole design exists to avoid. Drop the
+		// table, force a repaint, and redo the frame from scratch. `allow_retry`
+		// bounds this at one: a single frame containing more than
+		// STYLE_TABLE_MAX distinct styles would otherwise recurse forever.
+		if allow_retry {
+			diff_styles_reset(r)
+			render_diff(r, lines, cur, allow_retry = false)
+			return
+		}
+	}
+
+	// The cursor the frame asks for, in terminal terms. min(): the model allows
+	// x == cols (DECAWM pending wrap), which is a state no absolute move can
+	// reproduce -- and does not need to be, since the next frame's first write
+	// always issues its own absolute move. See the oracle's cursor comparison.
+	tx := min(cur_s.x, r.term_width - 1)
+	ty := cur_s.y
+
+	// WHETHER THIS FRAME WRITES ANYTHING AT ALL, decided before a byte is
+	// emitted -- because the DECTCEM pair has to go OUTSIDE the painting, and a
+	// hide/show around zero painting would cost 12 bytes on an identical frame.
+	changed := repaint || (tx != r.emit_x) || (ty != r.emit_y) || screens_differ(prev, cur_s)
+
+	hide := cur.show && changed
+	if hide {
+		// ARMED BEFORE THE BYTES CAN LEAVE, exactly as renderer_render does.
+		cursor_hide_arm()
+		strings.write_string(r.out, CURSOR_HIDE)
+	}
+
+	if repaint {
+		// SGR first: \e[2J erases with the ACTIVE background, so clearing under
+		// an unknown (or coloured) style would paint the screen that colour.
+		strings.write_string(r.out, SGR_RESET)
+		strings.write_string(r.out, HOME)
+		strings.write_string(r.out, ED2)
+	}
+
+	for y in 0 ..< cur_s.rows { emit_row(r, y, prev, cur_s) }
+
+	when DIFF_FAULT != "no_cursor" {
+		// UNCONDITIONAL, and cheap: diff_move writes nothing when the cursor is
+		// already there, which on an identical frame it always is. This is the
+		// only thing that keeps the cursor in step with what the repaint would
+		// have left behind even when the app declares no cursor at all -- the
+		// repaint parks it after its trailing \e[J, and "the same screen" is not
+		// the same screen if the caret is somewhere else.
+		diff_move(r, tx, ty)
+	}
+
+	if hide { strings.write_string(r.out, CURSOR_SHOW) }
+
+	// The frame just painted IS the screen now.
+	r.front = 1 - r.front
+	}
+}
+
+// Allocates (or re-allocates) the two grids for the current size. Any size
+// change discards both and forces a repaint: every cell's position, and whether
+// it exists at all, is a function of the viewport.
+@(private = "file")
+diff_grid_ensure :: proc(r: ^Renderer) {
+	w, h := r.term_width, r.term_height
+	if r.grid_ready && r.screens[0].cols == w && r.screens[0].rows == h { return }
+	if !r.grid_ready {
+		style_table_init(&r.styles)
+		r.grid_ready = true
+	}
+	screen_init(&r.screens[0], w, h, &r.styles)
+	screen_init(&r.screens[1], w, h, &r.styles)
+	resize(&r.dirty, w)
+	r.front         = 0
+	r.force_repaint = true
+}
+
+@(private = "file")
+diff_styles_reset :: proc(r: ^Renderer) {
+	style_table_destroy(&r.styles)
+	style_table_init(&r.styles)
+	screen_blank(&r.screens[0])
+	screen_blank(&r.screens[1])
+	r.force_repaint = true
+}
+
+@(private = "file")
+screens_differ :: proc(a, b: ^Screen) -> bool {
+	for i in 0 ..< len(b.cells) {
+		if !cell_eq(a, a.cells[i], b, b.cells[i]) { return true }
+	}
+	return false
+}
+
+// Moves the terminal's cursor to (x, y), 0-based, writing nothing if it is
+// already there. THE ONLY PLACE r.emit_x/emit_y are advanced by a move.
+//
+// \r for column 0 (1 byte) beats CHA (4+); CHA for any other column on the
+// CURRENT row beats CUP; CUP for a row change. No CUU/CUD/CUF/CUB: they save at
+// most a byte or two over CHA and each one is a separate chance to be off by
+// one against a terminal's own clamping. This is the "start with CUP + writes +
+// EL and measure" the brief asks for, and the measurements are in the report --
+// the remaining repertoire buys single-digit percentages against a baseline
+// that is already ~99% smaller than a repaint.
+@(private = "file")
+diff_move :: proc(r: ^Renderer, x, y: int) {
+	if r.emit_y == y && r.emit_x == x { return }
+	if r.emit_y == y {
+		if x == 0 {
+			// CR also clears a pending wrap, which is the state emit_x == cols
+			// records -- so this is correct there too, not merely cheap.
+			strings.write_string(r.out, "\r")
+		} else {
+			write_csi(r.out, x + 1, "G")   // CHA is 1-based
+		}
+	} else {
+		write_cup(r.out, y + 1, x + 1)
+	}
+	r.emit_x, r.emit_y = x, y
+}
+
+// Brings the terminal's SGR to style `s`, writing nothing if it is already
+// there.
+//
+// ALWAYS VIA THE DEFAULT. A style is stored as the bytes accumulated since the
+// last reset (see Style_Table), so applying it to a DEFAULT terminal reproduces
+// it exactly -- and applying it to some other style does not. Hence: reset
+// first unless we are already at the default. Costs 4 bytes per style
+// transition and removes an entire class of "the leftover attribute from three
+// cells ago is still on" bugs.
+@(private = "file")
+diff_style :: proc(r: ^Renderer, s: u16) {
+	when DIFF_FAULT == "drop_style" {
+		// INJECTED FAULT: the emitter never re-establishes a cell's style.
+		return
+	} else {
+	if r.emit_style == s { return }
+	if r.emit_style != 0 { strings.write_string(r.out, SGR_RESET) }
+	if s != 0 { strings.write_string(r.out, style_bytes(&r.styles, s)) }
+	r.emit_style = s
+	}
+}
+
+// Emits whatever it takes to turn row `y` of `prev` into row `y` of `cur`.
+// Writes NOTHING when the row is unchanged -- the property the whole mode
+// exists for.
+@(private = "file")
+emit_row :: proc(r: ^Renderer, y: int, prev, cur: ^Screen) {
+	cols := cur.cols
+	base := y * cols
+
+	any_dirty := false
+	for x in 0 ..< cols {
+		d := !cell_eq(prev, prev.cells[base + x], cur, cur.cells[base + x])
+		r.dirty[x] = d
+		if d { any_dirty = true }
+	}
+	if !any_dirty { return }
+
+	// THE WIDE-CELL INVARIANT, and the one place it is enforced.
+	//
+	// A wide cluster owns TWO columns and is a single, indivisible write. Two
+	// separate hazards, both of which this expansion closes:
+	//
+	//   * Writing the head. It consumes both columns, so the second column is
+	//     rewritten whether the diff intended it or not -- it must therefore be
+	//     part of the region the diff is responsible for, or the emitter's idea
+	//     of the cursor's column goes wrong immediately after it.
+	//   * OVERWRITING a wide cluster that was already there. Painting a narrow
+	//     cell over the LEFT half leaves the right half in a state the standards
+	//     do not fix (xterm blanks both; others leave a stray half-glyph). The
+	//     only portable answer is to repaint BOTH columns explicitly, so that
+	//     whatever the terminal did with the first write is overwritten by the
+	//     second. Painting over the RIGHT half is the mirror image and needs the
+	//     head repainted for the same reason.
+	//
+	// Hence: any dirty column drags in the other half of its pair, in EITHER
+	// frame, to a fixpoint (a single pass can only propagate one step, and a
+	// newly-dirtied column can itself be half of a pair in the other frame).
+	//
+	// AND IT IS, TODAY, PROVABLY INERT -- measured, not assumed. Removing it
+	// (DIFF_FAULT=no_pair_expand) changes not one byte of output across the
+	// whole fuzz corpus and every hand-written wide-cell test. The reason is a
+	// global invariant the model happens to maintain: a continuation cell exists
+	// if and only if the cell to its left is a wide head, and both are written
+	// by the same screen_put with the same style -- so the two halves can never
+	// differ from the previous frame independently, and the "one half dirty,
+	// the other clean" state this loop exists to fix is unreachable.
+	//
+	// IT STAYS ANYWAY, for two reasons worth writing down rather than deleting
+	// six lines over. That invariant is global (it depends on every erase and
+	// every write in screen.odin agreeing about pairs), while this loop makes
+	// the emitter's wide-cell correctness LOCAL -- true by inspection of this
+	// proc alone. And the hazard it names is real on real hardware even when the
+	// model cannot express it: no cell model represents what an actual xterm
+	// does to the far half of a wide glyph when you write over the near one, so
+	// "always repaint both halves" is the only rule that does not depend on
+	// which terminal is on the other end of the socket.
+	when DIFF_FAULT != "no_pair_expand" {
+	for {
+		grew := false
+		for x in 0 ..< cols {
+			if !r.dirty[x] { continue }
+			if x + 1 < cols {
+				if (cur.cells[base + x].width == 2 || prev.cells[base + x].width == 2) && !r.dirty[x + 1] {
+					r.dirty[x + 1] = true
+					grew = true
+				}
+			}
+			if x > 0 {
+				if (cur.cells[base + x].width == 0 || prev.cells[base + x].width == 0) && !r.dirty[x - 1] {
+					r.dirty[x - 1] = true
+					grew = true
+				}
+			}
+		}
+		if !grew { break }
+	}
+	}
+
+	first := 0
+	for !r.dirty[first] { first += 1 }
+	last := cols - 1
+	for !r.dirty[last] { last -= 1 }
+
+	// \e[K OPPORTUNITY. `tail` is the leftmost column from which this frame's
+	// row is blank-at-the-default-style all the way to the right margin -- which
+	// is exactly the state \e[K leaves behind, provided the SGR is default when
+	// it runs (\e[K erases with the ACTIVE background). A non-default blank tail
+	// is deliberately NOT eligible: whether an erase records underline, strike
+	// or only the background is terminal-dependent, so those cells are written
+	// as real spaces instead. That is the "if you scope styling down, say what
+	// you did" line, and this is the one place it is scoped down.
+	tail := cols
+	for tail > 0 {
+		c := cur.cells[base + tail - 1]
+		if c.len != 0 || c.width != 1 || c.style != 0 { break }
+		tail -= 1
+	}
+	use_el := false
+	el_at  := 0
+	if tail <= last {
+		// Erasing from before the first change is harmless (those cells already
+		// hold what \e[K would leave) but pointless, so start no earlier.
+		el_at = max(tail, first)
+		if last - el_at + 1 >= EL_MIN_RUN { use_el = true }
+	}
+	write_end := last
+	if use_el { write_end = el_at - 1 }
+
+	x := first
+	for x <= write_end {
+		if !r.dirty[x] {
+			// A run of cells that did not change. Hop over it if that is
+			// cheaper than rewriting it -- and ALWAYS hop if it contains any
+			// part of a wide cluster, because "rewriting an unchanged cell" is
+			// only a no-op for a cell that owns exactly one column.
+			j := x
+			for j <= write_end && !r.dirty[j] { j += 1 }
+			narrow := true
+			for k in x ..< j {
+				if cur.cells[base + k].width != 1 { narrow = false; break }
+			}
+			if !narrow || j - x > GAP_MERGE_MAX {
+				x = j
+				continue
+			}
+		}
+		c := cur.cells[base + x]
+		if c.width == 0 {
+			// The right half of a wide cluster. Its head was dirty too (the
+			// expansion above guarantees it) and painting the head already
+			// covered this column.
+			x += 1
+			continue
+		}
+		when DIFF_FAULT == "skip_cell" {
+			// INJECTED FAULT: the last changed cell of the row is never sent.
+			if x == last { x += max(int(c.width), 1); continue }
+		}
+		diff_move(r, x, y)
+		diff_style(r, c.style)
+		if c.len == 0 {
+			// A blank is painted as a space. Indistinguishable on screen, and
+			// the model normalises the two (see put_cell), so this cannot make
+			// the next frame think the cell changed.
+			strings.write_string(r.out, " ")
+		} else {
+			strings.write_string(r.out, cell_bytes(cur, c))
+		}
+		when DIFF_FAULT == "narrow_wide" {
+			// INJECTED FAULT: a wide cluster is treated as one column wide.
+			r.emit_x = min(x + 1, cols)
+		} else {
+			r.emit_x = min(x + int(c.width), cols)
+		}
+		x += max(int(c.width), 1)
+	}
+
+	if use_el {
+		diff_move(r, el_at, y)
+		diff_style(r, 0)
+		strings.write_string(r.out, EL)
+		// \e[K does not move the cursor.
 	}
 }
 
@@ -518,6 +1134,26 @@ render_inline :: proc(r: ^Renderer, lines: []string, cur: Cursor) {
 // Tears the current frame down completely: after this the Renderer believes
 // nothing is on screen, and the next renderer_render starts from scratch.
 renderer_clear :: proc(r: ^Renderer) {
+	if r.mode == .Diff {
+		// Same bytes .Full_Screen writes, plus an SGR reset when one is needed:
+		// \e[J erases with the ACTIVE background, and this mode is the only one
+		// that can knowingly be sitting in a non-default style.
+		if r.emit_style != 0 {
+			strings.write_string(r.out, SGR_RESET)
+			r.emit_style = 0
+		}
+		strings.write_string(r.out, HOME)
+		strings.write_string(r.out, ED)
+		// The model must say what the terminal now is: blank, cursor home.
+		if r.grid_ready {
+			screen_blank(&r.screens[0])
+			screen_blank(&r.screens[1])
+		}
+		r.emit_x, r.emit_y = 0, 0
+		r.last_rows = 0
+		return
+	}
+
 	if r.mode == .Full_Screen {
 		// Home and erase to the end of the screen. No rewind and no walk home:
 		// this mode parks nothing (cursor_up is always 0) and owns the whole

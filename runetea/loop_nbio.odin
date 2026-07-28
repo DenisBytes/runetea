@@ -87,6 +87,12 @@ run_nbio :: proc(p: ^Program($T), fd: posix.FD, out: ^strings.Builder, flush_fd:
 		if w, h, ok := term_size(flush_fd); ok { initial_w, initial_h = w, h }
 	}
 	renderer_init(&r, out, initial_w, initial_h, p.render_mode)
+	// T3-A: .Diff allocates two cell grids on its first sized frame; the
+	// other two modes allocate nothing and this is a no-op for them. Deferred
+	// right at construction so no early return -- and there are several, on
+	// every panic path -- can skip it. tools/test.sh's leak audit is the gate
+	// that would catch it if one did.
+	defer renderer_destroy(&r)
 
 	// Initial paint, then the init Cmd -- identical to run(), and for the
 	// same reason: an app whose first action is asynchronous must still show

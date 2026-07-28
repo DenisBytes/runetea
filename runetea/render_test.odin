@@ -31,8 +31,14 @@ test_second_render_rewinds_previous_lines :: proc(t: ^testing.T) {
 test_identical_frame_costs_a_full_repaint :: proc(t: ^testing.T) {
 	// Documents the naive renderer's defining weakness with an exact byte
 	// expectation, not a >0 smoke check: an unchanged single-line frame still
-	// costs rewind + full content. T3's diff renderer must reduce this to 0
-	// bytes, and this test is what will prove it changed.
+	// costs rewind + full content.
+	//
+	// T3-A DID NOT CHANGE THIS, and must not: .Inline is still the rewind
+	// renderer and still costs 14 bytes here. The 0-byte answer lives in the
+	// third mode -- see test_diff_identical_frame_costs_zero_bytes in
+	// diff_oracle_test.odin, which pins the same frame at 0 bytes through
+	// .Diff. Both are true at once, which is the whole point of adding a mode
+	// rather than rewriting one.
 	b := strings.builder_make(); defer strings.builder_destroy(&b)
 	r: Renderer
 	renderer_init(&r, &b)

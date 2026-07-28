@@ -305,6 +305,12 @@ run :: proc(p: ^Program($T), src: ^Input_Source, out: ^strings.Builder, flush_fd
 		if w, h, ok := term_size(flush_fd); ok { initial_w, initial_h = w, h }
 	}
 	renderer_init(&r, out, initial_w, initial_h, p.render_mode)
+	// T3-A: .Diff allocates two cell grids on its first sized frame; the
+	// other two modes allocate nothing and this is a no-op for them. Deferred
+	// right at construction so no early return -- and there are several, on
+	// every panic path -- can skip it. tools/test.sh's leak audit is the gate
+	// that would catch it if one did.
+	defer renderer_destroy(&r)
 
 	// Initial paint, then the init Cmd -- in that order, so an app whose first
 	// action is asynchronous still shows its loading state immediately.
