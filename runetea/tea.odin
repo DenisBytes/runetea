@@ -116,6 +116,22 @@ Program :: struct($T: typeid) {
 	// (logical line index + DISPLAY column), not the terminal's -- see Cursor.
 	cursor:   proc(model: T, alloc: mem.Allocator) -> Cursor,
 
+	// OPTIONAL (T2-C). Which renderer this program wants. .Inline is the ZERO
+	// VALUE -- and what program_init leaves it as -- so every program written
+	// before T2-C keeps the rewind renderer with nothing said and renders byte
+	// for byte as it did. Set it directly on either side of the program_init
+	// call, exactly like `cursor` and `legacy` above.
+	//
+	// Read ONCE, at renderer construction, by run() and run_nbio(); changing it
+	// mid-session does nothing (see renderer_init on why the mode is fixed at
+	// construction).
+	//
+	// THIS DOES NOT ENTER THE ALTERNATE SCREEN. The two are separate opt-ins on
+	// purpose -- this one picks a renderer, term_enter_raw's `alt` picks a
+	// terminal buffer -- and an application that wants the usual full-screen
+	// experience asks for both. See term_enter_raw for why they are not coupled.
+	render_mode: Render_Mode,
+
 	init_cmd: Cmd,
 	quit:     bool,
 	// Which side of each legacy C0 collision this program wants (see
@@ -275,11 +291,20 @@ run :: proc(p: ^Program($T), src: ^Input_Source, out: ^strings.Builder, flush_fd
 	// rows_for_line in width.odin for why that is deliberate, not a gap. A
 	// failed ioctl (term_size ok=false, e.g. a pty with no size ever set)
 	// degrades the same way: initial_w stays 0.
+	//
+	// THE HEIGHT USED TO BE DISCARDED HERE (`if w, _, ok := ...`). term_size has
+	// always returned it; T2-C's full-screen renderer is the first thing that
+	// needs it, and it needs it from the very first frame -- a Window_Size_Msg
+	// only arrives on a SIGWINCH, so a program that is never resized would
+	// otherwise run its whole life with an unknown height. Same degradation
+	// rules as the width: no fd, or a failed ioctl, leaves it 0 == unknown,
+	// which the full-screen renderer reads as "do not truncate".
 	initial_w := 0
+	initial_h := 0
 	if flush_fd >= 0 {
-		if w, _, ok := term_size(flush_fd); ok { initial_w = w }
+		if w, h, ok := term_size(flush_fd); ok { initial_w, initial_h = w, h }
 	}
-	renderer_init(&r, out, initial_w)
+	renderer_init(&r, out, initial_w, initial_h, p.render_mode)
 
 	// Initial paint, then the init Cmd -- in that order, so an app whose first
 	// action is asynchronous still shows its loading state immediately.
@@ -496,8 +521,16 @@ apply :: proc(p: ^Program($T), msg: any, fa: ^Frame_Arena, disp: ^Dispatcher, r:
 	// own layout. ws.w == 0 is signals.odin's own "term_size lookup failed"
 	// sentinel (SIGWINCH fired but the ioctl came back empty) -- ignored here
 	// so a bad lookup can't clobber a previously-known-good width.
-	if ws, is_resize := msg.(Window_Size_Msg); is_resize && ws.w > 0 {
-		renderer_set_width(r, ws.w)
+	//
+	// T2-C: the HEIGHT is applied here too, and guarded separately rather than
+	// under the same `ws.w > 0` test. signals.odin's failure sentinel sets BOTH
+	// to 0, so in practice they move together -- but they are two independent
+	// pieces of state on the Renderer, and one guard covering both would mean a
+	// future partial-failure mode silently clobbering the good half of a
+	// previously-known-good size.
+	if ws, is_resize := msg.(Window_Size_Msg); is_resize {
+		if ws.w > 0 { renderer_set_width(r, ws.w) }
+		if ws.h > 0 { renderer_set_height(r, ws.h) }
 	}
 
 	// THE MODEL IS PASSED BY POINTER -- update mutates p.model IN PLACE.

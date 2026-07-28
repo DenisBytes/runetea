@@ -55,6 +55,14 @@ Term_State :: struct {
 	// T2-B. Same guarded-flag shape as paste_active, same DECSET/DECRST hazard
 	// class -- see term_restore_c.
 	focus_active:  bool,
+	// T2-C. The alternate screen buffer. Same guarded-flag SHAPE as the three
+	// above and the same DECSET/DECRST hazard class -- but the consequence of a
+	// MISSED reset is the most severe of the five, which is why it sits third in
+	// term_restore_c's worst-first ordering rather than down with paste. See
+	// term_restore_c's ALTERNATE SCREEN note for both directions of the hazard:
+	// what a missed `l` costs the user, and what an unpaired `l` (one written by
+	// a process that never wrote the `h`) does to a terminal.
+	alt_active:    bool,
 }
 
 // Which mouse events the terminal should report. SELECTABLE rather than
@@ -134,6 +142,29 @@ FOCUS_ON:  string : "\e[?1004h"
 @(private="file")
 FOCUS_OFF: string : "\e[?1004l"
 
+// DECSET/DECRST 1049 -- the ALTERNATE SCREEN BUFFER (T2-C). Static for the same
+// reason every OFF string above is: ALT_OFF is written from a signal handler,
+// where write(2) is safe and fmt/the allocator are not.
+//
+// 1049 AND NOT 47 OR 1047: `?1049h` saves the cursor, switches to the alternate
+// buffer AND clears it, in one atomic mode set, and `?1049l` clears the alt
+// buffer, switches back and restores the saved cursor. The older 47/1047 do not
+// save the cursor at all (the caller has to bracket them with DECSC/DECRC), and
+// 1047 famously does not clear on entry -- meaning the previous alt-screen
+// tenant's contents would show through the first frame. 1049 is what every
+// terminal emulator written this century implements and what every TUI uses.
+//
+// NOTE WHAT THIS PAIR IS AND IS NOT. It is DECSET/DECRST -- a boolean mode, no
+// stack, no depth, exactly like paste/mouse/focus and not at all like Kitty's
+// push/pop. But `?1049h` has a SIDE EFFECT the other three do not: it saves a
+// cursor position that `?1049l` later restores. That is what makes an UNPAIRED
+// `?1049l` actively wrong rather than a no-op, and it is the whole reason
+// alt_active exists -- see term_restore_c.
+@(private="file")
+ALT_ON:  string : "\e[?1049h"
+@(private="file")
+ALT_OFF: string : "\e[?1049l"
+
 // Builds "CSI > <flags> u" (push) followed by "CSI ? u" (query) into `buf`,
 // returning the filled prefix. Hand-formatted rather than fmt.bprintf'd: this
 // runs while the tty is already raw and half-configured, and the whole
@@ -160,19 +191,31 @@ kitty_push_seq :: proc(kb: Kitty_Flags, buf: []u8) -> []u8 {
 // nothing is written, nothing is pushed, and the paired teardown in
 // term_restore_c stays a no-op. `paste` defaults to false and means the same
 // thing for bracketed paste; `mouse` defaults to .None and `focus` to false
-// (T2-B) and mean the same thing again. Opting in is the application's call,
-// not the framework's -- unlike Bubble Tea, run() does not own the terminal
-// here (the app calls term_enter_raw itself, and the golden tests drive run()
-// with a plain pipe), so the layer that entered raw mode is the layer that gets
-// to decide, and a terminal that never opted in must see zero sequences of any
-// kind. All four are trailing defaulted parameters so that every call site
-// written before they existed keeps compiling and keeps behaving identically.
+// (T2-B) and `alt` to false (T2-C) and mean the same thing again. Opting in is
+// the application's call, not the framework's -- unlike Bubble Tea, run() does
+// not own the terminal here (the app calls term_enter_raw itself, and the golden
+// tests drive run() with a plain pipe), so the layer that entered raw mode is the
+// layer that gets to decide, and a terminal that never opted in must see zero
+// sequences of any kind. All five are trailing defaulted parameters so that every
+// call site written before they existed keeps compiling and keeps behaving
+// identically.
+//
+// `alt` is the terminal half of render.odin's Render_Mode.Full_Screen, and the
+// two are deliberately INDEPENDENT: entering the alt screen without a
+// full-screen renderer is legal (an inline renderer would simply rewind inside
+// the alt buffer), and a full-screen renderer without the alt screen is legal
+// too (it repaints over the shell's output and clears below itself). Coupling
+// them would mean this file knowing about the renderer, and would take the
+// choice away from an application that has a reason to want one and not the
+// other. Nothing in this package writes `?1049h` anywhere else, so this
+// parameter is the ONE place the alt screen can be entered from.
 term_enter_raw :: proc(
 	fd:     posix.FD,
 	kb:     Kitty_Flags = {},
 	paste:  bool        = false,
 	mouse:  Mouse_Mode  = .None,
 	focus:  bool        = false,
+	alt:    bool        = false,
 ) -> bool {
 	if posix.tcgetattr(fd, &g_term.saved) != .OK { return false }
 
@@ -223,6 +266,7 @@ term_enter_raw :: proc(
 	if paste           { paste_enable(fd) }
 	if mouse != .None  { mouse_enable(fd, mouse) }
 	if focus           { focus_enable(fd) }
+	if alt             { alt_enable(fd) }
 	return true
 }
 
@@ -344,6 +388,37 @@ focus_enable :: proc(fd: posix.FD) {
 	}
 }
 
+// `CSI ? 1049 h`. Ordering invariant identical in SHAPE to the four enables
+// above -- alt_active goes true BEFORE the write -- but the two sides of that
+// trade are not symmetric here, and it is worth being precise about which way
+// they lean.
+//
+// Flag-before-write means a crash signal landing between the two writes an
+// `?1049l` for an `h` that may never have landed. On an xterm-family terminal
+// that restores a cursor position that was never saved: one jump of the cursor,
+// on a screen the user is about to get a shell prompt on anyway. Flag-after-
+// write would leave the opposite window, in which the `h` HAS landed and the
+// restore no-ops: the user is left inside the alternate screen with their
+// terminal's entire scrollback inaccessible and no way out but `reset`. That is
+// permanent and it is the worst outcome this file can produce, so the same
+// "assume set whenever it is not certain we did not" direction every other
+// enable takes is, if anything, more strongly justified here than anywhere else.
+//
+// A short write is not a case worth splitting (as it is for the Kitty push,
+// which is two independent sequences): this is one eight-byte sequence, so a
+// partial write leaves the terminal mid-sequence either way.
+@(private="file")
+alt_enable :: proc(fd: posix.FD) {
+	g_term.alt_active = true
+	if posix.write(fd, raw_data(ALT_ON), len(ALT_ON)) <= 0 {
+		// Nothing went out at all (EIO once the far end is gone), so the terminal
+		// never switched buffers and never saved a cursor -- there is genuinely
+		// nothing for restore to undo, and writing `?1049l` anyway would be the
+		// unpaired reset term_restore_c's own comment warns about.
+		g_term.alt_active = false
+	}
+}
+
 // DECTCEM show. Static, and written from a signal handler, for exactly the
 // reasons KITTY_POP and PASTE_OFF are static (write(2) is async-signal-safe,
 // fmt and the allocator are not). Deliberately NOT paired here with a
@@ -457,23 +532,67 @@ term_restore :: proc() {
 // unconditionally (which is what ultraviolet's MouseModeNone does) would turn
 // off modes this process never set -- the same rule, broken.
 //
-// ORDERING: termios FIRST, then the keyboard pop, then the mouse reset, then
-// the focus reset, then the cursor show, then the paste reset. The six are
-// independent layers (kernel line discipline vs five separate pieces of
-// terminal-emulator state) so none depends on another, which leaves two
-// tie-breakers, and both point the same way. (1) This runs from a crash
-// handler; the only thing that can stop it half-way is a SECOND fatal signal,
-// so restorations go WORST-FIRST:
+// THE ALTERNATE SCREEN IS DECSET/DECRST TOO (T2-C), so the pairing hazard is
+// again the mild one and not the Kitty one -- `?1049h`/`l` is a boolean mode
+// with no stack and no depth, and resetting it twice is a genuine no-op. But
+// this is the one of the five where BOTH directions of getting it wrong are
+// severe, which is why it is the only one whose guard is argued in both
+// directions here:
+//
+//   MISSING THE RESET is the worst single outcome in this proc after raw mode
+//   itself. The user is left inside the alternate buffer: their shell prompt
+//   draws over the dead TUI's last frame, their scrollback is gone (the alt
+//   buffer has none, and the primary buffer's is inaccessible until they leave),
+//   and the entire session that preceded the program is invisible. Nothing is
+//   mistyped and nothing is mis-reported -- they simply cannot see their own
+//   terminal, and the only way back is to blind-type `reset`.
+//
+//   AN UNPAIRED RESET is actively wrong output, not a no-op, and this is the
+//   warning the last paragraph of this comment has carried since FIX 5.
+//   `?1049h` does not merely switch buffers: it SAVES THE CURSOR POSITION, which
+//   `?1049l` later restores. A process that never wrote the `h` and writes the
+//   `l` anyway makes the terminal restore a position nobody ever saved -- the
+//   cursor jumps to wherever some earlier program's DECSC happened to leave it,
+//   in the middle of output that is still being written.
+//
+// What changed since that warning was written is exactly one thing, and it is
+// the thing the warning was waiting for: SOMETHING NOW ENTERS THE ALT SCREEN.
+// `alt_active` is true if and only if this process wrote the `h` that performed
+// the save, so the `l` below is only ever written against a save it is genuinely
+// paired with -- which is what turns the old unconditional write (an alt-screen
+// exit the framework never entered) into a correct one. The rule did not change;
+// the write finally satisfies it.
+//
+// ORDERING: termios FIRST, then the keyboard pop, then the ALT-SCREEN LEAVE,
+// then the mouse reset, then the focus reset, then the cursor show, then the
+// paste reset. The seven are independent layers (kernel line discipline vs six
+// separate pieces of terminal-emulator state) so none depends on another, which
+// leaves two tie-breakers, and both point the same way. (1) This runs from a
+// crash handler; the only thing that can stop it half-way is a SECOND fatal
+// signal, so restorations go WORST-FIRST:
 //   - a tty stranded in RAW MODE has no echo, no line editing and no Ctrl+C --
 //     the user must blind-type `reset`;
 //   - a tty stranded with an extra KEYBOARD-STACK entry still echoes and still
-//     line-edits, but it can mis-report EVERY subsequent keystroke to the shell;
+//     line-edits, but it can mis-report EVERY subsequent keystroke to the shell.
+//     Above the alt screen deliberately: this one corrupts what the shell
+//     RECEIVES, so it can make even the recovery command untypable, while the
+//     alt screen leaves input perfectly intact;
+//   - a tty stranded in the ALTERNATE SCREEN echoes and reports everything
+//     correctly, but costs the user their entire visible terminal: no
+//     scrollback, no history of the session, a shell prompt drawn over a dead
+//     TUI, and no way back but `reset`. That is a total, persistent loss of
+//     CONTEXT rather than intermittent noise, which is why T2-C put it ABOVE
+//     mouse -- and above the cursor show too, so that the show lands on the
+//     PRIMARY screen the user is actually looking at rather than on a buffer
+//     that is about to be discarded;
 //   - a tty stranded with MOUSE REPORTING on injects escape-sequence garbage
 //     into the shell's command line on every click and every scroll flick (and,
 //     under 1003, on every pointer movement across the window). That is the
 //     same class of damage as the keyboard mis-report -- input the user did not
 //     type -- and it fires constantly rather than only when a key is pressed,
-//     which is why T2-B put it ABOVE the cursor rather than next to paste;
+//     which is why T2-B put it ABOVE the cursor rather than next to paste. It
+//     stays BELOW the alt screen because the user can see every character of it
+//     and delete it;
 //   - a tty stranded with FOCUS REPORTING on does the same thing, injecting
 //     "\e[I"/"\e[O" into the command line, but only when the user switches
 //     windows -- the same kind of damage at a far lower rate;
@@ -482,10 +601,10 @@ term_restore :: proc() {
 //     disorienting on every subsequent command, though nothing is mistyped;
 //   - a tty stranded in BRACKETED-PASTE mode reports every keystroke correctly
 //     and only wraps PASTES in literal "[200~"/"[201~" -- annoying, and
-//     invisible until the user next pastes, the smallest of the six.
+//     invisible until the user next pastes, the smallest of the seven.
 // (2) tcsetattr cannot block, write CAN (a full tty output queue), and blocking
 // mid-crash before the line discipline is back would be the worst of both.
-// Writing the five sequences after the TCSAFLUSH also means none is at risk
+// Writing the six sequences after the TCSAFLUSH also means none is at risk
 // from that flush.
 //
 // The write targets a real tty by construction -- kitty_active can only be
@@ -496,20 +615,22 @@ term_restore :: proc() {
 // not moved (FIX 5, final fix-wave report). This used to unconditionally write
 // "\e[?1049l\e[?25h" -- leave alt screen, show cursor -- on every exit path,
 // while nothing in this package or its examples ever wrote the corresponding
-// ENTRY sequences: render.odin is a naive INLINE rewind renderer (cursor-up +
-// erase-line, see renderer_render), not an alt-screen renderer. That
-// unconditional write was an alt-screen EXIT the framework never entered: on
-// xterm-family terminals an unpaired "\e[?1049l" restores a cursor position
-// that was never saved, which is actively wrong output, not merely a harmless
-// no-op. The rule it was replaced with -- undo only what was actually set --
-// is what the flags below enforce, and it is why the cursor show returned only
-// now, with a flag behind it: T2-A gave render.odin a real "\e[?25l" to pair
-// with (Cursor / renderer_render), so the restore grew by EXACTLY that and
-// nothing more. Alt screen is still not entered anywhere, so "\e[?1049l" is
-// still not written anywhere. T3 may change that; if it does, it must arrive
-// with its own flag, set where the entry sequence is actually emitted.
+// ENTRY sequences: render.odin was a naive INLINE rewind renderer (cursor-up +
+// erase-line, see renderer_render) and nothing else. That unconditional write
+// was an alt-screen EXIT the framework never entered: on xterm-family terminals
+// an unpaired "\e[?1049l" restores a cursor position that was never saved,
+// which is actively wrong output, not merely a harmless no-op. The rule it was
+// replaced with -- undo only what was actually set -- is what the flags below
+// enforce, and it is why each write returned only when something real paired
+// with it: T2-A gave render.odin a "\e[?25l" (Cursor / renderer_render), T2-B
+// gave the mouse and focus enables theirs, and T2-C has now given "\e[?1049l"
+// its "\e[?1049h" (term_enter_raw's `alt`, render.odin's
+// Render_Mode.Full_Screen). Each time the restore grew by EXACTLY that and
+// nothing more, each time behind its own flag set where the entry sequence is
+// actually emitted. Nothing else is written here, and nothing should be added
+// without the same pairing.
 //
-// The six flags are checked INDEPENDENTLY rather than nested under one
+// The seven flags are checked INDEPENDENTLY rather than nested under one
 // early return, so that no restoration can ever be skipped because of
 // another's state.
 term_restore_c :: proc "c" () {
@@ -520,6 +641,10 @@ term_restore_c :: proc "c" () {
 	if g_term.kitty_active {
 		posix.write(g_term.fd, raw_data(KITTY_POP), len(KITTY_POP))
 		g_term.kitty_active = false
+	}
+	if g_term.alt_active {
+		posix.write(g_term.fd, raw_data(ALT_OFF), len(ALT_OFF))
+		g_term.alt_active = false
 	}
 	if g_term.mouse_mode != .None {
 		// A switch over static strings, not a formatted sequence: this is signal

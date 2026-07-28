@@ -83,16 +83,27 @@ main :: proc() {
 	// `mouse = .Normal` is DECSET 1000 (press and release) plus DECSET 1006 (SGR
 	// extended coordinates, which term_enter_raw always pairs with a tracking
 	// mode -- the legacy encoding cannot express a column past 223). .Normal and
-	// not .Button_Event or .Any_Event because this editor binds only the WHEEL
-	// (ed.apply_mouse explains why it does not bind click-to-position), and
-	// wheel notches are reported in every tracking mode: asking for drag or
-	// all-motion would flood the reader with reports nothing here consumes.
+	// not .Button_Event or .Any_Event because this editor binds the WHEEL and a
+	// LEFT PRESS (T2-C's click-to-position, see ed.apply_mouse) and nothing else:
+	// both are reported in every tracking mode, so asking for drag or all-motion
+	// would flood the reader with reports nothing here consumes.
 	//
 	// Focus reporting (DECSET 1004) is NOT enabled: nothing in this example
 	// reacts to Focus_Msg/Blur_Msg, and enabling a mode with no handler behind
 	// it is exactly the "write nothing you did not need" rule term_enter_raw's
 	// defaults exist to make easy.
-	if !rt.term_enter_raw(fd, {.Disambiguate}, true, .Normal) { fmt.eprintln("not a tty"); os.exit(1) }
+	//
+	// `alt = true` is DECSET 1049, the ALTERNATE SCREEN BUFFER (T2-C) -- the
+	// terminal half of the full-screen renderer selected below. It gives this
+	// program a cleared buffer of its own and, on exit, hands the user back their
+	// shell exactly as they left it: scrollback intact, this editor's frames
+	// gone. The matching `?1049l` is written by rt.term_restore() below and by
+	// the crash-signal path, exactly once between them -- which matters more here
+	// than for any of the other opt-ins, because a program that dies without it
+	// leaves the user unable to see their own terminal at all.
+	if !rt.term_enter_raw(fd, {.Disambiguate}, true, .Normal, false, true) {
+		fmt.eprintln("not a tty"); os.exit(1)
+	}
 	defer rt.term_restore()
 
 	src, ok := rt.input_source_from_fd(fd)
@@ -109,6 +120,27 @@ main :: proc() {
 	// one that actually needs a caret pays for one. This replaces the literal
 	// '|' this editor used to paint into its own text; see ed.cursor.
 	p.cursor = ed.cursor
+	// T2-C. The FULL-SCREEN renderer: every frame homes to the top-left cell and
+	// repaints from there, instead of rewinding over the previous one. Two things
+	// follow, and this example needs both. The frame has a KNOWN ORIGIN, which is
+	// what makes ed.click_target able to turn a click's absolute screen row into
+	// a line of the document at all (T2-B declined to bind clicks precisely
+	// because the inline renderer had no origin). And the renderer knows the
+	// terminal's HEIGHT, so a document taller than the window is truncated at the
+	// bottom rather than scrolling the screen out from under the frame.
+	//
+	// Set here rather than passed to program_init for the same reason p.cursor is
+	// (rt.Program.render_mode): .Inline is the zero value, so no example written
+	// before T2-C has to change.
+	p.render_mode = .Full_Screen
+	// Seed the app's own copy of the terminal size. rt's renderer gets this
+	// itself from term_size inside run(), but ed.click_target needs the WIDTH too
+	// -- to account for view lines that wrap -- and a Window_Size_Msg only ever
+	// arrives on a SIGWINCH, so an editor that is never resized would otherwise
+	// spend its whole life assuming nothing wraps. ok=false leaves both 0, which
+	// is exactly the assumption the renderer makes with an unknown width, so the
+	// two stay consistent either way (see ed.Model.term_w).
+	if w, h, ok := rt.term_size(fd); ok { p.model.term_w, p.model.term_h = w, h }
 
 	// flush_fd = the tty, so each frame reaches the screen as it is rendered.
 	if err := rt.run(&p, &src, &b, fd); err != nil { fmt.eprintln("error:", err) }

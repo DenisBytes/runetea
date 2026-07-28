@@ -148,6 +148,7 @@ test_no_opt_ins_write_nothing :: proc(t: ^testing.T) {
 	testing.expect(t, !g_term.paste_active, "no paste requested: paste_active must stay false")
 	testing.expect(t, g_term.mouse_mode == .None, "no mouse requested: mouse_mode must stay .None")
 	testing.expect(t, !g_term.focus_active, "no focus requested: focus_active must stay false")
+	testing.expect(t, !g_term.alt_active, "no alt screen requested: alt_active must stay false")
 
 	buf: [64]u8
 	testing.expectf(t, drain_master(pty.master, buf[:], 0) == "",
@@ -799,4 +800,208 @@ test_mouse_and_focus_reset_on_the_crash_path :: proc(t: ^testing.T) {
 	got := drain_master(pty.master, buf[:], len(want))
 	testing.expectf(t, got == want,
 		"crash path wrote %q, want enable then exactly one reset of each %q", got, want)
+}
+
+// ---------------------------------------------------------------------------
+// T2-C: the ALTERNATE SCREEN BUFFER's enter/leave pairing. Same pty technique
+// and same test SHAPE as the four pairings above, because the invariant is the
+// same one -- never leave the terminal in a state this process put it in.
+//
+// THE HAZARD, stated fresh rather than copied, because this one is the worst of
+// the five and the reason it sits so high in term_restore_c's worst-first
+// ordering. `\e[?1049h` / `l` are DECSET/DECRST like paste, mouse and focus --
+// a boolean mode, no stack, no depth -- so the specific catastrophe
+// POP-EXACTLY-ONCE guards against has no analogue. But the CONSEQUENCE of
+// missing the reset is not mild at all: a terminal left in the alternate screen
+// shows the dead TUI's last frame under the user's shell prompt, gives them a
+// buffer with no scrollback, and hides the entire session that preceded the
+// program. Nothing echoes wrong and nothing is mistyped -- the user simply
+// cannot see their own terminal any more, and the only way back is to blind-type
+// `reset` (or `printf '\e[?1049l'`).
+//
+// AND THE OTHER DIRECTION MATTERS TOO, which is what term_restore_c's old
+// comment was written about. An UNPAIRED `\e[?1049l` -- one written by a process
+// that never entered the alt screen -- makes an xterm-family terminal restore a
+// cursor position that was never saved, i.e. actively wrong output rather than a
+// harmless no-op. That is precisely why `alt_active` exists: it is the record
+// that THIS process wrote the `h` that performed the save, so the `l` is only
+// ever written against a save it is genuinely paired with.
+// ---------------------------------------------------------------------------
+
+@(test)
+test_alt_screen_enter_and_leave_exactly_once :: proc(t: ^testing.T) {
+	pty, ok := open_test_pty()
+	if !testing.expect(t, ok, "could not open a pty") { return }
+	defer close_test_pty(pty)
+	g_term = {}
+	defer g_term = {}
+
+	testing.expect(t, term_enter_raw(pty.slave, {}, false, .None, false, true),
+		"term_enter_raw should succeed")
+	testing.expect(t, g_term.alt_active, "a successful enter must leave alt_active true")
+	testing.expect(t, !g_term.kitty_active, "alt screen alone must not touch the keyboard stack")
+	testing.expect(t, !g_term.paste_active, "alt screen alone must not touch bracketed paste")
+	testing.expect(t, g_term.mouse_mode == .None, "alt screen alone must not enable mouse tracking")
+	testing.expect(t, !g_term.focus_active, "alt screen alone must not enable focus reporting")
+
+	buf: [64]u8
+	got := drain_master(pty.master, buf[:], len("\e[?1049h"))
+	testing.expectf(t, got == "\e[?1049h", "entered %q, want %q", got, "\e[?1049h")
+
+	// Three teardowns: the orderly one, a redundant repeat, and the
+	// signal-handler entry point. Exactly one leave must come out. A second
+	// would be harmless on the wire (RESET is idempotent) but it would mean the
+	// flag guard is not working -- and the guard is what stops us writing a
+	// `?1049l` against a save that was never made.
+	term_restore()
+	testing.expect(t, !g_term.alt_active, "restore must clear alt_active")
+	term_restore()
+	term_restore_c()
+
+	buf2: [64]u8
+	got2 := drain_master(pty.master, buf2[:], len("\e[?1049l"))
+	testing.expectf(t, got2 == "\e[?1049l",
+		"teardown wrote %q, want exactly one leave %q", got2, "\e[?1049l")
+	// ...AND NOTHING MORE -- see exactly_once_needs_a_second_drain above.
+	buf3: [64]u8
+	testing.expectf(t, drain_master(pty.master, buf3[:], 0) == "",
+		"something arrived after the leave: %q", drain_master(pty.master, buf3[:], 0))
+}
+
+// ALL FIVE OPT-INS AT ONCE, and the ordering T2-C changed. This is the sibling
+// of test_all_four_opt_ins_pair_independently above, which is deliberately left
+// untouched (alt defaults to off, so it still passes byte for byte) -- the
+// point of a second test rather than an edit is that both orderings stay
+// pinned: the one every pre-T2-C program produces, and the one a full-screen
+// program produces.
+//
+// TEARDOWN ORDER: termios, keyboard pop, ALT SCREEN LEAVE, mouse reset, focus
+// reset, cursor show, paste reset. Worst-first, so a second fatal signal
+// landing mid-teardown has already undone the most damaging state. Alt sits
+// third for two reasons, both stated in term_restore_c: a stranded alt screen
+// costs the user their entire visible terminal (worse than mouse's per-click
+// garbage, which they can at least see and delete), but it still does not
+// corrupt what the shell RECEIVES, which is what the keyboard pop above it
+// prevents. It is also above the cursor show deliberately, so that the show
+// lands on the PRIMARY screen the user is actually looking at.
+@(test)
+test_all_five_opt_ins_pair_independently :: proc(t: ^testing.T) {
+	pty, ok := open_test_pty()
+	if !testing.expect(t, ok, "could not open a pty") { return }
+	defer close_test_pty(pty)
+	g_term = {}
+	defer g_term = {}
+
+	testing.expect(t, term_enter_raw(pty.slave, {.Disambiguate}, true, .Button_Event, true, true),
+		"term_enter_raw should succeed")
+	testing.expect(t, g_term.kitty_active && g_term.paste_active &&
+		g_term.mouse_mode == .Button_Event && g_term.focus_active && g_term.alt_active,
+		"all five opt-ins must be armed")
+
+	// ENTER order: keyboard push+query, paste, mouse, focus, alt -- the order
+	// term_enter_raw writes them, which is deliberately the same order the
+	// parameters appear in.
+	want_in := "\e[>1u\e[?u" + "\e[?2004h" + "\e[?1002h\e[?1006h" + "\e[?1004h" + "\e[?1049h"
+	buf: [128]u8
+	got := drain_master(pty.master, buf[:], len(want_in))
+	testing.expectf(t, got == want_in, "enter wrote %q, want %q", got, want_in)
+
+	term_restore()
+	term_restore_c()
+
+	// TEARDOWN order: worst-first, and NOT the reverse of the enter order.
+	want_out := "\e[<1u" + "\e[?1049l" + "\e[?1006l\e[?1002l" + "\e[?1004l" + "\e[?2004l"
+	buf2: [128]u8
+	got2 := drain_master(pty.master, buf2[:], len(want_out))
+	testing.expectf(t, got2 == want_out, "teardown wrote %q, want %q", got2, want_out)
+}
+
+// THE CRASH PATH, end to end and for real -- the exact shape of the four
+// crash-path tests above, for the same reason: a process killed by a signal
+// never runs its `defer`s, so the leave has to come out of guard.odin's
+// crash_handler (which calls term_restore_c directly) or not at all.
+//
+// This is the pairing where forgetting hurts most, and it is why this test
+// exists even though the in-process one above already covers term_restore_c: a
+// crashed full-screen program that never leaves the alt screen leaves the user
+// staring at its corpse, with their shell's entire scrollback inaccessible
+// until they blind-type `reset`.
+@(test)
+test_alt_screen_leaves_on_the_crash_path :: proc(t: ^testing.T) {
+	pty, ok := open_test_pty()
+	if !testing.expect(t, ok, "could not open a pty") { return }
+	defer close_test_pty(pty)
+
+	pid := posix.fork()
+	if !testing.expect(t, pid >= 0, "fork failed") { return }
+
+	if pid == 0 {
+		// CHILD. No `defer term_restore()`: this proves the SIGNAL path leaves.
+		posix.close(pty.master)
+		install_crash_handlers()
+		if !term_enter_raw(pty.slave, {}, false, .None, false, true) { posix._exit(1) }
+		posix.raise(posix.Signal.SIGTERM)
+		posix._exit(1)   // NOT REACHED: crash_handler re-raises with SIG_DFL
+	}
+
+	status: c.int
+	exited := false
+	for _ in 0 ..< 200 {
+		if posix.waitpid(pid, &status, {.NOHANG}) == pid { exited = true; break }
+		time.sleep(5 * time.Millisecond)
+	}
+	if !exited {
+		posix.kill(pid, posix.Signal.SIGKILL)
+		testing.expect(t, false, "child did not die within 1s")
+		return
+	}
+	testing.expect(t, posix.WIFSIGNALED(status),
+		"the child must die BY SIGNAL -- if it exited normally, crash_handler never ran")
+
+	buf: [64]u8
+	want := "\e[?1049h\e[?1049l"
+	got := drain_master(pty.master, buf[:], len(want))
+	testing.expectf(t, got == want,
+		"crash path wrote %q, want enter then exactly one leave %q", got, want)
+}
+
+// The FULL-SCREEN renderer's real bytes, at a real pty, inside a real alt
+// screen -- the T2-C analogue of test_cursor_hide_and_show_exactly_once above,
+// and for the same reason: render.odin buffers the frame, term.odin writes the
+// teardown, and only a test that drives both can prove they compose.
+@(test)
+test_full_screen_frame_and_alt_screen_compose :: proc(t: ^testing.T) {
+	pty, ok := open_test_pty()
+	if !testing.expect(t, ok, "could not open a pty") { return }
+	defer close_test_pty(pty)
+	g_term = {}
+	defer g_term = {}
+
+	testing.expect(t, term_enter_raw(pty.slave, {}, false, .None, false, true),
+		"term_enter_raw should succeed")
+	buf0: [64]u8
+	drain_master(pty.master, buf0[:], len("\e[?1049h"))
+
+	b := strings.builder_make(); defer strings.builder_destroy(&b)
+	r: Renderer
+	renderer_init(&r, &b, 20, 5, .Full_Screen)
+	renderer_render(&r, "hi", Cursor{line = 0, col = 1, show = true})
+	testing.expect(t, g_term.cursor_hidden,
+		"a frame that hides the cursor must arm the paired show BEFORE its bytes are flushed")
+	flush_frame(&b, pty.slave)
+
+	frame := "\e[?25l" + "\e[H" + "hi\e[K" + "\r\n\e[J" + "\e[1;2H" + "\e[?25h"
+	buf: [64]u8
+	got := drain_master(pty.master, buf[:], len(frame))
+	testing.expectf(t, got == frame, "frame was %q, want %q", got, frame)
+
+	term_restore()
+	term_restore_c()
+
+	// Worst-first: the alt-screen leave comes BEFORE the cursor show, so the
+	// show lands on the primary screen the user is actually looking at.
+	want_out := "\e[?1049l" + "\e[?25h"
+	buf2: [64]u8
+	got2 := drain_master(pty.master, buf2[:], len(want_out))
+	testing.expectf(t, got2 == want_out, "teardown wrote %q, want %q", got2, want_out)
 }

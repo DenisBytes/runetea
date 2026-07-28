@@ -12,6 +12,7 @@ package edit
 import "core:fmt"
 import "core:mem"
 import "core:strings"
+import "core:unicode/utf8"
 import rt "../../../runetea"
 
 // Fixed capacities, no [dynamic] anywhere in Model, and that is still
@@ -93,6 +94,8 @@ Action :: enum u8 {
 	// ACTION_NAME below is an [Action]string, so an inserted member would
 	// silently shift every existing label.
 	Scroll_Up, Scroll_Down,
+	// T2-C. Appended for the same reason.
+	Click,
 }
 
 ACTION_NAME := [Action]string{
@@ -103,6 +106,7 @@ ACTION_NAME := [Action]string{
 	.Home = "home", .End = "end", .Page_Up = "page-up", .Page_Down = "page-down",
 	.Indent = "indent", .Toggle_Help = "help", .Paste = "paste",
 	.Scroll_Up = "scroll-up", .Scroll_Down = "scroll-down",
+	.Click = "click",
 }
 
 Model :: struct {
@@ -119,6 +123,25 @@ Model :: struct {
 	// conditional rather than silently so.
 	kitty:   bool,
 	last:    Action,
+	// T2-C. The terminal's size, as this app last knew it. NEEDED FOR
+	// CLICK-TO-POSITION, not for layout: turning a Mouse_Msg's absolute screen
+	// row into a view line means knowing how many PHYSICAL rows each view line
+	// above it occupies, and that is a function of the width (rt.rows_for_line).
+	// Without it, a header line wider than the terminal -- and this view's header
+	// is 105 columns, so on an 80-column terminal it is exactly that -- would
+	// wrap, push everything below it down a row, and every click would land one
+	// line too high.
+	//
+	// SEEDED BY main.odin from rt.term_size at startup and kept live here from
+	// Window_Size_Msg; 0 means "unknown", which rt.rows_for_line reads as "assume
+	// one row per line". That is the same assumption the RENDERER makes with an
+	// unknown width, which is the property that matters: the mapping and the
+	// paint are wrong together or right together, never inconsistent with each
+	// other. `term_h` is not used for anything but the status line -- this
+	// editor's viewport is a fixed VIEWPORT rows, not the screen's height -- and
+	// is kept so a resize is visible in the UI rather than silently absorbed.
+	term_w:  int,
+	term_h:  int,
 }
 
 // ---------------------------------------------------------------------------
@@ -271,8 +294,18 @@ update :: proc(m: ^Model, msg: any, alloc: mem.Allocator) -> rt.Cmd {
 		m.pasting = false
 	case rt.Keyboard_Enhancements_Msg:
 		m.kitty = .Disambiguate in v.flags
+	case rt.Window_Size_Msg:
+		// T2-C. rt's own renderer already consumed this before update() was
+		// called (rt.apply keeps Renderer.term_width/term_height live from the
+		// same message), so this is not the app doing the framework's job -- it
+		// is the app keeping ITS copy of the width, which click_target needs to
+		// account for wrapped view lines exactly the way the renderer does.
+		// w == 0 is rt's "the ioctl failed" sentinel; ignore it rather than
+		// clobbering a known-good width, same rule rt.apply follows.
+		if v.w > 0 { m.term_w = v.w }
+		if v.h > 0 { m.term_h = v.h }
 	case rt.Mouse_Msg:
-		return apply_mouse(m, v)
+		return apply_mouse(m, v, alloc)
 	case rt.Key_Msg:
 		return apply_key(m, v)
 	}
@@ -284,31 +317,45 @@ update :: proc(m: ^Model, msg: any, alloc: mem.Allocator) -> rt.Cmd {
 // scroll feels broken on a trackpad.
 WHEEL_LINES :: 3
 
-// T2-B: the mouse. THIS EXAMPLE BINDS THE WHEEL AND DELIBERATELY DOES NOT BIND
-// CLICK-TO-POSITION, and the reason is a real limitation worth stating rather
-// than working around badly.
+// T2-B/T2-C: the mouse. The wheel scrolls; a LEFT PRESS positions the caret.
 //
-// A wheel notch means "scroll", full stop -- it needs no coordinates at all, so
-// it is exactly as correct here as it would be in any application.
+// T2-B DECLINED TO BIND CLICK-TO-POSITION, and the reason it gave was correct
+// at the time: a click carries ABSOLUTE TERMINAL COORDINATES (rt.Mouse_Msg.x/y
+// are screen cells, 0-based from the top-left of the WINDOW), and turning `y`
+// into a view line needs to know which screen row this frame's first line is on.
+// rt's renderer was an INLINE REWIND renderer, so a frame sat wherever the
+// terminal's cursor happened to be -- it had no screen origin at all, and a
+// binding built on a guessed one would put the caret on the wrong line whenever
+// the frame was not flush against the top of the window.
 //
-// A CLICK carries ABSOLUTE TERMINAL COORDINATES (rt.Mouse_Msg.x/y are screen
-// cells, 0-based from the top-left of the WINDOW), and turning `y` into a view
-// line needs to know which screen row this frame's first line is on. rt's
-// renderer is an INLINE REWIND renderer (render.odin's renderer_render:
-// cursor-up + erase-line, no alt screen), so a frame sits wherever the terminal
-// happened to be -- it has no screen origin, and nothing in rt.Cursor or
-// Window_Size_Msg exposes one. Deriving it would mean tracking the frame's
-// absolute top row through every resize, every wrap and every frame whose
-// height changes (this view's own help panel changes it), i.e. new renderer
-// state, not a binding in an example. So a click here would place the caret on
-// the wrong line whenever the frame is not flush against the top of the window,
-// which is most of the time -- and a caret that lands somewhere else on most
-// clicks is worse than no click binding at all.
+// T2-C REMOVED EXACTLY THAT OBSTACLE. main.odin now runs this program with
+// rt.Render_Mode.Full_Screen inside the alternate screen, and that renderer
+// homes to the top-left cell every frame (render.odin's render_full_screen), so
+// VIEW LINE 0 IS SCREEN ROW 0 -- by construction, every frame, with nothing to
+// track. `y` is then a physical row within the frame, and the only remaining
+// work is the one the inline renderer could not have done either: physical rows
+// are not logical lines, because a view line wider than the terminal wraps onto
+// several of them. click_target does that arithmetic with rt.rows_for_line --
+// the SAME function the renderer itself uses to lay the frame out -- so the two
+// cannot disagree about which row a line starts on. That is what makes this
+// well-defined rather than merely usually-right.
 //
-// `.Press` only, and left-button-agnostic: wheel notches arrive as Wheel events
-// regardless of tracking mode, and every other kind is ignored rather than
-// guessed at.
-apply_mouse :: proc(m: ^Model, mo: rt.Mouse_Msg) -> rt.Cmd {
+// `.Press` only, and only the LEFT button: a release would fire a second time on
+// the same spot, and a right/middle click has no meaning in this editor.
+apply_mouse :: proc(m: ^Model, mo: rt.Mouse_Msg, alloc: mem.Allocator) -> rt.Cmd {
+	if mo.kind == .Press && mo.button == .Left {
+		if cy, cx, ok := click_target(m^, mo.x, mo.y, alloc); ok {
+			m.cy, m.cx = cy, cx
+			m.last = .Click
+			// follow_cursor, not a bare assignment: a click can only land on a
+			// visible line, so this is a no-op today -- but it is the invariant
+			// every other action in this file maintains, and leaving it out would
+			// make this the one code path that could ever leave the caret outside
+			// the window.
+			follow_cursor(m)
+		}
+		return rt.cmd_nil()
+	}
 	if mo.kind != .Wheel { return rt.cmd_nil() }
 	#partial switch mo.button {
 	case .Wheel_Up:
@@ -464,6 +511,13 @@ apply_key :: proc(m: ^Model, k: rt.Key_Msg) -> rt.Cmd {
 
 RULE :: "--------------------------------------------------------------------------"
 
+// The header, hoisted out of view()'s first sbprintfln by T2-C. It is a named
+// constant now because click_target has to MEASURE it (105 columns -- wider than
+// an 80-column terminal, so it really does wrap in practice) to know which
+// screen row the text area starts on. A literal written twice would be a layout
+// that can silently drift out of agreement with the click mapping.
+HELP_LINE :: "RuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit"
+
 // The view's fixed preamble: the key-help header, then RULE. Text row `row`
 // (0-based, within the viewport) is therefore view line HEADER_LINES + row --
 // and `cursor` below depends on that being exactly true, which is why it is a
@@ -475,32 +529,110 @@ HEADER_LINES :: 2
 // so the number is never wider than 3.
 GUTTER_COLS :: 4
 
+// The exact text view() paints for viewport row `row`, gutter included.
+// EXTRACTED SO THERE IS ONE COPY, not two: click_target measures these strings
+// to map a screen row back to a line, and a second, hand-kept copy of the
+// formatting would be a mapping that agrees with the paint right up until
+// someone edits one of them.
+@(private)
+view_row_text :: proc(m: Model, row: int, alloc: mem.Allocator) -> string {
+	i := m.top + row
+	if i < 0 || i >= m.nlines { return "   ~" }
+	sb := strings.builder_make(alloc)
+	// "% 3d", not "%3d": Odin's core:fmt does NOT follow Go here. "%3d"
+	// pads a number with ZEROS ("001"), and "%-3d" pads with zeros on the
+	// RIGHT -- so `fmt.printf("%-3d", 1)` prints "100", which reads as one
+	// hundred. Only the explicit space flag gives Go's "  1". Verified on
+	// this toolchain, not assumed.
+	fmt.sbprintf(&sb, "% 3d ", i + 1)
+	l := m.lines[i]
+	for k in 0 ..< l.n { strings.write_rune(&sb, l.r[k]) }
+	return strings.to_string(sb)
+}
+
+// T2-C. Maps an absolute screen cell to a caret position: `y` is a PHYSICAL
+// screen row and `x` a physical column, both 0-based from the top-left of the
+// window (rt.Mouse_Msg's coordinates). ok=false means the click was not on a
+// text row at all -- the header, either rule, the status line, the help panel,
+// or a "~" filler past the end of the document -- and the caller must then do
+// nothing rather than pick a nearby line.
+//
+// WHY THIS IS WELL-DEFINED AND WAS NOT BEFORE: main.odin runs this program with
+// rt.Render_Mode.Full_Screen, whose frames start at the top-left cell every
+// time, so view line 0 is screen row 0 with nothing to track. See apply_mouse.
+//
+// PHYSICAL ROWS, NOT LOGICAL LINES, and that is the whole substance of this
+// proc. Every view line above the text area (and every text row above the one
+// clicked) may WRAP, and rt.rows_for_line -- the renderer's own layout function,
+// not a re-derivation -- says how many rows each actually took. With an unknown
+// width (m.term_w == 0) rows_for_line answers 1 for everything, which is
+// precisely what the renderer assumes too, so mapping and paint stay consistent
+// with each other even when both are ignorant of the real terminal.
+//
+// The COLUMN is handled by the same arithmetic in reverse: a click on the
+// SECOND physical row of a wrapped line is at display column x + term_w, on the
+// third at x + 2*term_w, and so on.
+@(private)
+click_target :: proc(m: Model, x, y: int, alloc: mem.Allocator) -> (cy, cx: int, ok: bool) {
+	w := m.term_w
+	row := rt.rows_for_line(HELP_LINE, w) + rt.rows_for_line(RULE, w)
+	if y < row { return 0, 0, false }   // header or the rule under it
+
+	for r in 0 ..< VIEWPORT {
+		text := view_row_text(m, r, alloc)
+		rows := rt.rows_for_line(text, w)
+		if y < row + rows {
+			i := m.top + r
+			if i >= m.nlines { return 0, 0, false }   // a "~" filler row
+			col := x
+			if w > 0 { col += (y - row) * w }         // which continuation row was clicked
+			// A click in the GUTTER (the line number) means the start of the
+			// line, not a negative column -- the same thing every editor does.
+			col = max(col - GUTTER_COLS, 0)
+			return i, rune_at_display_col(m.lines[i], col), true
+		}
+		row += rows
+	}
+	return 0, 0, false   // the trailing rule, the status line or the help panel
+}
+
+// The inverse of `cursor`'s display_width sum: a DISPLAY column within a line's
+// text, back to the RUNE INDEX the caret uses. The two must be inverses or a
+// click followed by a repaint would move the caret somewhere the user did not
+// click, so this walks widths the same way cursor() sums them.
+//
+// A click anywhere INSIDE a wide rune (the second cell of a CJK glyph, say)
+// resolves to that rune's own index, i.e. the caret lands on its left edge.
+// That is what a rune-granular editor can offer -- there is no position between
+// the two halves of one rune -- and it is what every terminal editor does.
+// A click past the end of the text lands at the end of the line.
+@(private)
+rune_at_display_col :: proc(l: Line, col: int) -> int {
+	if col <= 0 { return 0 }
+	w := 0
+	for k in 0 ..< l.n {
+		buf, n := utf8.encode_rune(l.r[k])
+		rw := rt.display_width(string(buf[:n]))
+		if col < w + rw { return k }
+		w += rw
+	}
+	return l.n
+}
+
 view :: proc(m: Model, alloc: mem.Allocator) -> string {
 	sb := strings.builder_make(alloc)
 
-	fmt.sbprintfln(&sb, "RuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit")
+	fmt.sbprintfln(&sb, HELP_LINE)
 	fmt.sbprintfln(&sb, RULE)
 
 	for row in 0 ..< VIEWPORT {
-		i := m.top + row
-		if i >= m.nlines {
-			fmt.sbprintfln(&sb, "   ~")
-			continue
-		}
-		// "% 3d", not "%3d": Odin's core:fmt does NOT follow Go here. "%3d"
-		// pads a number with ZEROS ("001"), and "%-3d" pads with zeros on the
-		// RIGHT -- so `fmt.printf("%-3d", 1)` prints "100", which reads as one
-		// hundred. Only the explicit space flag gives Go's "  1". Verified on
-		// this toolchain, not assumed.
-		fmt.sbprintf(&sb, "% 3d ", i + 1)
-		l := m.lines[i]
-		for k in 0 ..< l.n { strings.write_rune(&sb, l.r[k]) }
-		strings.write_string(&sb, "\n")
+		fmt.sbprintfln(&sb, "%s", view_row_text(m, row, alloc))
 	}
 
 	fmt.sbprintfln(&sb, RULE)
-	fmt.sbprintfln(&sb, "Ln %d, Col %d   %d lines   window %d-%d   kitty:%s   last:%s%s",
+	fmt.sbprintfln(&sb, "Ln %d, Col %d   %d lines   window %d-%d   term %dx%d   kitty:%s   last:%s%s",
 		m.cy + 1, m.cx + 1, m.nlines, m.top + 1, min(m.top + VIEWPORT, m.nlines),
+		m.term_w, m.term_h,
 		m.kitty ? "on" : "off", ACTION_NAME[m.last],
 		m.pasting ? "   [PASTING]" : "")
 

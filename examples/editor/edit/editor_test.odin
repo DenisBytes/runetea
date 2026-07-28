@@ -1,5 +1,6 @@
 package edit
 
+import "core:fmt"
 import "core:os"
 import "core:strings"
 import "core:testing"
@@ -48,8 +49,9 @@ KITTY_CTRL_I :: "\e[105;5u"  // Kitty: Ctrl+I -- a DIFFERENT key. Legacy: both 0
 KITTY_REPLY  :: "\e[?1u"     // the terminal's answer to term_enter_raw's CSI ? u
 // T2-B. SGR mouse wheel notches: Cb 64 is up, 65 is down. The coordinates are
 // present because the encoding requires them and are irrelevant to a wheel
-// binding -- which is exactly why this editor binds the wheel and not
-// click-to-position (see ed.apply_mouse).
+// binding -- unlike a CLICK, whose coordinates are its entire meaning, which is
+// why the click tests below build their bytes with click_at() rather than
+// spelling them as constants here.
 WHEEL_UP     :: "\e[<64;1;1M"
 WHEEL_DOWN   :: "\e[<65;1;1M"
 
@@ -70,6 +72,19 @@ drive :: proc(t: ^testing.T, start: Model, script: string, b: ^strings.Builder) 
 	// (which runs inside rt's guarded view call, on every frame) would never be
 	// exercised at all.
 	p.cursor = cursor
+	// T2-C, and here for exactly the same reason p.cursor is: main.odin ships
+	// this program in FULL-SCREEN mode, so a test that drove it inline would be
+	// testing a different program -- the golden would hold rewind bytes the real
+	// editor never emits, and the full-screen path (which is what makes
+	// click_target's coordinates mean anything) would never run here at all.
+	//
+	// The alternate screen is NOT entered here, and that is not an omission: it
+	// is term_enter_raw's job, and these tests deliberately never enter raw mode
+	// (they drive run() over a byte slice, with flush_fd = -1 and no tty in
+	// sight). The two opt-ins are independent by design -- see rt.term_enter_raw
+	// -- so a full-screen renderer with no alt screen is a legal configuration
+	// and exactly the one a test harness wants.
+	p.render_mode = .Full_Screen
 	err := rt.run(&p, &src, b)
 	testing.expectf(t, err == nil, "run should exit cleanly, got %v", err)
 	return p.model
@@ -349,15 +364,29 @@ test_the_rendered_frame_places_a_real_cursor_and_paints_no_caret_glyph :: proc(t
 	out := strings.to_string(b)
 	last := out[strings.last_index(out, "\e[?25l"):]
 
+	// T2-C REBASELINED THIS ONE LINE, deliberately: the editor now ships in
+	// FULL-SCREEN mode (drive() sets p.render_mode to match main.odin), so the
+	// caret is placed with an ABSOLUTE CUP instead of the inline renderer's
+	// relative walk. The CELL is the same one the inline expectation described,
+	// and that is the point of writing it out both ways here.
+	//
 	// The view is 14 logical lines with no help panel (header, RULE, VIEWPORT
 	// text rows, RULE, status), and these tests run with no terminal, so
 	// term_width is 0 and every logical line is one physical row (width.odin's
-	// rows_for_line). The caret is on view line 2 (HEADER_LINES + row 0), i.e.
-	// 14 - 2 = 12 rows above home, at display column 4 + len("hello") = 9,
-	// which CHA spells 1-based as 10.
-	want :: "\e[12A\e[10G\e[?25h"
+	// rows_for_line). The caret is on view line 2 (HEADER_LINES + row 0) at
+	// display column 4 + len("hello") = 9. Inline, that was "12 rows above home,
+	// CHA to 1-based column 10" -- "\e[12A\e[10G". Full-screen, it is the same
+	// cell named absolutely: row 3, column 10, both 1-based.
+	want :: "\e[3;10H\e[?25h"
 	testing.expectf(t, strings.has_suffix(last, want),
 		"frame must end with the cursor placement %q; frame was:\n%q", want, last)
+	// ...and the frame it ends is a full-screen frame, not a rewind: homed at the
+	// top-left, no \e[1A anywhere. Pinned here rather than assumed because this is
+	// the only test in this file that looks at the real bytes.
+	testing.expect(t, strings.has_prefix(last, "\e[?25l\e[H"),
+		"a full-screen frame must home before it paints")
+	testing.expect(t, !strings.contains(last, "\e[1A"),
+		"a full-screen frame must never rewind")
 	testing.expect(t, strings.has_prefix(last, "\e[?25l"),
 		"a cursor frame must hide the cursor before it repaints")
 	testing.expect(t, !strings.contains(last, "|"),
@@ -464,4 +493,222 @@ l15`)
 	expect_line(t, m, 0, "l1", "wheel must not modify the text")
 	expect_line(t, m, 14, "l15", "wheel must not modify the text")
 	testing.expectf(t, m.nlines == 15, "wheel changed nlines to %d", m.nlines)
+}
+
+// ---------------------------------------------------------------------------
+// T2-C: click-to-position.
+//
+// The coordinates below are SCREEN CELLS, and every one of them is derived, not
+// guessed, so a layout change breaks these tests loudly instead of silently
+// moving what a click means:
+//
+//   text row r sits at screen row TEXT_ORIGIN + r, where TEXT_ORIGIN is the
+//   physical height of the header plus the rule under it;
+//   column c of a line sits at screen column GUTTER_COLS + <display width of
+//   the runes before it>.
+//
+// With m.term_w == 0 (no tty behind these tests, so no width was ever learned)
+// rt.rows_for_line answers 1 for every line, so TEXT_ORIGIN is HEADER_LINES --
+// and the wrapping case gets its own test below, with a width set.
+// ---------------------------------------------------------------------------
+
+// SGR mouse press, left button, at 0-based screen cell (x, y). The wire encoding
+// is 1-based, hence the +1s -- the same conversion rt.sgr_mouse undoes on the
+// way in. Cb 0 is the left button.
+@(private = "file")
+click_at :: proc(x, y: int) -> string {
+	return fmt.aprintf("\e[<0;%d;%dM", x + 1, y + 1)
+}
+
+@(test)
+test_click_positions_the_caret_on_the_clicked_cell :: proc(t: ^testing.T) {
+	doc := init(`alpha
+bravo
+charlie`)
+
+	// Text row 1 ("bravo"), column 3 -- so screen cell (GUTTER_COLS + 3, 2 + 1).
+	script := click_at(GUTTER_COLS + 3, HEADER_LINES + 1); defer delete(script)
+	m := run_script(t, doc, script)
+	testing.expectf(t, m.cy == 1 && m.cx == 3, "click: caret at (%d,%d), want (1,3)", m.cy, m.cx)
+	testing.expectf(t, m.last == .Click, "click: last = %v, want click", m.last)
+
+	// A click in the GUTTER (the line number) means column 0, not a negative
+	// column and not "ignore this click".
+	script2 := click_at(1, HEADER_LINES + 2); defer delete(script2)
+	m = run_script(t, doc, script2)
+	testing.expectf(t, m.cy == 2 && m.cx == 0, "gutter click: caret at (%d,%d), want (2,0)", m.cy, m.cx)
+
+	// A click PAST THE END of a line lands at the end of that line, not at the
+	// column the user physically clicked (there is no text there to point at).
+	script3 := click_at(GUTTER_COLS + 40, HEADER_LINES + 0); defer delete(script3)
+	m = run_script(t, doc, script3)
+	testing.expectf(t, m.cy == 0 && m.cx == 5, "past-end click: caret at (%d,%d), want (0,5)", m.cy, m.cx)
+
+	// A click that is not on a text row at all -- the header -- must do NOTHING.
+	// Placing the caret "somewhere near" would be worse than ignoring it.
+	script4 := click_at(10, 0); defer delete(script4)
+	m = run_script(t, doc, script4)
+	testing.expectf(t, m.cy == 0 && m.cx == 0, "header click moved the caret to (%d,%d)", m.cy, m.cx)
+	testing.expectf(t, m.last == .None, "header click: last = %v, want none", m.last)
+
+	// ...and neither must a click on a "~" filler row past the end of the
+	// document (row 5 of the viewport, with only 3 lines of text).
+	script5 := click_at(GUTTER_COLS, HEADER_LINES + 5); defer delete(script5)
+	m = run_script(t, doc, script5)
+	testing.expectf(t, m.cy == 0 && m.cx == 0, "filler click moved the caret to (%d,%d)", m.cy, m.cx)
+	testing.expectf(t, m.last == .None, "filler click: last = %v, want none", m.last)
+}
+
+// THE WIDE-RUNE CASE, which is the whole reason the mapping goes through
+// rt.display_width in both directions rather than counting runes. "日本語" is 3
+// runes, 9 bytes and SIX COLUMNS, so the caret positions and the screen columns
+// they correspond to are three different sequences of numbers.
+@(test)
+test_click_on_a_line_with_a_wide_rune_uses_display_columns :: proc(t: ^testing.T) {
+	doc := init("日本語x")
+
+	// Column layout of the text, 0-based within the line:
+	//   cols 0-1  日   (rune 0)
+	//   cols 2-3  本   (rune 1)
+	//   cols 4-5  語   (rune 2)
+	//   col  6    x    (rune 3)
+	Case :: struct { col, want_cx: int, what: string }
+	for c in ([?]Case{
+		{0, 0, "left half of the first wide rune"},
+		{1, 0, "RIGHT half of the first wide rune -- still that rune"},
+		{2, 1, "left half of the second"},
+		{3, 1, "right half of the second"},
+		{4, 2, "left half of the third"},
+		{6, 3, "the narrow rune after three wide ones"},
+		{7, 4, "past the end of the text"},
+	}) {
+		script := click_at(GUTTER_COLS + c.col, HEADER_LINES); defer delete(script)
+		m := run_script(t, doc, script)
+		testing.expectf(t, m.cy == 0 && m.cx == c.want_cx,
+			"%s: click at display column %d -> caret (%d,%d), want (0,%d)",
+			c.what, c.col, m.cy, m.cx, c.want_cx)
+	}
+
+	// A rune index would have put the caret at 6 for the last case and a BYTE
+	// index at 9 -- both silently wrong. Pinned so the test above cannot pass
+	// for the wrong reason.
+	testing.expectf(t, m_line_len(doc, 0) == 4, "the fixture line must be 4 runes")
+}
+
+@(private = "file")
+m_line_len :: proc(m: Model, i: int) -> int { return m.lines[i].n }
+
+// THE VIEW SCROLLED. `top` shifts which document line a text row shows, and the
+// mapping has to follow it -- clicking the first text row after scrolling must
+// select the first VISIBLE line, not line 0. Driven through a real wheel notch
+// so the scroll itself comes from the same wire bytes a terminal sends.
+@(test)
+test_click_after_scrolling_selects_the_visible_line :: proc(t: ^testing.T) {
+	doc := init(`l1
+l2
+l3
+l4
+l5
+l6
+l7
+l8
+l9
+l10
+l11
+l12
+l13
+l14
+l15`)
+
+	// One wheel notch down scrolls WHEEL_LINES (3), so text row 0 now shows l4.
+	click := click_at(GUTTER_COLS + 1, HEADER_LINES + 0); defer delete(click)
+	script := strings.concatenate({WHEEL_DOWN, click}); defer delete(script)
+	m := run_script(t, doc, script)
+	testing.expectf(t, m.top == 3, "the wheel notch should have scrolled to top=3, got %d", m.top)
+	testing.expectf(t, m.cy == 3 && m.cx == 1,
+		"click on the first visible row after scrolling: caret (%d,%d), want (3,1)", m.cy, m.cx)
+
+	// ...and the last visible row is top + VIEWPORT - 1, not VIEWPORT - 1.
+	click2 := click_at(GUTTER_COLS, HEADER_LINES + VIEWPORT - 1); defer delete(click2)
+	script2 := strings.concatenate({WHEEL_DOWN, click2}); defer delete(script2)
+	m = run_script(t, doc, script2)
+	testing.expectf(t, m.cy == 3 + VIEWPORT - 1,
+		"click on the last visible row: cy = %d, want %d", m.cy, 3 + VIEWPORT - 1)
+}
+
+// THE CASE THAT MAKES THIS WELL-DEFINED RATHER THAN USUALLY-RIGHT: a terminal
+// narrow enough to WRAP the view's own header. At 40 columns the 105-column
+// header takes 3 physical rows and the 74-column rule takes 2, so the text area
+// starts at screen row 5 -- not at HEADER_LINES. A mapping that counted logical
+// lines would put every click three rows too high.
+//
+// The width reaches the model the way it does in production: main.odin seeds it
+// from rt.term_size, and this test seeds the fixture directly, because these
+// tests have no tty to resize.
+@(test)
+test_click_accounts_for_wrapped_view_lines :: proc(t: ^testing.T) {
+	doc := init(`alpha
+bravo
+charlie`)
+	doc.term_w = 40
+
+	origin := rt.rows_for_line(HELP_LINE, 40) + rt.rows_for_line(RULE, 40)
+	testing.expectf(t, origin == 5, "the wrapped preamble should be 5 rows at width 40, got %d", origin)
+
+	// Text row 1 is now at screen row `origin + 1`, and a click there must land
+	// on line 1 -- while the same click at the UNWRAPPED origin would not.
+	script := click_at(GUTTER_COLS + 2, origin + 1); defer delete(script)
+	m := run_script(t, doc, script)
+	testing.expectf(t, m.cy == 1 && m.cx == 2,
+		"wrapped-header click: caret (%d,%d), want (1,2)", m.cy, m.cx)
+
+	// The proof that the wrap accounting is doing real work: clicking where the
+	// text row WOULD be if nothing wrapped now hits the header, and is ignored.
+	script2 := click_at(GUTTER_COLS + 2, HEADER_LINES + 1); defer delete(script2)
+	m = run_script(t, doc, script2)
+	testing.expectf(t, m.last == .None,
+		"a click inside the wrapped header must be ignored, got last = %v", m.last)
+
+	// A TEXT ROW that wraps: with the caret mapping in continuation-row terms,
+	// clicking column 2 of the SECOND physical row of a long line is display
+	// column 2 + 40 = 42, minus the 4-column gutter = 38.
+	long := init("0123456789012345678901234567890123456789012345678901234567890123456789")
+	long.term_w = 40
+	script3 := click_at(2, origin + 1); defer delete(script3)
+	m = run_script(t, long, script3)
+	testing.expectf(t, m.cy == 0 && m.cx == 38,
+		"click on a wrapped line's continuation row: caret (%d,%d), want (0,38)", m.cy, m.cx)
+}
+
+// A resize keeps the mapping live: the width arrives as a Window_Size_Msg (the
+// same message rt's own renderer consumes) and click_target must use the NEW one
+// immediately. Driven through update() directly rather than through run(),
+// because a SIGWINCH cannot be scripted into a byte slice.
+@(test)
+test_window_size_msg_keeps_the_click_mapping_live :: proc(t: ^testing.T) {
+	m := init(`alpha
+bravo
+charlie`)
+	testing.expectf(t, m.term_w == 0, "a fresh model knows no width, got %d", m.term_w)
+
+	// context.temp_allocator, not context.allocator: click_target below builds
+	// one row string per viewport row it scans, and in production those come
+	// from rt's FRAME arena and die with the frame (arena.odin's LIFETIME
+	// CONTRACT). A test that handed them the tracking allocator instead would
+	// report them as leaks -- correctly, since nothing here would ever free them.
+	update(&m, rt.Window_Size_Msg{w = 40, h = 12}, context.temp_allocator)
+	testing.expectf(t, m.term_w == 40 && m.term_h == 12,
+		"a resize must reach the model: term %dx%d, want 40x12", m.term_w, m.term_h)
+
+	// The failure sentinel (rt sets both to 0 when the ioctl fails) must not
+	// clobber a known-good size.
+	update(&m, rt.Window_Size_Msg{w = 0, h = 0}, context.temp_allocator)
+	testing.expectf(t, m.term_w == 40 && m.term_h == 12,
+		"a failed size lookup must not clobber a known-good one, got %dx%d", m.term_w, m.term_h)
+
+	origin := rt.rows_for_line(HELP_LINE, 40) + rt.rows_for_line(RULE, 40)
+	defer free_all(context.temp_allocator)
+	cy, cx, ok := click_target(m, GUTTER_COLS + 1, origin + 2, context.temp_allocator)
+	testing.expect(t, ok, "a click on a text row must resolve")
+	testing.expectf(t, cy == 2 && cx == 1, "post-resize click: (%d,%d), want (2,1)", cy, cx)
 }

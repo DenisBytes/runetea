@@ -733,3 +733,40 @@ test_mouse_and_focus_reach_update_in_order :: proc(t: ^testing.T) {
 			"run_nbio(): the click landed at (%d,%d), want (9,4)", p.model.x, p.model.y)
 	}
 }
+
+// T2-C: a resize must update BOTH renderer dimensions, through the real apply()
+// path rather than by calling renderer_set_* directly -- the height half is new,
+// and the thing that could plausibly break is the wiring in apply(), not the
+// setter. Driven with a boxed Window_Size_Msg because that is exactly what
+// signals.odin's SIGWINCH branch puts in the mailbox (apply() box_free's it).
+@(test)
+test_window_size_msg_updates_both_renderer_dimensions :: proc(t: ^testing.T) {
+	fa: Frame_Arena
+	testing.expect(t, frame_arena_init(&fa) == nil, "frame arena init should succeed")
+	defer frame_arena_destroy(&fa)
+
+	mbox: Mailbox
+	testing.expect(t, mailbox_init(&mbox, 8) == nil, "mailbox init should succeed")
+	defer mailbox_destroy(&mbox)
+	disp: Dispatcher
+	dispatcher_init(&disp, &mbox, 1)
+	defer dispatcher_destroy(&disp)
+
+	b := strings.builder_make(); defer strings.builder_destroy(&b)
+	r: Renderer
+	renderer_init(&r, &b, 20, 5, .Full_Screen)
+
+	p: Program(Counter)
+	program_init(&p, Counter{}, counter_update, counter_view)
+
+	apply(&p, box(Window_Size_Msg{w = 80, h = 24}, context.allocator), &fa, &disp, &r, &b, -1)
+	testing.expect_value(t, r.term_width, 80)
+	testing.expect_value(t, r.term_height, 24)
+
+	// signals.odin's "the ioctl failed" sentinel is w == h == 0, and it must not
+	// clobber a previously-known-good size -- the same rule the width has always
+	// followed, now asserted for the height as well.
+	apply(&p, box(Window_Size_Msg{w = 0, h = 0}, context.allocator), &fa, &disp, &r, &b, -1)
+	testing.expect_value(t, r.term_width, 80)
+	testing.expect_value(t, r.term_height, 24)
+}

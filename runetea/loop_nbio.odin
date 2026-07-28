@@ -79,11 +79,14 @@ run_nbio :: proc(p: ^Program($T), fd: posix.FD, out: ^strings.Builder, flush_fd:
 	// with its own fd baked in, while run_nbio takes fd and flush_fd
 	// separately; flush_fd is still the right one to query here for the same
 	// reason it's the right one to write frames to (flush_frame's comment).
+	// The HEIGHT is threaded through here for the same reason and with the same
+	// degradation rules as in run() (T2-C) -- see the fuller note there.
 	initial_w := 0
+	initial_h := 0
 	if flush_fd >= 0 {
-		if w, _, ok := term_size(flush_fd); ok { initial_w = w }
+		if w, h, ok := term_size(flush_fd); ok { initial_w, initial_h = w, h }
 	}
-	renderer_init(&r, out, initial_w)
+	renderer_init(&r, out, initial_w, initial_h, p.render_mode)
 
 	// Initial paint, then the init Cmd -- identical to run(), and for the
 	// same reason: an app whose first action is asynchronous must still show
