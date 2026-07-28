@@ -205,6 +205,12 @@ test_kitty_push_and_pop_exactly_once :: proc(t: ^testing.T) {
 		got2 := drain_master(pty.master, buf2[:], len("\e[<1u"))
 		testing.expectf(t, got2 == "\e[<1u",
 			"%v: teardown wrote %q, want exactly one pop %q", c.kb, got2, "\e[<1u")
+		// ...AND NOTHING MORE. See exactly_once_needs_a_second_drain below for
+		// why this line exists even though the assertion above already catches
+		// every stacked-pop bug reachable today.
+		buf3: [64]u8
+		testing.expectf(t, drain_master(pty.master, buf3[:], 0) == "",
+			"%v: something arrived after the pop: %q", c.kb, drain_master(pty.master, buf3[:], 0))
 	}
 }
 
@@ -307,6 +313,10 @@ test_paste_set_and_reset_exactly_once :: proc(t: ^testing.T) {
 	got2 := drain_master(pty.master, buf2[:], len("\e[?2004l"))
 	testing.expectf(t, got2 == "\e[?2004l",
 		"teardown wrote %q, want exactly one reset %q", got2, "\e[?2004l")
+	// ...AND NOTHING MORE -- see exactly_once_needs_a_second_drain below.
+	buf3: [64]u8
+	testing.expectf(t, drain_master(pty.master, buf3[:], 0) == "",
+		"something arrived after the reset: %q", drain_master(pty.master, buf3[:], 0))
 }
 
 // The two opt-ins are independent layers and must pair independently. This
@@ -397,7 +407,35 @@ test_cursor_hide_and_show_exactly_once :: proc(t: ^testing.T) {
 	got2 := drain_master(pty.master, buf2[:], len("\e[?25h"))
 	testing.expectf(t, got2 == "\e[?25h",
 		"teardown wrote %q, want exactly one show %q", got2, "\e[?25h")
+	// ...AND NOTHING MORE -- see exactly_once_needs_a_second_drain below.
+	buf3: [64]u8
+	testing.expectf(t, drain_master(pty.master, buf3[:], 0) == "",
+		"something arrived after the show: %q", drain_master(pty.master, buf3[:], 0))
 }
+
+// Why every exactly-once test above ends with a second, want == 0 drain.
+//
+// T2-B flagged drain_master as too weak for these assertions, on the grounds
+// that it "stops the moment it has `want` bytes" and so would read exactly one
+// reset out of three stacked ones. That reading is wrong, and it was worth
+// checking rather than acting on: drain_master's read asks for `room` -- the
+// WHOLE remaining buffer -- not `want`, so a single read drains everything the
+// pty already holds, and `n >= want` then breaks with all of it in hand.
+// Verified by injecting two separate bugs into term_restore_c: three pops in
+// one call, and a never-cleared kitty_active so all three restore calls pop.
+// The original one-drain assertion caught BOTH ("\e[<1u\e[<1u\e[<1u" and eight
+// stacked pops respectively).
+//
+// The second drain is therefore hardening, not a bug fix, and is kept for one
+// reason: it closes the one case the first drain genuinely cannot see -- bytes
+// written strictly AFTER the read that satisfied `want`. Nothing in the
+// teardown path writes asynchronously today, which is exactly why the first
+// drain suffices today; this line is what keeps these tests honest if that ever
+// changes. All six exactly-once tests now assert the invariant the same way,
+// which matters more than the marginal coverage: an assertion that reads
+// "exactly one" should not quietly mean "one, followed by anything".
+@(private = "file")
+exactly_once_needs_a_second_drain :: 0
 
 // A program that never declares a cursor must never arm the show -- the opt-in
 // property, checked at the terminal rather than at the renderer.
