@@ -58,6 +58,12 @@ drive :: proc(t: ^testing.T, start: Model, script: string, b: ^strings.Builder) 
 
 	p: rt.Program(Model)
 	rt.program_init(&p, start, update, view)
+	// Exactly what main.odin does, and it has to be here too: without it these
+	// tests would drive a DIFFERENT program from the one that ships -- the
+	// cursor escapes would be missing from the golden, and cursor() itself
+	// (which runs inside rt's guarded view call, on every frame) would never be
+	// exercised at all.
+	p.cursor = cursor
 	err := rt.run(&p, &src, b)
 	testing.expectf(t, err == nil, "run should exit cleanly, got %v", err)
 	return p.model
@@ -226,10 +232,13 @@ test_page_down_scrolls_by_a_viewport :: proc(t: ^testing.T) {
 	drive(t, doc, PAGE_DOWN, &b)
 	out := strings.to_string(b)
 	last := out[strings.last_index(out, "RuneTea editor"):]
-	// Line 11 is the CURSOR line after one Page_Down, so its row reads
-	// " 11 |line" -- the caret sits at column 0. Line 12 is the plain form.
-	testing.expectf(t, strings.contains(last, " 11 |line"),
-		"view after Page_Down should show line 11 with the caret; frame was:\n%s", last)
+	// Every text row is now the plain form: the caret is the terminal's REAL
+	// cursor (see cursor()), not a glyph inserted into the text, so line 11 --
+	// the cursor's own line after one Page_Down -- reads exactly like every
+	// other row. It used to read " 11 |line", and the fact that this assertion
+	// had to change is the point: the old caret shifted every column after it.
+	testing.expectf(t, strings.contains(last, " 11 line"),
+		"view after Page_Down should show line 11; frame was:\n%s", last)
 	testing.expect(t, strings.contains(last, " 12 line"), "view after Page_Down should show line 12")
 	testing.expect(t, !strings.contains(last, "  1 line"), "view after Page_Down should not show line 1")
 	testing.expect(t, !strings.contains(last, " 21 line"), "view after Page_Down should not show line 21")
@@ -284,6 +293,69 @@ test_ctrl_i_help_panel_appears_in_the_view :: proc(t: ^testing.T) {
 	drive(t, init("x"), KITTY_CTRL_I, &b)
 	out := strings.to_string(b)
 	testing.expect(t, strings.contains(out, "CSI 105;5 u"), "the help panel should be painted")
+}
+
+// ---------------------------------------------------------------------------
+// T2-A: the real terminal cursor replaces the fake '|' caret.
+// ---------------------------------------------------------------------------
+
+// THE POINT OF THE WHOLE EXERCISE. cursor()'s column must be a DISPLAY column,
+// so a line of CJK text puts the caret where the glyphs actually end -- not
+// where a rune index (2 columns short here) or a byte index (2 columns long)
+// would put it. The old '|' caret could not get this wrong because it was
+// painted INTO the text, which is precisely why it also shifted every column
+// after it.
+@(test)
+test_cursor_column_is_a_display_column_not_a_rune_or_byte_index :: proc(t: ^testing.T) {
+	// cursor() builds its measuring prefix with the allocator it is handed --
+	// normally rt's frame arena, reclaimed wholesale after each frame. Here
+	// that is the temp allocator, freed below; using context.allocator would
+	// leak, and tools/test.sh's leak audit would (rightly) fail the run.
+	defer free_all(context.temp_allocator)
+
+	m := init("日本x")
+	m.cx = 2   // after "日本": 2 RUNES, 6 BYTES, 4 COLUMNS
+
+	c := cursor(m, context.temp_allocator)
+	testing.expect(t, c.show, "the editor always declares a cursor for a visible line")
+	testing.expectf(t, c.line == HEADER_LINES, "line = %d, want %d (first text row)", c.line, HEADER_LINES)
+	testing.expectf(t, c.col == GUTTER_COLS + 4,
+		"col = %d, want %d -- a rune index would give %d and a byte index %d",
+		c.col, GUTTER_COLS + 4, GUTTER_COLS + 2, GUTTER_COLS + 6)
+
+	// End of the line: "日本x" is 4 + 1 = 5 columns.
+	m.cx = 3
+	testing.expect_value(t, cursor(m, context.temp_allocator).col, GUTTER_COLS + 5)
+
+	// And the scroll offset, not the absolute line, is what picks the row.
+	long := long_doc()
+	long.cy = 12
+	long.top = 10
+	testing.expect_value(t, cursor(long, context.temp_allocator).line, HEADER_LINES + 2)
+}
+
+// End to end through the real loop: the last frame must END with the cursor
+// placement and the DECTCEM show, and must contain no '|' caret anywhere.
+@(test)
+test_the_rendered_frame_places_a_real_cursor_and_paints_no_caret_glyph :: proc(t: ^testing.T) {
+	b := strings.builder_make(); defer strings.builder_destroy(&b)
+	drive(t, init(""), "hello", &b)
+	out := strings.to_string(b)
+	last := out[strings.last_index(out, "\e[?25l"):]
+
+	// The view is 14 logical lines with no help panel (header, RULE, VIEWPORT
+	// text rows, RULE, status), and these tests run with no terminal, so
+	// term_width is 0 and every logical line is one physical row (width.odin's
+	// rows_for_line). The caret is on view line 2 (HEADER_LINES + row 0), i.e.
+	// 14 - 2 = 12 rows above home, at display column 4 + len("hello") = 9,
+	// which CHA spells 1-based as 10.
+	want :: "\e[12A\e[10G\e[?25h"
+	testing.expectf(t, strings.has_suffix(last, want),
+		"frame must end with the cursor placement %q; frame was:\n%q", want, last)
+	testing.expect(t, strings.has_prefix(last, "\e[?25l"),
+		"a cursor frame must hide the cursor before it repaints")
+	testing.expect(t, !strings.contains(last, "|"),
+		"the fake '|' caret must be gone -- it inserted a column and shifted everything after it")
 }
 
 // Golden bytes for a session that touches every binding at once. Same shape as

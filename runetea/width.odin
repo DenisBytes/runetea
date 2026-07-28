@@ -54,8 +54,128 @@ Width_Options :: struct {
 // clusters (letters, combining sequences, ZWJ emoji, flags); it must not
 // contain "\n" if the caller wants per-physical-row semantics -- see
 // rows_for_line, which splits on line boundaries itself.
+//
+// ANSI ESCAPE SEQUENCES ARE ZERO WIDTH (T2-A). This was a LIVE DEFECT, fixed
+// here, not a feature that was merely missing: every byte of "\e[7mX\e[0m" but
+// the two ESCs used to be measured as content (7 columns for one visible
+// glyph; the ESCs themselves already measured 0 because core:unicode's
+// normalized_east_asian_width returns 0 for is_control runes). That fed
+// rows_for_line, which fed Renderer.last_rows, which drives the rewind -- so
+// ANY styled line inflated the row count and desynchronised the next frame's
+// rewind. Identical failure class to the one
+// docs/superpowers/render-width-decision.md §1 reproduced under a pty, reached
+// by a different route.
+//
+// WHY A BYTE PRE-PASS RATHER THAN A CHECK INSIDE THE CLUSTER LOOP. The
+// grapheme iterator's byte-span reconstruction (defect 1 above) is the
+// delicate part of this file: it depends on consecutive byte_index values
+// closing each other's spans, and inserting a "was that cluster an escape?"
+// branch into that loop would mean recomputing spans around skipped regions --
+// the one thing this file must not get wrong. Instead the string is split at
+// ESC boundaries into escape-free SEGMENTS, and each segment is measured by
+// the untouched cluster loop (plain_width below). This is sound on bytes, not
+// just on runes, because 0x1B can never occur inside a multi-byte UTF-8
+// sequence (every continuation byte is >= 0x80), so a byte-level scan for ESC
+// can never split a rune. It is also allocation-free: segments are subslices,
+// nothing is copied or stripped into a buffer.
+//
+// The one behavioural consequence of measuring per segment: a grapheme cluster
+// SPLIT BY an escape ("e" + "\e[0m" + U+0301) is measured as two clusters
+// rather than one. That is the right answer anyway here -- the second segment
+// opens with a nonspacing mark, which defect 4's correction forces to 0, so
+// "e\e[0mU+0301" still measures 1, same as "é".
 @(require_results)
 display_width :: proc(s: string, opts := Width_Options{}) -> int {
+	if len(s) == 0 { return 0 }
+
+	total := 0
+	seg   := 0   // start of the current escape-free segment
+	i     := 0
+	for i < len(s) {
+		if s[i] != ESC { i += 1; continue }
+		total += plain_width(s[seg:i], opts)
+		i = skip_escape(s, i)   // always > i, so this loop always advances
+		seg = i
+	}
+	return total + plain_width(s[seg:], opts)
+}
+
+@(private = "file")
+ESC :: 0x1B
+@(private = "file")
+BEL :: 0x07
+
+// skip_escape returns the index one past the escape sequence beginning at
+// s[start] (which the caller has already checked is ESC). Everything it
+// consumes is zero width.
+//
+// UNTERMINATED ESCAPE AT END OF STRING -> ZERO WIDTH TO THE END, and that is a
+// choice. An escape running off the end of the string is a TRUNCATED escape:
+// the terminal will consume its missing tail from whatever bytes are written
+// next and will never paint those bytes as glyphs, so counting them as content
+// would reintroduce exactly the over-count this fix exists to remove -- on the
+// input where it is most likely to happen (a view truncated mid-style). The
+// opposite choice (measure the fragment as literal text) is only "safer" if
+// you believe the terminal will print "\e[3"; it will not.
+//
+// A MALFORMED escape MID-string is NOT swallowed to the end, though: the CSI
+// scan below stops at the first byte that cannot legally belong to a CSI and
+// resumes ordinary measurement AT that byte, so one stray "\e[" cannot silently
+// zero out the whole rest of a line.
+@(private = "file")
+skip_escape :: proc(s: string, start: int) -> int {
+	i := start + 1
+	if i >= len(s) { return len(s) }   // bare trailing ESC
+
+	switch s[i] {
+	case '[':
+		// CSI: ESC [ P...P I...I F, per ECMA-48 -- parameter bytes 0x30-0x3F,
+		// intermediate bytes 0x20-0x2F, final byte 0x40-0x7E. The two ranges
+		// are contiguous, so one scan over 0x20-0x3F covers both.
+		i += 1
+		for i < len(s) && s[i] >= 0x20 && s[i] <= 0x3F { i += 1 }
+		if i < len(s) && s[i] >= 0x40 && s[i] <= 0x7E { return i + 1 }
+		return i   // truncated (i == len) or malformed: resume measuring here
+
+	case ']', 'P', '^', '_', 'X':
+		// The ST-terminated string family: OSC (]), DCS (P), PM (^), APC (_)
+		// and SOS (X), all closed by ST ("\e\\") or, by long-standing xterm
+		// convention, by BEL. DELIBERATELY WIDER THAN THE OSC-ONLY CASE: the
+		// payload of any of these is arbitrary text (an OSC 8 hyperlink's URI,
+		// a Kitty-graphics APC base64 blob, a DCS sixel), and measuring THAT as
+		// content is the largest over-count this proc can possibly produce --
+		// far worse than an SGR's few bytes. Treating them as plain two-byte
+		// escapes instead would leave the entire payload to be counted.
+		i += 1
+		for i < len(s) {
+			if s[i] == BEL { return i + 1 }
+			if s[i] == ESC {
+				if i + 1 < len(s) && s[i + 1] == '\\' { return i + 2 }   // ST
+				return i   // a bare ESC inside: end this string here and let
+				           // the caller's loop re-dispatch on it
+			}
+			i += 1
+		}
+		return len(s)   // unterminated
+
+	case:
+		// Everything else: nF escapes (ESC + intermediates 0x20-0x2F + a final
+		// byte, e.g. "\e(B" to select ASCII -- THREE bytes, which is why this
+		// is not a flat "ESC plus one byte" rule; that would leave the 'B'
+		// behind to be counted as content) and the plain two-byte Fe/Fp/Fs
+		// escapes ("\eM", "\e7", "\e8"), which simply have no intermediates.
+		for i < len(s) && s[i] >= 0x20 && s[i] <= 0x2F { i += 1 }
+		if i < len(s) { return i + 1 }
+		return len(s)   // unterminated
+	}
+}
+
+// plain_width is display_width's original body, unchanged, over a segment
+// GUARANTEED to contain no ESC. Split out only so the escape pre-pass above
+// can call it once per segment without touching a line of the byte-span
+// reconstruction below.
+@(private = "file")
+plain_width :: proc(s: string, opts: Width_Options) -> int {
 	if len(s) == 0 { return 0 }
 
 	it := utf8.decode_grapheme_iterator_make(s)

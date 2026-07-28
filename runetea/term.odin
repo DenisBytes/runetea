@@ -40,6 +40,12 @@ Term_State :: struct {
 	// it guards is genuinely milder; see term_restore_c's "SET/RESET, NOT
 	// PUSH/POP" note for why, and for why the guard stays anyway.
 	paste_active: bool,
+	// T2-A. True from the first moment the renderer could have written a
+	// "\e[?25l" to this terminal. Set by cursor_hide_arm below (never
+	// cleared except by term_restore_c), so the paired "\e[?25h" is written
+	// on every teardown path -- see term_restore_c's DECTCEM note for why
+	// this one is deliberately STICKY where kitty_active is not.
+	cursor_hidden: bool,
 }
 
 // Process-global: signal handlers take no arguments and must reach this.
@@ -223,6 +229,52 @@ paste_enable :: proc(fd: posix.FD) {
 	}
 }
 
+// DECTCEM show. Static, and written from a signal handler, for exactly the
+// reasons KITTY_POP and PASTE_OFF are static (write(2) is async-signal-safe,
+// fmt and the allocator are not). Deliberately NOT paired here with a
+// CURSOR_HIDE constant: the hide is emitted by the renderer, into the frame
+// BUILDER, alongside the rest of a frame's bytes -- see cursor_hide_arm.
+@(private="file")
+CURSOR_SHOW: string : "\e[?25h"
+
+// Called by render.odin immediately BEFORE it writes a "\e[?25l" into a frame,
+// to arm the paired show in term_restore_c. Three things about it are
+// deliberate.
+//
+// GATED ON raw_active. This is the "did WE do it" check, and it has to be
+// something the renderer cannot answer itself: the renderer writes to a
+// strings.Builder and has no idea whether those bytes ever reach a terminal
+// (with flush_fd < 0 -- the golden harness, every unit test -- they never do).
+// raw_active is true exactly when this process has a tty it configured and
+// still owns, and g_term.fd is that tty. Without the gate, a golden-harness
+// render would arm a show against g_term.fd == 0, i.e. an unpaired "\e[?25h"
+// written to the test runner's own stdin.
+//
+// STICKY, unlike kitty_active/paste_active, which are cleared the moment their
+// undo is written. A frame contains its own hide AND its own show, so in the
+// happy path the terminal ends every frame with the cursor visible and this
+// flag is describing a state that no longer exists. It stays set anyway
+// because the bytes are not written by this proc -- they are BUFFERED, and
+// flush_frame's posix.write is a single unlooped call, so a short write can
+// deliver the hide and drop the show. Clearing the flag per frame would mean
+// the one case where the show went missing is also the one case where restore
+// stays silent. Sticky costs an idempotent extra "\e[?25h" at teardown;
+// non-sticky costs an invisible cursor forever.
+//
+// WHY THAT TRADE IS SAFE HERE AND WOULD NOT BE FOR KITTY. `\e[?25h` is
+// DECSET -- one boolean mode, no stack, no depth -- so writing it when the
+// cursor is already visible is a true no-op, and writing it unpaired can at
+// worst reveal a cursor some other program hid (bounded, immediately visible,
+// and trivially re-hidden by that program). `CSI < 1 u` is a stack POP: an
+// extra one silently eats an entry belonging to whoever is above us, from a
+// stack nobody can inspect. Same guard SHAPE, genuinely different hazard --
+// which is why kitty_active must be exact and this one is allowed to err
+// towards writing.
+@(private="package")
+cursor_hide_arm :: proc() {
+	if g_term.raw_active { g_term.cursor_hidden = true }
+}
+
 term_restore :: proc() {
 	term_restore_c()
 }
@@ -260,44 +312,62 @@ term_restore :: proc() {
 // than unbounded and invisible, so the guard is protecting against a smaller
 // hazard, and a bug in it would be correspondingly less destructive.
 //
-// ORDERING: termios FIRST, then the keyboard pop, then the paste reset. The
-// three are independent layers (kernel line discipline vs two separate pieces
-// of terminal-emulator state) so none depends on another, which leaves two
-// tie-breakers, and both point the same way. (1) This runs from a crash
-// handler; the only thing that can stop it half-way is a SECOND fatal signal,
-// so restorations go WORST-FIRST. A tty stranded in raw mode has no echo, no
-// line editing and no Ctrl+C -- the user must blind-type `reset`. A tty
-// stranded with an extra keyboard-stack entry still echoes and still
+// THE CURSOR IS DECTCEM -- ALSO SET/RESET, AND DELIBERATELY BIASED TOWARDS
+// WRITING. `\e[?25h` is DECSET 25, the same shape as bracketed paste and not
+// the Kitty stack's shape at all, so the reasoning is stated fresh rather than
+// copied: showing an already-visible cursor is a genuine no-op, and showing one
+// unpaired can at worst reveal a cursor another program hid -- bounded,
+// immediately visible to the user, and trivially undone by that program. The
+// guard (`cursor_hidden`) therefore exists to keep a process that never touched
+// the cursor silent, NOT to prevent a catastrophe, and unlike the other two it
+// is deliberately STICKY once armed -- see cursor_hide_arm for why (the hide is
+// buffered into a frame this proc never sees, and flush_frame's write is not
+// looped, so "the show got dropped" and "the show landed" are indistinguishable
+// from here; leaving a terminal with an invisible cursor is precisely the
+// "actively wrong output" this comment's last paragraph warns about).
+//
+// ORDERING: termios FIRST, then the keyboard pop, then the cursor show, then
+// the paste reset. The four are independent layers (kernel line discipline vs
+// three separate pieces of terminal-emulator state) so none depends on another,
+// which leaves two tie-breakers, and both point the same way. (1) This runs
+// from a crash handler; the only thing that can stop it half-way is a SECOND
+// fatal signal, so restorations go WORST-FIRST. A tty stranded in raw mode has
+// no echo, no line editing and no Ctrl+C -- the user must blind-type `reset`. A
+// tty stranded with an extra keyboard-stack entry still echoes and still
 // line-edits, but it can mis-report EVERY subsequent keystroke to the shell. A
-// tty stranded in bracketed-paste mode reports every keystroke correctly and
-// only wraps PASTES in literal "[200~"/"[201~" -- annoying, and invisible until
-// the user next pastes, but the smallest of the three. (2) tcsetattr cannot
-// block, write CAN (a full tty output queue), and blocking mid-crash before the
-// line discipline is back would be the worst of both. Writing both sequences
-// after the TCSAFLUSH also means neither is at risk from that flush.
+// tty stranded with an invisible cursor reports and echoes everything
+// correctly, but the user is left typing at a shell with no caret at all --
+// disorienting on every subsequent command, though nothing is actually
+// mistyped. A tty stranded in bracketed-paste mode reports every keystroke
+// correctly and only wraps PASTES in literal "[200~"/"[201~" -- annoying, and
+// invisible until the user next pastes, the smallest of the four. (2)
+// tcsetattr cannot block, write CAN (a full tty output queue), and blocking
+// mid-crash before the line discipline is back would be the worst of both.
+// Writing the three sequences after the TCSAFLUSH also means none is at risk
+// from that flush.
 //
 // The write targets a real tty by construction -- kitty_active can only be
 // true if tcgetattr succeeded on this fd -- so it can only fail with EIO once
 // the far end is gone, never SIGPIPE the way a pipe would.
 //
-// Emits no OTHER escape sequences (FIX 5, final fix-wave report). This used to
-// unconditionally write "\e[?1049l\e[?25h" -- leave alt screen, show
-// cursor -- on every exit path, but nothing in this package or its
-// examples ever writes the corresponding entry sequences ("\e[?1049h",
-// "\e[?25l"): render.odin is a naive INLINE rewind renderer (cursor-up +
-// erase-line, see renderer_render), not an alt-screen renderer, and the
-// cursor is never hidden. Restore must undo only what was actually set --
-// right now that is termios raw mode, nothing else. The old unconditional
-// write was an alt-screen EXIT the framework never entered: on
-// xterm-family terminals an unpaired "\e[?1049l" restores a cursor
-// position that was never saved, which is actively wrong output, not
-// merely a harmless no-op. T2/T3 may start hiding the cursor and/or
-// entering the alt screen; this restore must grow to match exactly that
-// when it does, and no more in the meantime. The Kitty pop above is the
-// first thing to meet that bar: it is written ONLY when this process
-// actually pushed.
+// STILL emits no other escape sequences, and the rule that produced that has
+// not moved (FIX 5, final fix-wave report). This used to unconditionally write
+// "\e[?1049l\e[?25h" -- leave alt screen, show cursor -- on every exit path,
+// while nothing in this package or its examples ever wrote the corresponding
+// ENTRY sequences: render.odin is a naive INLINE rewind renderer (cursor-up +
+// erase-line, see renderer_render), not an alt-screen renderer. That
+// unconditional write was an alt-screen EXIT the framework never entered: on
+// xterm-family terminals an unpaired "\e[?1049l" restores a cursor position
+// that was never saved, which is actively wrong output, not merely a harmless
+// no-op. The rule it was replaced with -- undo only what was actually set --
+// is what the flags below enforce, and it is why the cursor show returned only
+// now, with a flag behind it: T2-A gave render.odin a real "\e[?25l" to pair
+// with (Cursor / renderer_render), so the restore grew by EXACTLY that and
+// nothing more. Alt screen is still not entered anywhere, so "\e[?1049l" is
+// still not written anywhere. T3 may change that; if it does, it must arrive
+// with its own flag, set where the entry sequence is actually emitted.
 //
-// The three flags are checked INDEPENDENTLY rather than nested under one
+// The four flags are checked INDEPENDENTLY rather than nested under one
 // early return, so that no restoration can ever be skipped because of
 // another's state.
 term_restore_c :: proc "c" () {
@@ -308,6 +378,10 @@ term_restore_c :: proc "c" () {
 	if g_term.kitty_active {
 		posix.write(g_term.fd, raw_data(KITTY_POP), len(KITTY_POP))
 		g_term.kitty_active = false
+	}
+	if g_term.cursor_hidden {
+		posix.write(g_term.fd, raw_data(CURSOR_SHOW), len(CURSOR_SHOW))
+		g_term.cursor_hidden = false
 	}
 	if g_term.paste_active {
 		posix.write(g_term.fd, raw_data(PASTE_OFF), len(PASTE_OFF))

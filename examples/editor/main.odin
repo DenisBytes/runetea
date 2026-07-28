@@ -89,6 +89,12 @@ main :: proc() {
 
 	p: rt.Program(ed.Model)
 	rt.program_init(&p, ed.init(DOC), ed.update, ed.view)
+	// The REAL terminal cursor, T2-A. Set after program_init because
+	// program_init deliberately does not take it (see rt.Program.cursor) --
+	// every example written before T2 keeps compiling untouched, and only the
+	// one that actually needs a caret pays for one. This replaces the literal
+	// '|' this editor used to paint into its own text; see ed.cursor.
+	p.cursor = ed.cursor
 
 	// flush_fd = the tty, so each frame reaches the screen as it is rendered.
 	if err := rt.run(&p, &src, &b, fd); err != nil { fmt.eprintln("error:", err) }

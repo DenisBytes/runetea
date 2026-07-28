@@ -94,6 +94,136 @@ test_is_ambiguous_width_table_lookup :: proc(t: ^testing.T) {
 	testing.expect(t, !is_ambiguous_width('a'), "ASCII letter must not be Ambiguous")
 }
 
+// ---------------------------------------------------------------------------
+// T2-A part 1: ANSI escape sequences are ZERO WIDTH.
+//
+// This was a live defect, not a missing feature: display_width counted an
+// escape's bytes as content, so rows_for_line over-counted rows for any styled
+// line, so Renderer.last_rows over-counted, so the NEXT frame's rewind ate
+// rows it never painted. Exactly the failure class
+// docs/superpowers/render-width-decision.md §1 reproduced under a pty, reached
+// by a second route. Measured before the fix on this toolchain:
+// display_width("\e[7mX\e[0m") == 7 (the two ESC bytes themselves already
+// measured 0; the remaining seven printable bytes each measured 1).
+// ---------------------------------------------------------------------------
+
+@(test)
+test_display_width_ignores_sgr_escapes :: proc(t: ^testing.T) {
+	// The headline case. One visible glyph wrapped in reverse-video on/off.
+	testing.expect_value(t, display_width("\e[7mX\e[0m"), 1)
+	// A styled string must measure exactly the same as its unstyled twin --
+	// stated as an equality so the expectation cannot drift from the plain
+	// measurement it is supposed to match.
+	testing.expect_value(t, display_width("\e[1;31mhello\e[0m"), display_width("hello"))
+	// A parameterless CSI ("\e[m" -- SGR reset, no params at all) followed by
+	// two ordinary letters. ECMA-48: params 0x30-0x3F, intermediates
+	// 0x20-0x2F, final 0x40-0x7E, so 'm' here is the FINAL byte and "ax" is
+	// content.
+	testing.expect_value(t, display_width("\e[max"), 2)
+	testing.expect_value(t, display_width("a\e[2Kb"), 2)
+	testing.expect_value(t, display_width("a\e[?25lb"), 2)   // '?' is a private param byte
+}
+
+@(test)
+test_display_width_ignores_nested_and_repeated_escapes :: proc(t: ^testing.T) {
+	// Several sequences, adjacent and interleaved, including empty runs
+	// between them -- the segment loop must not double-count or skip a
+	// boundary byte when two escapes touch.
+	s := "\e[1m\e[4m\e[38;5;196mred\e[39m\e[24m\e[22m"
+	testing.expect_value(t, display_width(s), 3)
+	testing.expect_value(t, display_width("\e[1m\e[1m\e[1m"), 0)
+	testing.expect_value(t, display_width("a\e[1mb\e[0mc"), 3)
+}
+
+@(test)
+test_display_width_ignores_osc_hyperlinks :: proc(t: ^testing.T) {
+	// OSC 8 hyperlink: ESC ] 8 ; ; <uri> ST  <text>  ESC ] 8 ; ; ST.
+	// The URI is inside the escape and must contribute nothing -- an OSC 8
+	// link is the single worst case for the old code, because the URI is
+	// arbitrarily long and entirely invisible.
+	st_form  := "\e]8;;https://example.com\e\\link\e]8;;\e\\"
+	bel_form := "\e]8;;https://example.com\alink\e]8;;\a"      // BEL-terminated, the other legal form
+	testing.expect_value(t, display_width(st_form), 4)
+	testing.expect_value(t, display_width(bel_form), 4)
+	// A window-title OSC, the other common one.
+	testing.expect_value(t, display_width("\e]0;my title\ax"), 1)
+}
+
+@(test)
+test_display_width_escape_adjacent_to_a_wide_rune :: proc(t: ^testing.T) {
+	// The escape must not disturb the grapheme iterator's byte-span
+	// reconstruction (defect 1) for the runes around it. Note "日" is 3 bytes
+	// / 2 columns, so a byte-length measure and a width measure differ on
+	// BOTH sides of the escape.
+	testing.expect_value(t, display_width("\e[7m日\e[0m"), 2)
+	testing.expect_value(t, display_width("日\e[0m本"), 4)
+	// And with a corrected cluster (defect 2's VS16 heart) straddling nothing:
+	// the escape splits the string into segments, and each segment is measured
+	// on its own, so a correction that keys off the FIRST rune of a segment
+	// must still fire.
+	testing.expect_value(t, display_width("\e[31m❤️\e[0m"), 2)
+	testing.expect_value(t, display_width("\e[31m\U0001F1EF\U0001F1F5\e[0m"), 2)
+}
+
+@(test)
+test_display_width_unterminated_escape_is_zero_width :: proc(t: ^testing.T) {
+	// CHOICE, stated because it is a choice: an escape sequence that runs off
+	// the end of the string is treated as ZERO WIDTH (everything from the ESC
+	// to end-of-string is consumed and contributes nothing), not as literal
+	// text. Rationale: an unterminated escape is a truncated one, and the
+	// terminal will consume the missing tail from whatever is written NEXT --
+	// it never renders those bytes as glyphs. Measuring them as content would
+	// reintroduce exactly the over-count this whole fix removes, on the one
+	// input where a mistake is most likely (a view truncated mid-style).
+	testing.expect_value(t, display_width("ab\e[3"), 2)      // CSI, no final byte
+	testing.expect_value(t, display_width("ab\e["), 2)
+	testing.expect_value(t, display_width("ab\e"), 2)        // bare trailing ESC
+	testing.expect_value(t, display_width("ab\e]8;;http://x"), 2)   // OSC, no ST/BEL
+	// A MALFORMED CSI mid-string is NOT swallowed to the end: the scan stops
+	// at the first byte that cannot belong to a CSI (here the 'y' is a final
+	// byte, so that one terminates normally; the second case's 0x07 is not a
+	// param, intermediate or final byte, so measurement resumes AT it).
+	testing.expect_value(t, display_width("\e[1yZ"), 1)
+	testing.expect_value(t, display_width("\e[1\aZ"), 1)     // BEL is not a CSI final; 'Z' still counts
+}
+
+@(test)
+test_display_width_two_byte_and_string_escapes :: proc(t: ^testing.T) {
+	// Two-byte Fe/Fs escapes: ESC M (reverse index), ESC 7 / ESC 8 (save /
+	// restore cursor).
+	testing.expect_value(t, display_width("a\eMb"), 2)
+	testing.expect_value(t, display_width("\e7x\e8"), 1)
+	// nF escapes carry intermediates before the final byte: ESC ( B selects
+	// the ASCII charset and is THREE bytes. A strict "ESC + one byte" rule
+	// would leave the 'B' behind and over-count by one.
+	testing.expect_value(t, display_width("\e(Bx"), 1)
+	// DCS/APC/PM/SOS are ST-terminated strings like OSC -- notably the Kitty
+	// graphics protocol's APC payload, which is base64 and arbitrarily long.
+	testing.expect_value(t, display_width("\e_Gf=100,a=T;AAAA\e\\x"), 1)
+	testing.expect_value(t, display_width("\ePq#0;2;0;0;0\e\\x"), 1)
+}
+
+// THE REGRESSION TEST FOR THE ACTUAL BUG: the row count, not the width.
+// A styled line and its unstyled twin must occupy the same number of physical
+// rows. Before the fix the styled form measured 8 columns wider (the two SGR
+// sequences' printable bytes) and tipped over the wrap boundary.
+@(test)
+test_rows_for_line_styled_line_matches_the_identical_unstyled_line :: proc(t: ^testing.T) {
+	plain  := "0123456789012345678"                 // 19 columns -- 1 row at width 20
+	styled := "\e[7m0123456789012345678\e[0m"        // same 19 columns, 27 bytes
+	testing.expect_value(t, len(styled), 27)
+	testing.expect_value(t, display_width(styled), display_width(plain))
+	testing.expect_value(t, rows_for_line(styled, 20, {}), rows_for_line(plain, 20, {}))
+	testing.expect_value(t, rows_for_line(styled, 20, {}), 1)   // NOT 2 -- the pre-fix answer
+
+	// And at a width where the content genuinely DOES wrap, both still agree
+	// -- the fix must not simply clamp everything to one row.
+	long_plain  :: "0123456789012345678901234567890123456789"   // 40 columns
+	long_styled :: "\e[1;32m" + long_plain + "\e[0m"
+	testing.expect_value(t, rows_for_line(long_plain, 20, {}), 2)
+	testing.expect_value(t, rows_for_line(long_styled, 20, {}), 2)
+}
+
 @(test)
 test_rows_for_line_unknown_width_is_always_one_row :: proc(t: ^testing.T) {
 	// term_width <= 0 means "unknown" and must never divide by zero or guess

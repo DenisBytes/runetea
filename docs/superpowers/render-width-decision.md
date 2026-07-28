@@ -456,3 +456,35 @@ logical line is still written to the builder exactly once, whole; the
 terminal does its own wrapping. The only thing that changed is how many
 physical rows the renderer believes that wrapping produced, for rewind
 counting.
+
+---
+
+## 8. Amendment (T2-A, 2026-07-28) — two statements above are now out of date
+
+This document is T1's evidence trail and is otherwise left as written. Two of
+its claims were overtaken by T2-A; the authoritative text is now the doc
+comments in `runetea/width.odin` and `runetea/render.odin`.
+
+1. **§3 / the width layer: escapes were counted as content.** `display_width`
+   measured every byte of an ANSI escape except the `ESC` itself (which
+   `normalized_east_asian_width` already returned 0 for, via `is_control`), so
+   `display_width("\e[7mX\e[0m")` was **7**. That fed `rows_for_line` → 
+   `last_rows` → the rewind, i.e. the *exact* defect class §1 reproduced under a
+   pty, reached through styling instead of through wrapping. Now **1**: escapes
+   are skipped by a byte pre-pass that splits the string at `ESC` boundaries and
+   runs the (untouched) grapheme-cluster loop per escape-free segment. Covered:
+   CSI, the ST-terminated string family (OSC/DCS/PM/APC/SOS), nF/Fe/Fp/Fs
+   two-or-more-byte escapes, and unterminated escapes (zero width to
+   end-of-string — a stated choice, see `skip_escape`).
+
+2. **§4's "Column positioning" and §7's "no cursor positioning".** The rewind
+   itself still needs no `\e[G`/`\r` fixup, and that reasoning is unchanged and
+   still load-bearing. What changed is that apps can now *place* the cursor
+   (`rt.Cursor` + `Program.cursor`), which necessarily leaves it somewhere other
+   than home. The invariant is preserved by **restoring home first**: a frame
+   that placed a cursor `n` rows up begins the next frame with `\e[<n>B\r`
+   before any rewind byte, so the rewind loop and §4's proof are untouched. The
+   two moves are symmetric by construction, which is why the placement clamps
+   into the painted frame (CUU/CUD stop at the screen margins, so an overshoot
+   would truncate on the way up but not on the way down). `examples/editor` no
+   longer paints a `|` caret glyph.

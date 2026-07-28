@@ -1,6 +1,7 @@
 package runetea
 
 import "core:c"
+import "core:strings"
 import "core:sys/posix"
 import "core:testing"
 import "core:time"
@@ -332,6 +333,161 @@ test_kitty_and_paste_pair_independently :: proc(t: ^testing.T) {
 	buf2: [64]u8
 	got2 := drain_master(pty.master, buf2[:], len(want_out))
 	testing.expectf(t, got2 == want_out, "teardown wrote %q, want %q", got2, want_out)
+}
+
+// ---------------------------------------------------------------------------
+// T2-A: DECTCEM's hide/show pairing. Same pty technique and same test SHAPE as
+// the two pairings above, because the invariant is the same one -- never leave
+// the terminal in a state this process put it in.
+//
+// What differs, again stated rather than copied. `\e[?25l` / `\e[?25h` are
+// DECSET/DECRST 25: a mode set and reset, not a stack push and pop, so an
+// extra show is a genuine no-op and an UNPAIRED show can at worst reveal a
+// cursor some other program hid -- visible instantly and trivially re-hidden.
+// The hazard is entirely on the other side: a terminal left with an INVISIBLE
+// cursor after a crash leaves the user typing at a shell with no caret, which
+// is exactly the "actively wrong output" term_restore_c's own comment was
+// written about. So `cursor_hidden` is biased towards writing, and is STICKY
+// once armed, unlike kitty_active and paste_active -- see cursor_hide_arm.
+//
+// The other structural difference: the hide is not written by term.odin at
+// all. render.odin buffers it into a frame, so these tests drive the REAL
+// renderer and flush its REAL bytes at the pty, rather than asserting on a
+// sequence this file emits.
+// ---------------------------------------------------------------------------
+
+@(test)
+test_cursor_hide_and_show_exactly_once :: proc(t: ^testing.T) {
+	pty, ok := open_test_pty()
+	if !testing.expect(t, ok, "could not open a pty") { return }
+	defer close_test_pty(pty)
+	g_term = {}
+	defer g_term = {}
+
+	testing.expect(t, term_enter_raw(pty.slave), "term_enter_raw should succeed")
+	testing.expect(t, !g_term.cursor_hidden, "entering raw mode alone must not arm the cursor show")
+
+	b := strings.builder_make(); defer strings.builder_destroy(&b)
+	r: Renderer
+	renderer_init(&r, &b)
+	renderer_render(&r, "hi", Cursor{line = 0, col = 1, show = true})
+	testing.expect(t, g_term.cursor_hidden,
+		"a frame that hides the cursor must arm the paired show BEFORE its bytes are flushed")
+	flush_frame(&b, pty.slave)
+
+	frame := "\e[?25l" + "hi\r\n" + "\e[1A\e[2G" + "\e[?25h"
+	buf: [64]u8
+	got := drain_master(pty.master, buf[:], len(frame))
+	testing.expectf(t, got == frame, "frame was %q, want %q", got, frame)
+
+	// Three teardowns: the orderly one, a redundant repeat, and the
+	// signal-handler entry point. Exactly ONE show must come out -- the frame
+	// already ended with one, so this is the redundant-but-cheap insurance
+	// described in cursor_hide_arm, and a SECOND one here would mean the flag
+	// guard is not working at all.
+	term_restore()
+	testing.expect(t, !g_term.cursor_hidden, "restore must clear cursor_hidden")
+	term_restore()
+	term_restore_c()
+
+	buf2: [64]u8
+	got2 := drain_master(pty.master, buf2[:], len("\e[?25h"))
+	testing.expectf(t, got2 == "\e[?25h",
+		"teardown wrote %q, want exactly one show %q", got2, "\e[?25h")
+}
+
+// A program that never declares a cursor must never arm the show -- the opt-in
+// property, checked at the terminal rather than at the renderer.
+@(test)
+test_a_frame_without_a_cursor_arms_nothing :: proc(t: ^testing.T) {
+	pty, ok := open_test_pty()
+	if !testing.expect(t, ok, "could not open a pty") { return }
+	defer close_test_pty(pty)
+	g_term = {}
+	defer g_term = {}
+
+	testing.expect(t, term_enter_raw(pty.slave), "term_enter_raw should succeed")
+
+	b := strings.builder_make(); defer strings.builder_destroy(&b)
+	r: Renderer
+	renderer_init(&r, &b)
+	renderer_render(&r, "hi")
+	renderer_render(&r, "ho")
+	flush_frame(&b, pty.slave)
+
+	frame := "hi\r\n" + "\e[1A\e[2K" + "ho\r\n"
+	buf: [64]u8
+	got := drain_master(pty.master, buf[:], len(frame))
+	testing.expectf(t, got == frame, "frame was %q, want %q (no DECTCEM at all)", got, frame)
+	testing.expect(t, !g_term.cursor_hidden, "a cursor-less frame must not arm the show")
+
+	term_restore()
+	buf2: [64]u8
+	testing.expectf(t, drain_master(pty.master, buf2[:], 0) == "",
+		"teardown after a cursor-less session wrote something -- an unpaired \\e[?25h reveals a cursor another program hid")
+}
+
+// THE CRASH PATH, and the case the sticky flag exists for. The child renders a
+// real frame, then writes only its LEADING HIDE to the tty before dying by
+// signal -- which is exactly what flush_frame's single, unlooped posix.write
+// does under a short write: the hide lands, the trailing show does not. The
+// child's `defer`s never run (it dies BY SIGNAL), so the show has to come from
+// guard.odin's crash_handler calling term_restore_c, or the terminal is left
+// with no cursor at all.
+//
+// This is the scenario that makes cursor_hidden sticky rather than per-frame.
+// A flag cleared at the end of every frame would be false right here -- in the
+// one situation where the terminal really is left hidden.
+@(test)
+test_cursor_shows_on_the_crash_path_after_a_truncated_frame :: proc(t: ^testing.T) {
+	pty, ok := open_test_pty()
+	if !testing.expect(t, ok, "could not open a pty") { return }
+	defer close_test_pty(pty)
+
+	pid := posix.fork()
+	if !testing.expect(t, pid >= 0, "fork failed") { return }
+
+	if pid == 0 {
+		// CHILD. No `defer term_restore()`: this proves the SIGNAL path shows.
+		posix.close(pty.master)
+		install_crash_handlers()
+		if !term_enter_raw(pty.slave) { posix._exit(1) }
+
+		// No `defer strings.builder_destroy`: this scope ends in a diverging
+		// _exit (and, before that, in death by signal), so Odin rejects the
+		// defer as unreachable -- correctly. Nothing here is freed, on purpose.
+		b := strings.builder_make()
+		r: Renderer
+		renderer_init(&r, &b)
+		renderer_render(&r, "hi", Cursor{line = 0, col = 0, show = true})
+		// Emulate flush_frame's unlooped write delivering only the head of the
+		// frame. Six bytes is exactly "\e[?25l".
+		s := strings.to_string(b)
+		posix.write(pty.slave, raw_data(s), 6)
+
+		posix.raise(posix.Signal.SIGTERM)
+		posix._exit(1)   // NOT REACHED: crash_handler re-raises with SIG_DFL
+	}
+
+	status: c.int
+	exited := false
+	for _ in 0 ..< 200 {
+		if posix.waitpid(pid, &status, {.NOHANG}) == pid { exited = true; break }
+		time.sleep(5 * time.Millisecond)
+	}
+	if !exited {
+		posix.kill(pid, posix.Signal.SIGKILL)
+		testing.expect(t, false, "child did not die within 1s")
+		return
+	}
+	testing.expect(t, posix.WIFSIGNALED(status),
+		"the child must die BY SIGNAL -- if it exited normally, crash_handler never ran")
+
+	buf: [64]u8
+	want := "\e[?25l\e[?25h"
+	got := drain_master(pty.master, buf[:], len(want))
+	testing.expectf(t, got == want,
+		"crash path wrote %q, want a hide then exactly one show %q", got, want)
 }
 
 // The crash path, end to end and for real -- the exact shape of

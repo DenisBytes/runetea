@@ -98,6 +98,24 @@ Program :: struct($T: typeid) {
 	update:   proc(model: ^T, msg: any, alloc: mem.Allocator) -> Cmd,
 
 	view:     proc(model: T, alloc: mem.Allocator) -> string,
+
+	// OPTIONAL (T2-A). nil -- the zero value, and what program_init leaves it
+	// as -- means "this program does not place the cursor", and then the
+	// renderer emits not one extra byte (render.odin's Cursor). Set it
+	// directly on either side of the program_init call, exactly like `legacy`
+	// below; program_init deliberately does not take it, so no call site
+	// written before T2 has to change.
+	//
+	// Called once per frame, immediately AFTER view and under the SAME
+	// guarded() call (see guarded_render), from the same model and with the
+	// same frame allocator -- so it can build whatever prefix string it needs
+	// to measure with display_width, and that string dies with the frame.
+	//
+	// IT IS THE APP'S JOB to keep this consistent with what view actually
+	// painted; nothing can check that for it. The coordinates are the VIEW's
+	// (logical line index + DISPLAY column), not the terminal's -- see Cursor.
+	cursor:   proc(model: T, alloc: mem.Allocator) -> Cursor,
+
 	init_cmd: Cmd,
 	quit:     bool,
 	// Which side of each legacy C0 collision this program wants (see
@@ -525,11 +543,17 @@ apply :: proc(p: ^Program($T), msg: any, fa: ^Frame_Arena, disp: ^Dispatcher, r:
 
 // Shared state for the guarded View call, mirroring Step above -- longjmp
 // discards the frame, so the view string produced (or not) lives outside it.
+// `cur` is the same story for the optional cursor callback, which runs inside
+// the SAME guarded body: it is written only if that body reaches it, so a
+// panic in view leaves it at its zero value ("no cursor declared") and the
+// diagnostic frame below places no cursor -- which is what you want when the
+// app's own idea of where the caret goes is exactly what just crashed.
 @(private="file")
 View_Step :: struct($T: typeid) {
 	p:     ^Program(T),
 	alloc: mem.Allocator,
 	view:  string,
+	cur:   Cursor,
 }
 
 // Renders exactly one frame under guarded(): calls p.view, writes it through
@@ -582,10 +606,19 @@ View_Step :: struct($T: typeid) {
 // neither is allowed to corrupt state and continue.
 @(private="package")
 guarded_render :: proc(p: ^Program($T), fa: ^Frame_Arena, r: ^Renderer, out: ^strings.Builder, flush_fd: posix.FD) -> Run_Error {
+	// p.cursor runs INSIDE this same guarded body rather than in a second
+	// guarded() call of its own. Two reasons. It is user code and must be
+	// covered (an app that indexes a slice to find its caret can panic exactly
+	// like a view can), and running it here costs nothing extra: it is a
+	// sequential call at the same stack depth as p.view, not a nested one, so
+	// the non-nesting constraint discussed below is untouched. It runs AFTER
+	// view because that is the order the app itself reasons in -- the cursor
+	// describes a position in the frame view just produced.
 	vs := View_Step(T){p = p, alloc = frame_allocator(fa)}
 	info := guarded(proc(ud: rawptr) {
 		s := cast(^View_Step(T))ud
 		s.view = s.p.view(s.p.model, s.alloc)
+		if s.p.cursor != nil { s.cur = s.p.cursor(s.p.model, s.alloc) }
 	}, &vs)
 
 	if info.recovered {
@@ -601,7 +634,7 @@ guarded_render :: proc(p: ^Program($T), fa: ^Frame_Arena, r: ^Renderer, out: ^st
 		return Panicked_Error{message = info.message}
 	}
 
-	renderer_render(r, vs.view)
+	renderer_render(r, vs.view, vs.cur)
 	flush_frame(out, flush_fd)
 	frame_reset(fa)
 	return nil

@@ -1,6 +1,6 @@
-RuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
+[?25lRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
 --------------------------------------------------------------------------
-  1 |
+  1 
    ~
    ~
    ~
@@ -12,9 +12,9 @@ RuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl
    ~
 --------------------------------------------------------------------------
 Ln 1, Col 1   1 lines   window 1-1   kitty:off   last:-
-[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
+[12A[5G[?25h[?25l[12B[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
 --------------------------------------------------------------------------
-  1 h|
+  1 h
    ~
    ~
    ~
@@ -26,9 +26,9 @@ Ln 1, Col 1   1 lines   window 1-1   kitty:off   last:-
    ~
 --------------------------------------------------------------------------
 Ln 1, Col 2   1 lines   window 1-1   kitty:off   last:insert
-[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
+[12A[6G[?25h[?25l[12B[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
 --------------------------------------------------------------------------
-  1 he|
+  1 he
    ~
    ~
    ~
@@ -40,9 +40,9 @@ Ln 1, Col 2   1 lines   window 1-1   kitty:off   last:insert
    ~
 --------------------------------------------------------------------------
 Ln 1, Col 3   1 lines   window 1-1   kitty:off   last:insert
-[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
+[12A[7G[?25h[?25l[12B[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
 --------------------------------------------------------------------------
-  1 hel|
+  1 hel
    ~
    ~
    ~
@@ -54,9 +54,9 @@ Ln 1, Col 3   1 lines   window 1-1   kitty:off   last:insert
    ~
 --------------------------------------------------------------------------
 Ln 1, Col 4   1 lines   window 1-1   kitty:off   last:insert
-[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
+[12A[8G[?25h[?25l[12B[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
 --------------------------------------------------------------------------
-  1 hell|
+  1 hell
    ~
    ~
    ~
@@ -68,9 +68,9 @@ Ln 1, Col 4   1 lines   window 1-1   kitty:off   last:insert
    ~
 --------------------------------------------------------------------------
 Ln 1, Col 5   1 lines   window 1-1   kitty:off   last:insert
-[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
+[12A[9G[?25h[?25l[12B[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
 --------------------------------------------------------------------------
-  1 hello|
+  1 hello
    ~
    ~
    ~
@@ -82,9 +82,9 @@ Ln 1, Col 5   1 lines   window 1-1   kitty:off   last:insert
    ~
 --------------------------------------------------------------------------
 Ln 1, Col 6   1 lines   window 1-1   kitty:off   last:insert
-[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
+[12A[10G[?25h[?25l[12B[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
 --------------------------------------------------------------------------
-  1 hello |
+  1 hello 
    ~
    ~
    ~
@@ -96,9 +96,9 @@ Ln 1, Col 6   1 lines   window 1-1   kitty:off   last:insert
    ~
 --------------------------------------------------------------------------
 Ln 1, Col 7   1 lines   window 1-1   kitty:off   last:insert
-[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
+[12A[11G[?25h[?25l[12B[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
 --------------------------------------------------------------------------
-  1 hello w|
+  1 hello w
    ~
    ~
    ~
@@ -110,9 +110,9 @@ Ln 1, Col 7   1 lines   window 1-1   kitty:off   last:insert
    ~
 --------------------------------------------------------------------------
 Ln 1, Col 8   1 lines   window 1-1   kitty:off   last:insert
-[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
+[12A[12G[?25h[?25l[12B[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
 --------------------------------------------------------------------------
-  1 hello wo|
+  1 hello wo
    ~
    ~
    ~
@@ -124,9 +124,9 @@ Ln 1, Col 8   1 lines   window 1-1   kitty:off   last:insert
    ~
 --------------------------------------------------------------------------
 Ln 1, Col 9   1 lines   window 1-1   kitty:off   last:insert
-[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
+[12A[13G[?25h[?25l[12B[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
 --------------------------------------------------------------------------
-  1 hello wor|
+  1 hello wor
    ~
    ~
    ~
@@ -138,9 +138,9 @@ Ln 1, Col 9   1 lines   window 1-1   kitty:off   last:insert
    ~
 --------------------------------------------------------------------------
 Ln 1, Col 10   1 lines   window 1-1   kitty:off   last:insert
-[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
+[12A[14G[?25h[?25l[12B[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
 --------------------------------------------------------------------------
-  1 hello worl|
+  1 hello worl
    ~
    ~
    ~
@@ -152,9 +152,9 @@ Ln 1, Col 10   1 lines   window 1-1   kitty:off   last:insert
    ~
 --------------------------------------------------------------------------
 Ln 1, Col 11   1 lines   window 1-1   kitty:off   last:insert
-[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
+[12A[15G[?25h[?25l[12B[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
 --------------------------------------------------------------------------
-  1 hello world|
+  1 hello world
    ~
    ~
    ~
@@ -166,9 +166,9 @@ Ln 1, Col 11   1 lines   window 1-1   kitty:off   last:insert
    ~
 --------------------------------------------------------------------------
 Ln 1, Col 12   1 lines   window 1-1   kitty:off   last:insert
-[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
+[12A[16G[?25h[?25l[12B[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
 --------------------------------------------------------------------------
-  1 |hello world
+  1 hello world
    ~
    ~
    ~
@@ -180,9 +180,9 @@ Ln 1, Col 12   1 lines   window 1-1   kitty:off   last:insert
    ~
 --------------------------------------------------------------------------
 Ln 1, Col 1   1 lines   window 1-1   kitty:off   last:home
-[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
+[12A[5G[?25h[?25l[12B[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
 --------------------------------------------------------------------------
-  1 hello| world
+  1 hello world
    ~
    ~
    ~
@@ -194,23 +194,9 @@ Ln 1, Col 1   1 lines   window 1-1   kitty:off   last:home
    ~
 --------------------------------------------------------------------------
 Ln 1, Col 6   1 lines   window 1-1   kitty:off   last:word-right
-[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
+[12A[10G[?25h[?25l[12B[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
 --------------------------------------------------------------------------
-  1 hello|world
-   ~
-   ~
-   ~
-   ~
-   ~
-   ~
-   ~
-   ~
-   ~
---------------------------------------------------------------------------
-Ln 1, Col 6   1 lines   window 1-1   kitty:off   last:delete
-[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
---------------------------------------------------------------------------
-  1 hello|orld
+  1 helloworld
    ~
    ~
    ~
@@ -222,9 +208,23 @@ Ln 1, Col 6   1 lines   window 1-1   kitty:off   last:delete
    ~
 --------------------------------------------------------------------------
 Ln 1, Col 6   1 lines   window 1-1   kitty:off   last:delete
-[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
+[12A[10G[?25h[?25l[12B[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
 --------------------------------------------------------------------------
-  1 helloorld|
+  1 helloorld
+   ~
+   ~
+   ~
+   ~
+   ~
+   ~
+   ~
+   ~
+   ~
+--------------------------------------------------------------------------
+Ln 1, Col 6   1 lines   window 1-1   kitty:off   last:delete
+[12A[10G[?25h[?25l[12B[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
+--------------------------------------------------------------------------
+  1 helloorld
    ~
    ~
    ~
@@ -236,9 +236,9 @@ Ln 1, Col 6   1 lines   window 1-1   kitty:off   last:delete
    ~
 --------------------------------------------------------------------------
 Ln 1, Col 10   1 lines   window 1-1   kitty:off   last:end
-[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
+[12A[14G[?25h[?25l[12B[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
 --------------------------------------------------------------------------
-  1 helloorl|
+  1 helloorl
    ~
    ~
    ~
@@ -250,10 +250,10 @@ Ln 1, Col 10   1 lines   window 1-1   kitty:off   last:end
    ~
 --------------------------------------------------------------------------
 Ln 1, Col 9   1 lines   window 1-1   kitty:off   last:backspace
-[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
+[12A[13G[?25h[?25l[12B[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
 --------------------------------------------------------------------------
   1 helloorl
-  2 |
+  2 
    ~
    ~
    ~
@@ -264,10 +264,10 @@ Ln 1, Col 9   1 lines   window 1-1   kitty:off   last:backspace
    ~
 --------------------------------------------------------------------------
 Ln 2, Col 1   2 lines   window 1-2   kitty:off   last:newline
-[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
+[11A[5G[?25h[?25l[11B[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
 --------------------------------------------------------------------------
   1 helloorl
-  2     |
+  2     
    ~
    ~
    ~
@@ -278,10 +278,10 @@ Ln 2, Col 1   2 lines   window 1-2   kitty:off   last:newline
    ~
 --------------------------------------------------------------------------
 Ln 2, Col 5   2 lines   window 1-2   kitty:off   last:indent
-[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
+[11A[9G[?25h[?25l[11B[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
 --------------------------------------------------------------------------
   1 helloorl
-  2     s|
+  2     s
    ~
    ~
    ~
@@ -292,10 +292,10 @@ Ln 2, Col 5   2 lines   window 1-2   kitty:off   last:indent
    ~
 --------------------------------------------------------------------------
 Ln 2, Col 6   2 lines   window 1-2   kitty:off   last:insert
-[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
+[11A[10G[?25h[?25l[11B[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
 --------------------------------------------------------------------------
   1 helloorl
-  2     se|
+  2     se
    ~
    ~
    ~
@@ -306,10 +306,10 @@ Ln 2, Col 6   2 lines   window 1-2   kitty:off   last:insert
    ~
 --------------------------------------------------------------------------
 Ln 2, Col 7   2 lines   window 1-2   kitty:off   last:insert
-[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
+[11A[11G[?25h[?25l[11B[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
 --------------------------------------------------------------------------
   1 helloorl
-  2     sec|
+  2     sec
    ~
    ~
    ~
@@ -320,10 +320,10 @@ Ln 2, Col 7   2 lines   window 1-2   kitty:off   last:insert
    ~
 --------------------------------------------------------------------------
 Ln 2, Col 8   2 lines   window 1-2   kitty:off   last:insert
-[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
+[11A[12G[?25h[?25l[11B[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
 --------------------------------------------------------------------------
   1 helloorl
-  2     seco|
+  2     seco
    ~
    ~
    ~
@@ -334,10 +334,10 @@ Ln 2, Col 8   2 lines   window 1-2   kitty:off   last:insert
    ~
 --------------------------------------------------------------------------
 Ln 2, Col 9   2 lines   window 1-2   kitty:off   last:insert
-[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
+[11A[13G[?25h[?25l[11B[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
 --------------------------------------------------------------------------
   1 helloorl
-  2     secon|
+  2     secon
    ~
    ~
    ~
@@ -348,10 +348,10 @@ Ln 2, Col 9   2 lines   window 1-2   kitty:off   last:insert
    ~
 --------------------------------------------------------------------------
 Ln 2, Col 10   2 lines   window 1-2   kitty:off   last:insert
-[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
+[11A[14G[?25h[?25l[11B[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
 --------------------------------------------------------------------------
   1 helloorl
-  2     second|
+  2     second
    ~
    ~
    ~
@@ -362,10 +362,10 @@ Ln 2, Col 10   2 lines   window 1-2   kitty:off   last:insert
    ~
 --------------------------------------------------------------------------
 Ln 2, Col 11   2 lines   window 1-2   kitty:off   last:insert
-[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
+[11A[15G[?25h[?25l[11B[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
 --------------------------------------------------------------------------
   1 helloorl
-  2     second|
+  2     second
    ~
    ~
    ~
@@ -376,10 +376,10 @@ Ln 2, Col 11   2 lines   window 1-2   kitty:off   last:insert
    ~
 --------------------------------------------------------------------------
 Ln 2, Col 11   2 lines   window 1-2   kitty:off   last:paste   [PASTING]
-[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
+[11A[15G[?25h[?25l[11B[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
 --------------------------------------------------------------------------
   1 helloorl
-  2     secondx|
+  2     secondx
    ~
    ~
    ~
@@ -390,11 +390,11 @@ Ln 2, Col 11   2 lines   window 1-2   kitty:off   last:paste   [PASTING]
    ~
 --------------------------------------------------------------------------
 Ln 2, Col 12   2 lines   window 1-2   kitty:off   last:paste   [PASTING]
-[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
+[11A[16G[?25h[?25l[11B[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
 --------------------------------------------------------------------------
   1 helloorl
   2     secondx
-  3 |
+  3 
    ~
    ~
    ~
@@ -404,11 +404,11 @@ Ln 2, Col 12   2 lines   window 1-2   kitty:off   last:paste   [PASTING]
    ~
 --------------------------------------------------------------------------
 Ln 3, Col 1   3 lines   window 1-3   kitty:off   last:paste   [PASTING]
-[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
+[10A[5G[?25h[?25l[10B[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
 --------------------------------------------------------------------------
   1 helloorl
   2     secondx
-  3 y|
+  3 y
    ~
    ~
    ~
@@ -418,11 +418,11 @@ Ln 3, Col 1   3 lines   window 1-3   kitty:off   last:paste   [PASTING]
    ~
 --------------------------------------------------------------------------
 Ln 3, Col 2   3 lines   window 1-3   kitty:off   last:paste   [PASTING]
-[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
+[10A[6G[?25h[?25l[10B[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
 --------------------------------------------------------------------------
   1 helloorl
   2     secondx
-  3 y|
+  3 y
    ~
    ~
    ~
@@ -432,11 +432,11 @@ Ln 3, Col 2   3 lines   window 1-3   kitty:off   last:paste   [PASTING]
    ~
 --------------------------------------------------------------------------
 Ln 3, Col 2   3 lines   window 1-3   kitty:off   last:paste
-[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
+[10A[6G[?25h[?25l[10B[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
 --------------------------------------------------------------------------
   1 helloorl
   2     secondx
-  3 y|
+  3 y
    ~
    ~
    ~
@@ -446,9 +446,9 @@ Ln 3, Col 2   3 lines   window 1-3   kitty:off   last:paste
    ~
 --------------------------------------------------------------------------
 Ln 3, Col 2   3 lines   window 1-3   kitty:off   last:page-down
-[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
+[10A[6G[?25h[?25l[10B[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
 --------------------------------------------------------------------------
-  1 h|elloorl
+  1 helloorl
   2     secondx
   3 y
    ~
@@ -460,9 +460,9 @@ Ln 3, Col 2   3 lines   window 1-3   kitty:off   last:page-down
    ~
 --------------------------------------------------------------------------
 Ln 1, Col 2   3 lines   window 1-3   kitty:off   last:page-up
-[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
+[12A[6G[?25h[?25l[12B[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
 --------------------------------------------------------------------------
-  1 h|elloorl
+  1 helloorl
   2     secondx
   3 y
    ~
@@ -478,9 +478,9 @@ Ln 1, Col 2   3 lines   window 1-3   kitty:off   last:help
 Ctrl+I toggled this panel. Tab (CSI 9 u) and Ctrl+I (CSI 105;5 u) are
 distinct keys ONLY because the Kitty disambiguation flag is pushed;
 on the legacy encoding both are the byte 0x09 and this panel is dead code.
-[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
+[16A[6G[?25h[?25l[16B[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2KRuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
 --------------------------------------------------------------------------
-  1 h|elloorl
+  1 helloorl
   2     secondx
   3 y
    ~
@@ -496,3 +496,4 @@ Ln 1, Col 2   3 lines   window 1-3   kitty:off   last:help
 Ctrl+I toggled this panel. Tab (CSI 9 u) and Ctrl+I (CSI 105;5 u) are
 distinct keys ONLY because the Kitty disambiguation flag is pushed;
 on the legacy encoding both are the byte 0x09 and this panel is dead code.
+[16A[6G[?25h

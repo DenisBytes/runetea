@@ -404,15 +404,18 @@ apply_key :: proc(m: ^Model, k: rt.Key_Msg) -> rt.Cmd {
 // view
 // ---------------------------------------------------------------------------
 
-// The caret is drawn as a literal '|' INSERTED into the text, not as a real
-// terminal cursor and not as reverse video. Two reasons, both structural:
-// rt's Renderer (render.odin) is a rewind-and-repaint painter with no cursor
-// positioning of any kind, and rows_for_line/display_width (width.odin) count
-// an ANSI escape's bytes as content -- so a `\e[7m` in a view line would
-// inflate the row count and desynchronise the next frame's rewind.
-CARET :: '|'
-
 RULE :: "--------------------------------------------------------------------------"
+
+// The view's fixed preamble: the key-help header, then RULE. Text row `row`
+// (0-based, within the viewport) is therefore view line HEADER_LINES + row --
+// and `cursor` below depends on that being exactly true, which is why it is a
+// named constant here rather than a 2 written twice.
+HEADER_LINES :: 2
+
+// The gutter every text row starts with: "% 3d " -- three columns of
+// right-aligned line number plus one space. Constant because MAX_LINES is 250,
+// so the number is never wider than 3.
+GUTTER_COLS :: 4
 
 view :: proc(m: Model, alloc: mem.Allocator) -> string {
 	sb := strings.builder_make(alloc)
@@ -433,11 +436,7 @@ view :: proc(m: Model, alloc: mem.Allocator) -> string {
 		// this toolchain, not assumed.
 		fmt.sbprintf(&sb, "% 3d ", i + 1)
 		l := m.lines[i]
-		for k in 0 ..< l.n {
-			if i == m.cy && k == m.cx { strings.write_rune(&sb, CARET) }
-			strings.write_rune(&sb, l.r[k])
-		}
-		if i == m.cy && m.cx >= l.n { strings.write_rune(&sb, CARET) }
+		for k in 0 ..< l.n { strings.write_rune(&sb, l.r[k]) }
 		strings.write_string(&sb, "\n")
 	}
 
@@ -455,4 +454,51 @@ view :: proc(m: Model, alloc: mem.Allocator) -> string {
 	}
 
 	return strings.to_string(sb)
+}
+
+// The REAL terminal cursor (rt.Program.cursor, wired up in main.odin), and the
+// reason there is no longer a caret glyph in the view above.
+//
+// THIS EXAMPLE USED TO PAINT A LITERAL '|' INTO THE TEXT, and the comment that
+// used to sit on that constant explained why: rt's Renderer had no cursor
+// positioning of any kind, and display_width counted an ANSI escape's bytes as
+// content, so even the reverse-video alternative would have inflated the row
+// count and desynchronised the next frame's rewind. Both of those are fixed
+// (T2-A: width.odin skips escapes; render.odin places a real cursor), and a
+// fake caret was never merely cosmetic -- it INSERTED a column, so every
+// character to its right sat one column further over than the file really has
+// it, which is wrong for anything that has to line up (indentation, an
+// alignment guide, a second pane).
+//
+// TWO RULES THIS HAS TO FOLLOW, both from rt.Cursor's doc comment:
+//
+//  1. `line` is an index into the VIEW's logical lines, so it must be derived
+//     from the same layout view() paints -- hence HEADER_LINES, and hence
+//     m.cy - m.top rather than m.cy.
+//  2. `col` is a DISPLAY column, so it goes through rt.display_width over the
+//     exact prefix view() wrote before the caret. NOT m.cx: that is a RUNE
+//     index, and a line containing CJK or an emoji would put the caret several
+//     columns left of where the text actually is. GUTTER_COLS is added rather
+//     than measured because "% 3d " is ASCII and fixed-width by construction.
+//
+// The prefix string is built with the frame allocator handed in -- it dies
+// with the frame, exactly like view()'s own builder (arena.odin's LIFETIME
+// CONTRACT).
+cursor :: proc(m: Model, alloc: mem.Allocator) -> rt.Cursor {
+	row := m.cy - m.top
+	// Defensive, not reachable in practice: follow_cursor runs after every
+	// action, so the caret's line is always inside the window. If it somehow
+	// is not, declare no cursor rather than point at the wrong row -- the zero
+	// value costs zero bytes (render.odin's Cursor).
+	if row < 0 || row >= VIEWPORT || m.cy >= m.nlines { return rt.Cursor{} }
+
+	sb := strings.builder_make(alloc)
+	l := m.lines[m.cy]
+	for k in 0 ..< min(m.cx, l.n) { strings.write_rune(&sb, l.r[k]) }
+
+	return rt.Cursor{
+		line = HEADER_LINES + row,
+		col  = GUTTER_COLS + rt.display_width(strings.to_string(sb)),
+		show = true,
+	}
 }
