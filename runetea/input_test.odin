@@ -73,28 +73,45 @@ test_decode_double_escape :: proc(t: ^testing.T) {
 // rune keypresses.
 //
 // The sequences chosen here are deliberately ones that are OUT of scope
-// rather than merely unimplemented: a Kitty keyboard flags report, an SGR
-// mouse report, F13 (CSI 25~, beyond the F1-F12 vocabulary Key_Code carries),
-// an unassigned tilde parameter, focus in/out and Shift+Tab. The flags report
-// is a KEY-level assertion and stays true after T1-K taught the decoder to
-// read it: it is never a Key_Msg, and with `enh` omitted (as here, and as
-// every caller outside the two event-loop hosts does) it is still consumed
-// whole and dropped -- see test_kitty_flags_reply_becomes_an_enhancements_msg
-// for the other half.
+// rather than merely unimplemented: a Kitty keyboard flags report, F13 (CSI
+// 25~, beyond the F1-F12 vocabulary Key_Code carries), an unassigned tilde
+// parameter, Shift+Tab, Begin, a DECRPM mode report, an xterm
+// modifyOtherKeys report, a colour-scheme report, a PARAMETERISED 'I' (which
+// is not the focus grammar), and an SGR-prefixed sequence whose final byte is
+// neither 'M' nor 'm'. The flags report is a KEY-level assertion and stays true
+// after T1-K taught the decoder to read it: it is never a Key_Msg, and with
+// `enh` omitted (as here, and as every caller outside the two event-loop hosts
+// does) it is still consumed whole and dropped -- see
+// test_kitty_flags_reply_becomes_an_enhancements_msg for the other half.
 //
-// THE LIST HAS BEEN RETARGETED TWICE, both times for the same reason: a
-// sequence that was genuinely unsupported became a feature, and leaving it
-// here would have made this test assert the OPPOSITE of the feature. It used
-// to use "\e[5~" when the decoder had no tilde table at all (PageUp is decoded
-// now), and it used to use "\e[200~" and "\e[201~" until T1-L made bracketed
-// paste real -- those two now have their own coverage in the T1-L block below.
-// Both times the coverage was moved, not deleted: what this test is FOR is the
-// consume-whole-and-emit-nothing contract, and that needs sequences the
-// decoder still has no vocabulary for.
+// THE LIST HAS NOW BEEN RETARGETED THREE TIMES, every time for the same
+// reason: a sequence that was genuinely unsupported became a feature, and
+// leaving it here would have made this test assert the OPPOSITE of the feature.
+// It used to use "\e[5~" when the decoder had no tilde table at all (PageUp is
+// decoded now); it used to use "\e[200~" and "\e[201~" until T1-L made
+// bracketed paste real; and T2-B has just taken "\e[<0;10;5M" (SGR mouse),
+// "\e[I" and "\e[O" (focus in/out), all three of which are now decoded and
+// covered by the T2-B block at the bottom of this file. Every time the coverage
+// was MOVED, not deleted: what this test is FOR is the
+// consume-whole-and-emit-nothing contract, and that needs sequences the decoder
+// still has no vocabulary for.
+//
+// The last two entries are the T2-B-shaped replacements specifically. "\e[1I"
+// proves the focus grammar is parameterless -- a decoder that matched on the
+// final byte alone would report a focus event for it -- and "\e[<0;10;5t"
+// proves the '<' private-prefix path is scoped to the two mouse finals rather
+// than to the prefix.
 @(test)
 test_decode_unsupported_csi_is_cleanly_ignored :: proc(t: ^testing.T) {
 	out := make([dynamic]Key_Msg); defer delete(out)
-	for seq in ([?]string{"\e[?1u", "\e[<0;10;5M", "\e[25~", "\e[9~", "\e[I", "\e[O", "\e[Z"}) {
+	for seq in ([?]string{
+		"\e[?1u", "\e[25~", "\e[9~", "\e[Z", "\e[E",
+		"\e[?2004;1$y",     // DECRPM report (carries an intermediate byte)
+		"\e[>4;2m",         // xterm modifyOtherKeys report: 'm' final, but a '>' prefix
+		"\e[?997;1n",       // light/dark colour-scheme report
+		"\e[1I",            // NOT focus-in: the focus grammar takes no parameters
+		"\e[<0;10;5t",      // SGR prefix, but not a mouse final byte
+	}) {
 		clear(&out)
 		n := decode_keys(transmute([]u8)seq, &out)
 		testing.expectf(t, n == len(seq), "%q: consumed %d, want %d", seq, n, len(seq))
@@ -175,7 +192,7 @@ Key_Case :: struct {
 	seq:   string,
 	want:  [2]Key_Msg,
 	nwant: int,
-	// T1-L: how many Paste_Markers the sequence produces. Zero for everything
+	// How many Input_Markers the sequence produces. Zero for everything
 	// that is not bracketed paste, which is why it is the LAST field -- adding
 	// it in the middle would have meant rewriting all 110 positional rows'
 	// values, not just appending a 0 to each.
@@ -382,6 +399,38 @@ key_cases := [?]Key_Case{
 	// the one that would break first if the paste path decoded byte-wise.
 	{"\e[200~é\e[201~", {{code = .Rune, r = 'é', pasted = true}, {}}, 1, 2},
 
+	// -- T2-B: mouse and focus -------------------------------------------
+	//
+	// Here for the same reason the Kitty and paste blocks are: this is the table
+	// test_split_at_every_byte_boundary reads, and both mouse encodings have to
+	// obey the HOLD-BACK CONTRACT byte for byte. The legacy rows are the
+	// important ones -- their last three bytes are NOT part of CSI grammar and
+	// can be any byte at all, so every proper prefix of them must hold back
+	// completely. WHAT each of these decodes to is asserted in
+	// test_mouse_decode_table below; what is asserted HERE is only that the
+	// sequence is consumed whole and produces exactly one marker and no keys.
+	{"\e[<0;10;5M",  {{}, {}}, 0, 1},   // SGR press
+	{"\e[<0;10;5m",  {{}, {}}, 0, 1},   // SGR release
+	{"\e[<32;10;5M", {{}, {}}, 0, 1},   // SGR drag
+	{"\e[<64;10;5M", {{}, {}}, 0, 1},   // SGR wheel up
+	{"\e[<65;10;5M", {{}, {}}, 0, 1},   // SGR wheel down
+	{"\e[<20;10;5M", {{}, {}}, 0, 1},   // SGR ctrl+shift+left press
+	{"\e[<0;300;5M", {{}, {}}, 0, 1},   // a column the legacy encoding cannot express
+	// Legacy/X10. Six bytes, the last three RAW: "\e[M" then Cb+32, Cx+32,
+	// Cy+32. ' ' is Cb 0 (left press), '*' is column 10, '%' is row 5.
+	{"\e[M *%",      {{}, {}}, 0, 1},   // legacy press
+	{"\e[M#*%",      {{}, {}}, 0, 1},   // legacy release ('#' is Cb 3)
+	// THE PAYLOAD TRAP, twice. A raw byte of 0x1B must NOT be read as an escape
+	// introducer, and raw bytes of 'M' / '~' must not be read as CSI final
+	// bytes -- in either case the decoder would resolve a phantom sequence and
+	// eat the user's next real keystroke. Splitting these at every boundary is
+	// what proves the three bytes are never fed back to the scanner.
+	{"\e[M *\e",     {{}, {}}, 0, 1},   // 0x1B as the Cy byte
+	{"\e[M M~",      {{}, {}}, 0, 1},   // 'M' as Cx, '~' as Cy
+	// Focus in / out.
+	{"\e[I", {{}, {}}, 0, 1},
+	{"\e[O", {{}, {}}, 0, 1},
+
 	// -- two sequences back to back -------------------------------------
 	{"\e[A\e[1;5D", {{code = .Up}, {code = .Left, mods = {.Ctrl}}}, 2, 0},
 	{"\eOA\e[5~",   {{code = .Up}, {code = .Page_Up}}, 2, 0},
@@ -393,15 +442,15 @@ key_cases := [?]Key_Case{
 @(test)
 test_decode_key_table :: proc(t: ^testing.T) {
 	out := make([dynamic]Key_Msg); defer delete(out)
-	// One Paste_State, RESET per row rather than carried: a table row is a
+	// One Input_State, RESET per row rather than carried: a table row is a
 	// self-contained buffer, and "\e[200~" leaving paste mode on would
 	// otherwise silently reinterpret every row after it as pasted text --
 	// which is exactly the cross-call persistence the T1-L tests below check
 	// deliberately, and must not leak in here by accident.
-	pst := Paste_State{}; defer delete(pst.markers)
+	pst := Input_State{}; defer delete(pst.markers)
 	for c in key_cases {
 		clear(&out)
-		pst.active = false
+		pst.in_paste = false
 		clear(&pst.markers)
 		n := decode_keys(transmute([]u8)c.seq, &out, {}, nil, &pst)
 		testing.expectf(t, n == len(c.seq), "%q: consumed %d, want %d", c.seq, n, len(c.seq))
@@ -466,12 +515,13 @@ test_split_at_every_byte_boundary :: proc(t: ^testing.T) {
 		}
 	}
 	// Floor raised from 100 to 500 when T1-J added the Kitty block, from 500 to
-	// 600 when T1-K added the legacy event-type block, and from 600 to 610 when
-	// T1-L added "\e[200~" (613 split points at the time of writing, up from
+	// 600 when T1-K added the legacy event-type block, from 600 to 610 when
+	// T1-L added "\e[200~", and from 610 to 700 when T2-B added the mouse and
+	// focus rows (705 split points at the time of writing, up from 613, up from
 	// 608, up from 531, up from 186). The floor exists so deleting a chunk of
 	// the table cannot quietly make this test vacuous, so it has to track the
 	// table's actual size.
-	testing.expectf(t, checked >= 610, "only %d split points exercised -- table shrank?", checked)
+	testing.expectf(t, checked >= 700, "only %d split points exercised -- table shrank?", checked)
 }
 
 // A complete sequence followed by a partial one: the complete prefix must be
@@ -1081,53 +1131,53 @@ Paste_Case :: struct {
 	// The pasted TEXT, as the runes that must come out in order. Every one of
 	// them must arrive as Key_Msg{code = .Rune, r = <it>, pasted = true}.
 	text:   string,
-	marks:  [2]Paste_Marker,
+	marks:  [2]Input_Marker,
 	nmark:  int,
 }
 
 @(private = "file")
 paste_cases := [?]Paste_Case{
 	{"complete paste", "\e[200~hello\e[201~", "hello",
-		{{at = 0, start = true}, {at = 5}}, 2},
+		{{at = 0, kind = .Paste_Start}, {at = 5, kind = .Paste_End}}, 2},
 
 	// THE HEADLINE BUG. Without bracketed paste, pasting a buffer that happens
 	// to contain "\e[A" executes an Up arrow in the middle of the text.
 	{"escape sequence is literal text", "\e[200~x\e[Ay\e[201~", "x\e[Ay",
-		{{at = 0, start = true}, {at = 5}}, 2},
+		{{at = 0, kind = .Paste_Start}, {at = 5, kind = .Paste_End}}, 2},
 
 	// Key semantics are suspended too: an app inserting pasted text wants a
 	// newline CHARACTER in its buffer, not "the user pressed Enter". Same for
 	// \t (not Tab) and \r (not Enter).
 	{"newline, tab and CR are literal runes", "\e[200~a\n\t\rb\e[201~", "a\n\t\rb",
-		{{at = 0, start = true}, {at = 5}}, 2},
+		{{at = 0, kind = .Paste_Start}, {at = 5, kind = .Paste_End}}, 2},
 
 	// Multi-byte UTF-8 must come through intact -- the paste path does its own
 	// rune decoding rather than emitting bytes.
 	{"multi-byte utf-8", "\e[200~héllo→\e[201~", "héllo→",
-		{{at = 0, start = true}, {at = 6}}, 2},
+		{{at = 0, kind = .Paste_Start}, {at = 6, kind = .Paste_End}}, 2},
 
 	// Zero-length paste. This is the case that makes the markers necessary at
 	// all: with no keys between them there is nothing else for an application
 	// to notice the paste by.
 	{"empty paste", "\e[200~\e[201~", "",
-		{{at = 0, start = true}, {at = 0}}, 2},
+		{{at = 0, kind = .Paste_Start}, {at = 0, kind = .Paste_End}}, 2},
 
 	// ONLY "\e[201~" ends a paste. xterm filters ESC out of paste content, but
 	// this decoder does not assume that: a bare ESC that is not the terminator
 	// is literal text.
 	{"bare ESC inside a paste is literal", "\e[200~a\e\e[201~", "a\e",
-		{{at = 0, start = true}, {at = 2}}, 2},
+		{{at = 0, kind = .Paste_Start}, {at = 2, kind = .Paste_End}}, 2},
 
 	// ...and so is a nested "\e[200~": all six of its bytes are runes. A
 	// decoder that re-entered paste mode here would swallow the real
 	// terminator and never leave.
 	{"nested paste start is literal", "\e[200~a\e[200~b\e[201~", "a\e[200~b",
-		{{at = 0, start = true}, {at = 8}}, 2},
+		{{at = 0, kind = .Paste_Start}, {at = 8, kind = .Paste_End}}, 2},
 
 	// A near-miss terminator: "\e[201X" is not "\e[201~", so every byte of it
 	// is text and the paste keeps going.
 	{"near-miss terminator is literal", "\e[200~\e[201X\e[201~", "\e[201X",
-		{{at = 0, start = true}, {at = 6}}, 2},
+		{{at = 0, kind = .Paste_Start}, {at = 6, kind = .Paste_End}}, 2},
 }
 
 // Feeds `data` through decode_keys exactly the way the reader loops do
@@ -1135,7 +1185,7 @@ paste_cases := [?]Paste_Case{
 // was consumed, keep the rest for the next chunk. Returns nothing -- the
 // caller inspects `out`, `pst` and `pending` itself.
 @(private = "file")
-paste_feed :: proc(pending: ^[dynamic]u8, chunk: []u8, out: ^[dynamic]Key_Msg, pst: ^Paste_State) {
+paste_feed :: proc(pending: ^[dynamic]u8, chunk: []u8, out: ^[dynamic]Key_Msg, pst: ^Input_State) {
 	append(pending, ..chunk)
 	consumed := decode_keys(pending[:], out, {}, nil, pst)
 	if consumed > 0 { remove_range(pending, 0, consumed) }
@@ -1143,7 +1193,7 @@ paste_feed :: proc(pending: ^[dynamic]u8, chunk: []u8, out: ^[dynamic]Key_Msg, p
 
 // Asserts that `out`/`pst` hold exactly what `c` says they should.
 @(private = "file")
-paste_check :: proc(t: ^testing.T, c: Paste_Case, label: string, out: []Key_Msg, pst: ^Paste_State) {
+paste_check :: proc(t: ^testing.T, c: Paste_Case, label: string, out: []Key_Msg, pst: ^Input_State) {
 	i := 0
 	for r in c.text {
 		if !testing.expectf(t, i < len(out), "%s/%s: ran out of keys at rune %d (%v)",
@@ -1161,17 +1211,17 @@ paste_check :: proc(t: ^testing.T, c: Paste_Case, label: string, out: []Key_Msg,
 		testing.expectf(t, pst.markers[k] == c.marks[k], "%s/%s: marker %d = %v, want %v",
 			c.name, label, k, pst.markers[k], c.marks[k])
 	}
-	testing.expectf(t, !pst.active, "%s/%s: paste mode still active after the terminator", c.name, label)
+	testing.expectf(t, !pst.in_paste, "%s/%s: paste mode still active after the terminator", c.name, label)
 }
 
 @(test)
 test_bracketed_paste_table :: proc(t: ^testing.T) {
 	out := make([dynamic]Key_Msg); defer delete(out)
 	pending: [dynamic]u8; defer delete(pending)
-	pst := Paste_State{}; defer delete(pst.markers)
+	pst := Input_State{}; defer delete(pst.markers)
 
 	for c in paste_cases {
-		clear(&out); clear(&pending); clear(&pst.markers); pst.active = false
+		clear(&out); clear(&pending); clear(&pst.markers); pst.in_paste = false
 		paste_feed(&pending, transmute([]u8)c.seq, &out, &pst)
 		testing.expectf(t, len(pending) == 0, "%s: %d bytes left unconsumed", c.name, len(pending))
 		paste_check(t, c, "whole", out[:], &pst)
@@ -1181,7 +1231,7 @@ test_bracketed_paste_table :: proc(t: ^testing.T) {
 // THE STREAMING TEST, and the one that pins paste mode as decoder STATE.
 //
 // Every case is split at every byte boundary into two chunks fed through ONE
-// Paste_State, which is exactly what the reader does when a paste straddles a
+// Input_State, which is exactly what the reader does when a paste straddles a
 // read: decode_keys is called once per read, so paste mode has to survive the
 // gap. The result must be byte-for-byte what the whole buffer produced -- a
 // paste that stalled (held back its content) or that lost its mode across the
@@ -1190,13 +1240,13 @@ test_bracketed_paste_table :: proc(t: ^testing.T) {
 test_paste_split_at_every_byte_boundary :: proc(t: ^testing.T) {
 	out := make([dynamic]Key_Msg); defer delete(out)
 	pending: [dynamic]u8; defer delete(pending)
-	pst := Paste_State{}; defer delete(pst.markers)
+	pst := Input_State{}; defer delete(pst.markers)
 	checked := 0
 
 	for c in paste_cases {
 		b := transmute([]u8)c.seq
 		for k in 1 ..< len(b) {
-			clear(&out); clear(&pending); clear(&pst.markers); pst.active = false
+			clear(&out); clear(&pending); clear(&pst.markers); pst.in_paste = false
 
 			if k == 1 {
 				// THE ONE EXCEPTION, and it is not a paste exception: a first
@@ -1238,7 +1288,7 @@ test_paste_split_at_every_byte_boundary :: proc(t: ^testing.T) {
 test_paste_content_is_streamed_not_buffered :: proc(t: ^testing.T) {
 	out := make([dynamic]Key_Msg); defer delete(out)
 	pending: [dynamic]u8; defer delete(pending)
-	pst := Paste_State{}; defer delete(pst.markers)
+	pst := Input_State{}; defer delete(pst.markers)
 
 	// Start plus 1000 bytes of content, no terminator in sight.
 	body: [dynamic]u8; defer delete(body)
@@ -1247,7 +1297,7 @@ test_paste_content_is_streamed_not_buffered :: proc(t: ^testing.T) {
 	paste_feed(&pending, body[:], &out, &pst)
 	testing.expect_value(t, len(pending), 0)
 	testing.expect_value(t, len(out), 1000)
-	testing.expect(t, pst.active, "still inside the paste")
+	testing.expect(t, pst.in_paste, "still inside the paste")
 	testing.expect_value(t, len(pst.markers), 1)
 
 	// The only things that may stall: a partial UTF-8 rune...
@@ -1272,7 +1322,7 @@ test_paste_content_is_streamed_not_buffered :: proc(t: ^testing.T) {
 	paste_feed(&pending, transmute([]u8)string("1~"), &out, &pst)
 	testing.expect_value(t, len(out), 0)
 	testing.expect_value(t, len(pending), 0)
-	testing.expect(t, !pst.active, "the terminator must end paste mode")
+	testing.expect(t, !pst.in_paste, "the terminator must end paste mode")
 }
 
 // Paste mode is state that persists across decode_keys calls -- the reader
@@ -1281,25 +1331,25 @@ test_paste_content_is_streamed_not_buffered :: proc(t: ^testing.T) {
 @(test)
 test_paste_state_persists_across_decode_keys_calls :: proc(t: ^testing.T) {
 	out := make([dynamic]Key_Msg); defer delete(out)
-	pst := Paste_State{}; defer delete(pst.markers)
+	pst := Input_State{}; defer delete(pst.markers)
 
 	n := decode_keys(transmute([]u8)string("\e[200~ab"), &out, {}, nil, &pst)
 	testing.expect_value(t, n, 8)
-	testing.expect(t, pst.active, "paste mode must survive the end of the call")
+	testing.expect(t, pst.in_paste, "paste mode must survive the end of the call")
 	testing.expect_value(t, len(out), 2)
 
 	// A SEPARATE call: "\e[A" here is pasted text, not Up.
 	n = decode_keys(transmute([]u8)string("\e[Ac\e[201~"), &out, {}, nil, &pst)
 	testing.expect_value(t, n, 10)
-	testing.expect(t, !pst.active, "the terminator must end paste mode")
+	testing.expect(t, !pst.in_paste, "the terminator must end paste mode")
 	if testing.expect_value(t, len(out), 6) {
 		for r, i in "ab\e[Ac" {
 			testing.expect_value(t, out[i], Key_Msg{code = .Rune, r = r, pasted = true})
 		}
 	}
 	if testing.expect_value(t, len(pst.markers), 2) {
-		testing.expect_value(t, pst.markers[0], Paste_Marker{at = 0, start = true})
-		testing.expect_value(t, pst.markers[1], Paste_Marker{at = 6})
+		testing.expect_value(t, pst.markers[0], Input_Marker{at = 0, kind = .Paste_Start})
+		testing.expect_value(t, pst.markers[1], Input_Marker{at = 6, kind = .Paste_End})
 	}
 
 	// A key AFTER the paste is an ordinary key again: pasted = false, and
@@ -1315,7 +1365,7 @@ test_paste_state_persists_across_decode_keys_calls :: proc(t: ^testing.T) {
 // same degradation `enh = nil` is: the sequences are still understood WITHIN
 // one buffer, but there is nowhere to record the markers and nowhere for the
 // mode to live between calls. Pinned rather than left implicit, because a
-// caller that wants paste across reads has to pass a Paste_State and this is
+// caller that wants paste across reads has to pass a Input_State and this is
 // what happens if it forgets.
 @(test)
 test_paste_without_a_state_does_not_persist :: proc(t: ^testing.T) {
@@ -1345,13 +1395,13 @@ test_paste_without_a_state_does_not_persist :: proc(t: ^testing.T) {
 @(test)
 test_unpaired_paste_end_is_ignored :: proc(t: ^testing.T) {
 	out := make([dynamic]Key_Msg); defer delete(out)
-	pst := Paste_State{}; defer delete(pst.markers)
+	pst := Input_State{}; defer delete(pst.markers)
 
 	n := decode_keys(transmute([]u8)string("\e[201~"), &out, {}, nil, &pst)
 	testing.expect_value(t, n, 6)
 	testing.expect_value(t, len(out), 0)
 	testing.expect_value(t, len(pst.markers), 0)
-	testing.expect(t, !pst.active, "an unpaired end must not enter paste mode")
+	testing.expect(t, !pst.in_paste, "an unpaired end must not enter paste mode")
 
 	// A trailing extra terminator after a real paste is the same thing.
 	clear(&pst.markers)
@@ -1370,7 +1420,7 @@ test_unpaired_paste_end_is_ignored :: proc(t: ^testing.T) {
 test_unterminated_paste_does_not_wedge_the_reader :: proc(t: ^testing.T) {
 	out := make([dynamic]Key_Msg); defer delete(out)
 	pending: [dynamic]u8; defer delete(pending)
-	pst := Paste_State{}; defer delete(pst.markers)
+	pst := Input_State{}; defer delete(pst.markers)
 
 	paste_feed(&pending, transmute([]u8)string("\e[200~hello"), &out, &pst)
 	testing.expect_value(t, len(pending), 0)
@@ -1381,7 +1431,7 @@ test_unterminated_paste_does_not_wedge_the_reader :: proc(t: ^testing.T) {
 	paste_feed(&pending, transmute([]u8)string(" world"), &out, &pst)
 	testing.expect_value(t, len(pending), 0)
 	testing.expect_value(t, len(out), 6)
-	testing.expect(t, pst.active, "no terminator arrived, so paste mode stays on")
+	testing.expect(t, pst.in_paste, "no terminator arrived, so paste mode stays on")
 
 	// The worst case for `pending` is a full proper prefix of the terminator:
 	// five bytes, and it can never grow past that.
@@ -1406,4 +1456,429 @@ test_paste_msgs_are_pod :: proc(t: ^testing.T) {
 	testing.expect(t, is_pod_type(Key_Msg), "Key_Msg must stay POD after gaining `pasted`")
 	testing.expect_value(t, size_of(Paste_Start_Msg), 0)
 	testing.expect_value(t, size_of(Paste_End_Msg), 0)
+}
+
+// ---------------------------------------------------------------------------
+// T2-B: mouse reporting and focus events.
+//
+// The decoded VALUES live here; the byte-level hold-back contract lives in
+// key_cases (see the T2-B block there) so that every sequence added to the
+// decoder's vocabulary is automatically split at every boundary too.
+// ---------------------------------------------------------------------------
+
+@(private = "file")
+Mouse_Case :: struct {
+	name: string,
+	seq:  string,
+	want: Mouse_Msg,
+}
+
+@(private = "file")
+mouse_cases := [?]Mouse_Case{
+	// -- SGR: CSI < Cb ; Cx ; Cy M|m -------------------------------------
+	//
+	// Coordinates on the wire are ONE-based and (10,5) is therefore cell (9,4).
+	// Every row below uses the same coordinates so that a mistake in the
+	// button/modifier decoding cannot hide behind a coordinate difference.
+	{"sgr press left",    "\e[<0;10;5M",  {kind = .Press,  button = .Left,   x = 9, y = 4}},
+	{"sgr press middle",  "\e[<1;10;5M",  {kind = .Press,  button = .Middle, x = 9, y = 4}},
+	{"sgr press right",   "\e[<2;10;5M",  {kind = .Press,  button = .Right,  x = 9, y = 4}},
+	// THE ONE THING THE LEGACY ENCODING CANNOT DO: the final byte, not the
+	// button bits, says press vs release, so the button survives a release.
+	{"sgr release left",  "\e[<0;10;5m",  {kind = .Release, button = .Left,  x = 9, y = 4}},
+	{"sgr release right", "\e[<2;10;5m",  {kind = .Release, button = .Right, x = 9, y = 4}},
+
+	// Motion bit (32) with a button held: a drag, which is what DECSET 1002 is
+	// for. Reported as .Motion with the held button, not as a second press.
+	{"sgr drag left",   "\e[<32;10;5M", {kind = .Motion, button = .Left,  x = 9, y = 4}},
+	{"sgr drag right",  "\e[<34;10;5M", {kind = .Motion, button = .Right, x = 9, y = 4}},
+	// Motion with NO button (Cb bits 0-1 == 3): what DECSET 1003 floods the
+	// stream with. .None is a real answer here, not a placeholder.
+	{"sgr motion, no button", "\e[<35;10;5M", {kind = .Motion, button = .None, x = 9, y = 4}},
+
+	// Wheel bank (bit 64). The motion bit is deliberately NOT honoured for
+	// these -- terminals set it spuriously and a "wheel drag" is not a thing --
+	// so 64 and 96 must decode identically.
+	{"sgr wheel up",    "\e[<64;10;5M", {kind = .Wheel, button = .Wheel_Up,    x = 9, y = 4}},
+	{"sgr wheel down",  "\e[<65;10;5M", {kind = .Wheel, button = .Wheel_Down,  x = 9, y = 4}},
+	{"sgr wheel left",  "\e[<66;10;5M", {kind = .Wheel, button = .Wheel_Left,  x = 9, y = 4}},
+	{"sgr wheel right", "\e[<67;10;5M", {kind = .Wheel, button = .Wheel_Right, x = 9, y = 4}},
+	{"sgr wheel up with the motion bit set",
+		"\e[<96;10;5M", {kind = .Wheel, button = .Wheel_Up, x = 9, y = 4}},
+
+	// Modifiers. Bit 4 Shift, bit 8 "meta" (reported as .Alt -- see
+	// mouse_button_bits), bit 16 Ctrl. .Meta is never set by a mouse report.
+	{"sgr shift+left",  "\e[<4;10;5M",  {kind = .Press, button = .Left, x = 9, y = 4, mods = {.Shift}}},
+	{"sgr alt+left",    "\e[<8;10;5M",  {kind = .Press, button = .Left, x = 9, y = 4, mods = {.Alt}}},
+	{"sgr ctrl+left",   "\e[<16;10;5M", {kind = .Press, button = .Left, x = 9, y = 4, mods = {.Ctrl}}},
+	{"sgr ctrl+shift+left",
+		"\e[<20;10;5M", {kind = .Press, button = .Left, x = 9, y = 4, mods = {.Ctrl, .Shift}}},
+	{"sgr all three mods on the right button",
+		"\e[<30;10;5M", {kind = .Press, button = .Right, x = 9, y = 4, mods = {.Ctrl, .Alt, .Shift}}},
+	{"sgr ctrl+wheel down",
+		"\e[<81;10;5M", {kind = .Wheel, button = .Wheel_Down, x = 9, y = 4, mods = {.Ctrl}}},
+	{"sgr modifiers survive a release",
+		"\e[<18;10;5m", {kind = .Release, button = .Right, x = 9, y = 4, mods = {.Ctrl}}},
+
+	// The extra-button bank (bit 128): browser back/forward and two unnamed
+	// buttons. Mouse_Button carries all four, so nothing is lost.
+	{"sgr backward",  "\e[<128;10;5M", {kind = .Press, button = .Backward,  x = 9, y = 4}},
+	{"sgr forward",   "\e[<129;10;5M", {kind = .Press, button = .Forward,   x = 9, y = 4}},
+	{"sgr button 11", "\e[<131;10;5M", {kind = .Press, button = .Button_11, x = 9, y = 4}},
+
+	// THE CASE LEGACY CANNOT EXPRESS, and the entire reason term_enter_raw asks
+	// for `?1006h`: a column past 223. In the legacy encoding Cx+32 would have
+	// to be byte 332, which does not exist.
+	{"sgr column past 223",  "\e[<0;300;5M",  {kind = .Press, button = .Left, x = 299, y = 4}},
+	{"sgr row past 223",     "\e[<0;10;400M", {kind = .Press, button = .Left, x = 9, y = 399}},
+	{"sgr both past 223",    "\e[<0;1000;999M", {kind = .Press, button = .Left, x = 999, y = 998}},
+	// The origin. (1,1) on the wire is (0,0) in the Msg.
+	{"sgr origin", "\e[<0;1;1M", {kind = .Press, button = .Left, x = 0, y = 0}},
+
+	// -- Legacy / X10: CSI M Cb+32 Cx+32 Cy+32 ---------------------------
+	//
+	// ' ' == 32 == Cb 0, '*' == 42 == column 10, '%' == 37 == row 5, so these
+	// are the same events as the SGR rows above and must decode identically.
+	{"x10 press left",   "\e[M *%", {kind = .Press, button = .Left,   x = 9, y = 4}},
+	{"x10 press middle", "\e[M!*%", {kind = .Press, button = .Middle, x = 9, y = 4}},
+	{"x10 press right",  "\e[M\"*%", {kind = .Press, button = .Right, x = 9, y = 4}},
+	// THE DOCUMENTED ASYMMETRY. Cb bits 0-1 == 3 ('#') is the ONLY thing this
+	// encoding can say about a release: the button identity is simply not on
+	// the wire, so it reports .None rather than guessing. See x10_mouse.
+	{"x10 release loses the button", "\e[M#*%", {kind = .Release, button = .None, x = 9, y = 4}},
+	{"x10 drag left",    "\e[M@*%", {kind = .Motion, button = .Left, x = 9, y = 4}},   // '@' == 64 == 32+32
+	{"x10 wheel up",     "\e[M`*%", {kind = .Wheel, button = .Wheel_Up,   x = 9, y = 4}},  // '`' == 96 == 32+64
+	{"x10 wheel down",   "\e[Ma*%", {kind = .Wheel, button = .Wheel_Down, x = 9, y = 4}},
+	{"x10 ctrl+left",    "\e[M0*%", {kind = .Press, button = .Left, x = 9, y = 4, mods = {.Ctrl}}},  // '0' == 48 == 32+16
+	{"x10 shift+left",   "\e[M$*%", {kind = .Press, button = .Left, x = 9, y = 4, mods = {.Shift}}}, // '$' == 36 == 32+4
+	// THE PAYLOAD TRAP, decoded rather than merely held back. 'M' (77) is
+	// column 45 and '~' (126) is row 94: both are ordinary coordinates here,
+	// and the fact that they are also CSI final bytes is irrelevant because the
+	// scanner never sees them.
+	{"x10 with 'M' and '~' in the payload", "\e[M M~", {kind = .Press, button = .Left, x = 44, y = 93}},
+	// 0x1B in the payload. It is below the +32 floor, so the coordinate itself
+	// is unrecoverable (a wrapped or out-of-spec value) and clamps to 0 -- but
+	// the POINT of the row is that it is consumed as a coordinate byte and NOT
+	// treated as an escape introducer.
+	{"x10 with 0x1B in the payload", "\e[M *\e", {kind = .Press, button = .Left, x = 9, y = 0}},
+	// The origin: 33 ('!') is coordinate 1, which is cell 0.
+	{"x10 origin", "\e[M !!", {kind = .Press, button = .Left, x = 0, y = 0}},
+}
+
+@(test)
+test_mouse_decode_table :: proc(t: ^testing.T) {
+	out := make([dynamic]Key_Msg); defer delete(out)
+	st := Input_State{}; defer delete(st.markers)
+	for c in mouse_cases {
+		clear(&out); clear(&st.markers); st.in_paste = false
+		n := decode_keys(transmute([]u8)c.seq, &out, {}, nil, &st)
+		testing.expectf(t, n == len(c.seq), "%s: consumed %d, want %d", c.name, n, len(c.seq))
+		testing.expectf(t, len(out) == 0, "%s: emitted %d keys, want 0 (%v)", c.name, len(out), out[:])
+		if !testing.expectf(t, len(st.markers) == 1, "%s: %d markers, want 1 (%v)",
+			c.name, len(st.markers), st.markers[:]) { continue }
+		testing.expectf(t, st.markers[0].kind == .Mouse, "%s: marker kind %v, want .Mouse",
+			c.name, st.markers[0].kind)
+		testing.expectf(t, st.markers[0].mouse == c.want, "%s: got %v, want %v",
+			c.name, st.markers[0].mouse, c.want)
+		testing.expectf(t, st.markers[0].at == 0, "%s: marker at %d, want 0", c.name, st.markers[0].at)
+	}
+}
+
+// `CSI I` in, `CSI O` out. Two zero-sized Msg types rather than one carrying a
+// bool -- see Focus_Msg's own comment for why, and for which of the two shapes
+// already in this codebase it follows.
+@(test)
+test_focus_events :: proc(t: ^testing.T) {
+	out := make([dynamic]Key_Msg); defer delete(out)
+	st := Input_State{}; defer delete(st.markers)
+
+	Case :: struct { seq: string, want: Input_Marker_Kind }
+	for c in ([?]Case{{"\e[I", .Focus}, {"\e[O", .Blur}}) {
+		clear(&out); clear(&st.markers)
+		n := decode_keys(transmute([]u8)c.seq, &out, {}, nil, &st)
+		testing.expectf(t, n == 3, "%q: consumed %d, want 3", c.seq, n)
+		testing.expectf(t, len(out) == 0, "%q: emitted %d keys, want 0", c.seq, len(out))
+		if !testing.expectf(t, len(st.markers) == 1, "%q: %d markers, want 1", c.seq, len(st.markers)) {
+			continue
+		}
+		testing.expectf(t, st.markers[0] == Input_Marker{at = 0, kind = c.want},
+			"%q: got %v, want kind %v at 0", c.seq, st.markers[0], c.want)
+	}
+
+	// `CSI O` is NOT `ESC O`. The SS3 introducer has no '[' and still resolves
+	// as the documented Alt+O; a decoder that confused the two would silently
+	// turn every Alt+O into a focus-out.
+	clear(&out); clear(&st.markers)
+	n := decode_keys(transmute([]u8)string("\eO"), &out, {}, nil, &st)
+	testing.expect_value(t, n, 2)
+	testing.expect_value(t, len(st.markers), 0)
+	testing.expect_value(t, len(out), 1)
+	testing.expect_value(t, out[0], Key_Msg{code = .Rune, r = 'O', mods = {.Alt}})
+}
+
+// THE LEGACY PAYLOAD IS THREE BYTES THAT ARE NOT CSI GRAMMAR, and the whole
+// report has to arrive before ANY of it is decoded. key_cases already splits
+// these at every boundary within a single call; this test does the other half
+// -- feeding them through TWO calls the way the reader loops actually do
+// (append to `pending`, decode, drop what was consumed) -- because the trap is
+// specifically a report straddling a read boundary.
+//
+// The payload bytes chosen are the ones that would do damage if they ever
+// reached the scanner: 0x1B (would open a phantom escape sequence and swallow
+// the next real keystroke), 'M' (would look like an X10 introducer of its own,
+// recursively), '~' (a CSI final byte), '[' (the CSI introducer), and 0x00.
+@(test)
+test_legacy_mouse_holds_back_across_reads :: proc(t: ^testing.T) {
+	out := make([dynamic]Key_Msg); defer delete(out)
+	pending: [dynamic]u8; defer delete(pending)
+	st := Input_State{}; defer delete(st.markers)
+
+	Case :: struct { name, seq: string, want: Mouse_Msg }
+	cases := [?]Case{
+		{"plain",        "\e[M *%",           {kind = .Press, button = .Left, x = 9, y = 4}},
+		{"ESC as Cy",    "\e[M *\e",          {kind = .Press, button = .Left, x = 9, y = 0}},
+		{"ESC as Cx",    "\e[M \e%",          {kind = .Press, button = .Left, x = 0, y = 4}},
+		{"M as Cx, ~ as Cy", "\e[M M~",       {kind = .Press, button = .Left, x = 44, y = 93}},
+		{"'[' as Cx",    "\e[M [%",           {kind = .Press, button = .Left, x = 58, y = 4}},
+		{"NUL as Cy",    "\e[M *\x00",        {kind = .Press, button = .Left, x = 9, y = 0}},
+	}
+
+	checked := 0
+	for c in cases {
+		b := transmute([]u8)c.seq
+		for k in 1 ..< len(b) {
+			clear(&out); clear(&pending); clear(&st.markers); st.in_paste = false
+
+			// First chunk. k == 1 is the documented lone-ESC ambiguity (a bare
+			// "\e" with nothing after it resolves as Escape); every other prefix
+			// must hold back COMPLETELY -- consume nothing, emit nothing, record
+			// no marker. Asserted positively rather than skipped so the exception
+			// stays visible, exactly as test_paste_split_at_every_byte_boundary
+			// does it.
+			append(&pending, ..b[:k])
+			n := decode_keys(pending[:], &out, {}, nil, &st)
+			if n > 0 { remove_range(&pending, 0, n) }
+			if k == 1 {
+				testing.expectf(t, n == 1 && len(out) == 1 && out[0] == Key_Msg{code = .Escape},
+					"%s[:1]: got n=%d %v, want the documented lone-ESC resolution", c.name, n, out[:])
+			} else {
+				checked += 1
+				testing.expectf(t, n == 0 && len(out) == 0 && len(st.markers) == 0,
+					"%s[:%d]: got n=%d keys=%v markers=%v, want a complete hold-back",
+					c.name, k, n, out[:], st.markers[:])
+			}
+
+			// Second chunk completes it. From k >= 2 the whole report must now
+			// resolve as ONE marker and no keys at all -- if any payload byte
+			// had leaked into the scanner it would show up here as a stray key
+			// or as leftover `pending` bytes.
+			clear(&out)
+			append(&pending, ..b[k:])
+			n = decode_keys(pending[:], &out, {}, nil, &st)
+			if n > 0 { remove_range(&pending, 0, n) }
+			if k == 1 { continue }   // the ESC was already consumed; the tail is not a report
+			testing.expectf(t, len(pending) == 0, "%s[:%d]: %d bytes left unconsumed",
+				c.name, k, len(pending))
+			testing.expectf(t, len(out) == 0, "%s[:%d]: emitted %d keys, want 0 (%v) -- a payload byte leaked into the scanner",
+				c.name, k, len(out), out[:])
+			if !testing.expectf(t, len(st.markers) == 1, "%s[:%d]: %d markers, want 1",
+				c.name, k, len(st.markers)) { continue }
+			testing.expectf(t, st.markers[0].kind == .Mouse && st.markers[0].mouse == c.want,
+				"%s[:%d]: got %v, want a .Mouse marker holding %v",
+				c.name, k, st.markers[0], c.want)
+		}
+	}
+	// Anti-vacuity floor: 6 cases x (len-2) real split points == 6 x 4 == 24.
+	testing.expectf(t, checked >= 24, "only %d split points exercised -- table shrank?", checked)
+}
+
+// A legacy report must not swallow the keys around it, and neither encoding may
+// eat a neighbouring sequence. This is the byte-level companion to the ordering
+// test below: `at` is only meaningful if consumption is exact.
+@(test)
+test_mouse_does_not_swallow_neighbouring_keys :: proc(t: ^testing.T) {
+	out := make([dynamic]Key_Msg); defer delete(out)
+	st := Input_State{}; defer delete(st.markers)
+
+	// A legacy report between two keys, with a payload byte that IS an escape.
+	seq := "a\e[M *\eb\e[A"
+	n := decode_keys(transmute([]u8)seq, &out, {}, nil, &st)
+	testing.expect_value(t, n, len(seq))
+	if testing.expect_value(t, len(out), 3) {
+		testing.expect_value(t, out[0], Key_Msg{code = .Rune, r = 'a'})
+		testing.expect_value(t, out[1], Key_Msg{code = .Rune, r = 'b'})
+		testing.expect_value(t, out[2], Key_Msg{code = .Up})
+	}
+	testing.expect_value(t, len(st.markers), 1)
+
+	// Two SGR reports and a focus event back to back, no keys at all.
+	clear(&out); clear(&st.markers)
+	seq = "\e[<0;1;1M\e[<0;1;1m\e[I"
+	n = decode_keys(transmute([]u8)seq, &out, {}, nil, &st)
+	testing.expect_value(t, n, len(seq))
+	testing.expect_value(t, len(out), 0)
+	if testing.expect_value(t, len(st.markers), 3) {
+		testing.expect_value(t, st.markers[0].mouse.kind, Mouse_Kind.Press)
+		testing.expect_value(t, st.markers[1].mouse.kind, Mouse_Kind.Release)
+		testing.expect_value(t, st.markers[2].kind, Input_Marker_Kind.Focus)
+	}
+}
+
+// ORDER RELATIVE TO THE KEYS IS THE WHOLE REASON mouse and focus ride the same
+// positioned marker list bracketed paste does, rather than a second unordered
+// stream like `enh` (see Input_Marker's comment). A user who clicks to place
+// the caret and then types expects the click to arrive FIRST, and a single
+// 1024-byte read can easily hold both.
+//
+// The last case is the one a second, separate stream could not have got right:
+// a mouse report and a paste start at the SAME `at`, where only decode order
+// says which came first.
+@(test)
+test_markers_keep_their_position_relative_to_keys :: proc(t: ^testing.T) {
+	out := make([dynamic]Key_Msg); defer delete(out)
+	st := Input_State{}; defer delete(st.markers)
+
+	// click, then "ab": the marker belongs before out[0].
+	n := decode_keys(transmute([]u8)string("\e[<0;1;1Mab"), &out, {}, nil, &st)
+	testing.expect_value(t, n, 11)
+	testing.expect_value(t, len(out), 2)
+	if testing.expect_value(t, len(st.markers), 1) {
+		testing.expect_value(t, st.markers[0].at, 0)
+	}
+
+	// "ab", then click, then "c": the marker belongs before out[2].
+	clear(&out); clear(&st.markers)
+	n = decode_keys(transmute([]u8)string("ab\e[<0;1;1Mc"), &out, {}, nil, &st)
+	testing.expect_value(t, n, 12)
+	testing.expect_value(t, len(out), 3)
+	if testing.expect_value(t, len(st.markers), 1) {
+		testing.expect_value(t, st.markers[0].at, 2)
+	}
+
+	// Focus-out at the very end: `at == len(out)` means "after everything".
+	clear(&out); clear(&st.markers)
+	n = decode_keys(transmute([]u8)string("ab\e[O"), &out, {}, nil, &st)
+	testing.expect_value(t, n, 5)
+	testing.expect_value(t, len(out), 2)
+	if testing.expect_value(t, len(st.markers), 1) {
+		testing.expect_value(t, st.markers[0], Input_Marker{at = 2, kind = .Blur})
+	}
+
+	// THE TIE. A click and a paste start both belong at `at == 0`; only the
+	// order they were appended in records that the click came first on the
+	// wire. Two separate positioned streams would have lost this.
+	clear(&out); clear(&st.markers); st.in_paste = false
+	n = decode_keys(transmute([]u8)string("\e[<0;1;1M\e[200~x\e[201~"), &out, {}, nil, &st)
+	testing.expect_value(t, n, 22)
+	testing.expect_value(t, len(out), 1)
+	if testing.expect_value(t, len(st.markers), 3) {
+		testing.expect_value(t, st.markers[0].kind, Input_Marker_Kind.Mouse)
+		testing.expect_value(t, st.markers[0].at, 0)
+		testing.expect_value(t, st.markers[1], Input_Marker{at = 0, kind = .Paste_Start})
+		testing.expect_value(t, st.markers[2], Input_Marker{at = 1, kind = .Paste_End})
+	}
+}
+
+// INSIDE A PASTE the bytes are TEXT, and that suspension applies to mouse and
+// focus exactly as it does to arrow keys: a pasted "\e[<0;1;1M" is nine literal
+// runes, not a click. Without this, pasting a terminal capture would fire
+// phantom mouse events at the application.
+@(test)
+test_mouse_and_focus_are_literal_text_inside_a_paste :: proc(t: ^testing.T) {
+	out := make([dynamic]Key_Msg); defer delete(out)
+	st := Input_State{}; defer delete(st.markers)
+
+	body :: "\e[<0;1;1M\e[I"
+	whole :: "\e[200~" + body + "\e[201~"
+	n := decode_keys(transmute([]u8)string(whole), &out, {}, nil, &st)
+	testing.expect_value(t, n, len(whole))
+	if testing.expect_value(t, len(out), len(body)) {
+		for r, i in body {
+			testing.expect_value(t, out[i], Key_Msg{code = .Rune, r = r, pasted = true})
+		}
+	}
+	// Exactly the two paste markers -- no mouse, no focus.
+	if testing.expect_value(t, len(st.markers), 2) {
+		testing.expect_value(t, st.markers[0].kind, Input_Marker_Kind.Paste_Start)
+		testing.expect_value(t, st.markers[1].kind, Input_Marker_Kind.Paste_End)
+	}
+}
+
+// `st = nil` (the default, and what most callers in this file pass) is the same
+// degradation `enh = nil` gives the enhancement reply: the sequence is still
+// consumed WHOLE -- including the legacy encoding's three raw payload bytes,
+// which is the part that would otherwise leak as garbage runes -- but there is
+// nowhere to record what it meant. Pinned rather than left implicit.
+@(test)
+test_mouse_without_a_state_is_still_consumed_whole :: proc(t: ^testing.T) {
+	out := make([dynamic]Key_Msg); defer delete(out)
+	for seq in ([?]string{"\e[<0;10;5M", "\e[M *%", "\e[M *\e", "\e[I", "\e[O"}) {
+		clear(&out)
+		n := decode_keys(transmute([]u8)seq, &out)
+		testing.expectf(t, n == len(seq), "%q: consumed %d, want %d", seq, n, len(seq))
+		testing.expectf(t, len(out) == 0, "%q: emitted %d keys, want 0 (%v)", seq, len(out), out[:])
+	}
+
+	// ...and the hold-back still applies with st == nil: a legacy report missing
+	// its last payload byte must not be resolved.
+	clear(&out)
+	n := decode_keys(transmute([]u8)string("\e[M *"), &out)
+	testing.expect_value(t, n, 0)
+	testing.expect_value(t, len(out), 0)
+}
+
+// Malformed SGR reports land on the cleanly-ignored path rather than being
+// forced into a plausible-looking click at a position nothing clicked. All of
+// these are COMPLETE sequences, so they are always consumed whole; the question
+// is only whether a marker comes out.
+//
+// The ':' rows are the ones that keep csi_params' sub-parameter rejection
+// honest from this side: sgr_mouse has its own parser precisely so csi_params
+// did not have to be widened, and that parser must reject ':' too.
+@(test)
+test_malformed_sgr_mouse_is_cleanly_ignored :: proc(t: ^testing.T) {
+	out := make([dynamic]Key_Msg); defer delete(out)
+	st := Input_State{}; defer delete(st.markers)
+	for seq in ([?]string{
+		"\e[<M",          // no parameters at all
+		"\e[<0M",         // one field
+		"\e[<0;10M",      // two fields
+		"\e[<0;10;5;7M",  // four fields
+		"\e[<0;10:5M",    // a ':' sub-parameter
+		"\e[<0;;5M",      // an empty middle field
+		"\e[<;10;5M",     // an empty first field
+		"\e[<0;10;M",     // an empty last field
+		"\e[<<0;10;5M",   // two private prefixes
+		"\e[0;10;5M",     // no private prefix at all: not the SGR grammar
+		"\e[>0;10;5M",    // the wrong private prefix
+		"\e[<0;10;5$M",   // an intermediate byte
+	}) {
+		clear(&out); clear(&st.markers)
+		n := decode_keys(transmute([]u8)seq, &out, {}, nil, &st)
+		testing.expectf(t, n == len(seq), "%q: consumed %d, want %d", seq, n, len(seq))
+		testing.expectf(t, len(out) == 0, "%q: emitted %d keys, want 0 (%v)", seq, len(out), out[:])
+		testing.expectf(t, len(st.markers) == 0, "%q: emitted %d markers, want 0 (%v)",
+			seq, len(st.markers), st.markers[:])
+	}
+}
+
+// Mouse_Msg, Focus_Msg and Blur_Msg cross the mailbox like every other Msg, so
+// they are subject to box()'s MESSAGE OWNERSHIP CONTRACT (arena.odin). Mouse_Msg
+// is the first Msg in this file with a non-trivial payload since Key_Msg, so it
+// is worth checking rather than assuming: two enums, two ints and a bit_set,
+// nothing owned.
+@(test)
+test_mouse_and_focus_msgs_are_pod :: proc(t: ^testing.T) {
+	testing.expect(t, is_pod_type(Mouse_Msg), "Mouse_Msg must be POD")
+	testing.expect(t, is_pod_type(Focus_Msg), "Focus_Msg must be POD")
+	testing.expect(t, is_pod_type(Blur_Msg), "Blur_Msg must be POD")
+	testing.expect(t, is_pod_type(Input_Marker), "Input_Marker must be POD (it embeds a Mouse_Msg)")
+	testing.expect_value(t, size_of(Focus_Msg), 0)
+	testing.expect_value(t, size_of(Blur_Msg), 0)
+	// Mouse_Button.None must stay the zero value: a motion event with no button
+	// held and every legacy release report it, and both build a Mouse_Msg that
+	// never names `button`.
+	testing.expect_value(t, Mouse_Button{}, Mouse_Button.None)
+	testing.expect_value(t, Mouse_Kind{}, Mouse_Kind.Press)
+	testing.expect_value(t, Mouse_Msg{}.button, Mouse_Button.None)
 }

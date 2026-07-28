@@ -89,6 +89,10 @@ Action :: enum u8 {
 	Word_Left, Word_Right,
 	Home, End, Page_Up, Page_Down,
 	Indent, Toggle_Help, Paste,
+	// T2-B. APPENDED, like every other member added to an enum in this repo --
+	// ACTION_NAME below is an [Action]string, so an inserted member would
+	// silently shift every existing label.
+	Scroll_Up, Scroll_Down,
 }
 
 ACTION_NAME := [Action]string{
@@ -98,6 +102,7 @@ ACTION_NAME := [Action]string{
 	.Word_Left = "word-left", .Word_Right = "word-right",
 	.Home = "home", .End = "end", .Page_Up = "page-up", .Page_Down = "page-down",
 	.Indent = "indent", .Toggle_Help = "help", .Paste = "paste",
+	.Scroll_Up = "scroll-up", .Scroll_Down = "scroll-down",
 }
 
 Model :: struct {
@@ -266,9 +271,62 @@ update :: proc(m: ^Model, msg: any, alloc: mem.Allocator) -> rt.Cmd {
 		m.pasting = false
 	case rt.Keyboard_Enhancements_Msg:
 		m.kitty = .Disambiguate in v.flags
+	case rt.Mouse_Msg:
+		return apply_mouse(m, v)
 	case rt.Key_Msg:
 		return apply_key(m, v)
 	}
+	return rt.cmd_nil()
+}
+
+// How many lines one wheel notch scrolls. Three is what most editors and
+// terminals use; it is a constant rather than 1 because a one-line-per-notch
+// scroll feels broken on a trackpad.
+WHEEL_LINES :: 3
+
+// T2-B: the mouse. THIS EXAMPLE BINDS THE WHEEL AND DELIBERATELY DOES NOT BIND
+// CLICK-TO-POSITION, and the reason is a real limitation worth stating rather
+// than working around badly.
+//
+// A wheel notch means "scroll", full stop -- it needs no coordinates at all, so
+// it is exactly as correct here as it would be in any application.
+//
+// A CLICK carries ABSOLUTE TERMINAL COORDINATES (rt.Mouse_Msg.x/y are screen
+// cells, 0-based from the top-left of the WINDOW), and turning `y` into a view
+// line needs to know which screen row this frame's first line is on. rt's
+// renderer is an INLINE REWIND renderer (render.odin's renderer_render:
+// cursor-up + erase-line, no alt screen), so a frame sits wherever the terminal
+// happened to be -- it has no screen origin, and nothing in rt.Cursor or
+// Window_Size_Msg exposes one. Deriving it would mean tracking the frame's
+// absolute top row through every resize, every wrap and every frame whose
+// height changes (this view's own help panel changes it), i.e. new renderer
+// state, not a binding in an example. So a click here would place the caret on
+// the wrong line whenever the frame is not flush against the top of the window,
+// which is most of the time -- and a caret that lands somewhere else on most
+// clicks is worse than no click binding at all.
+//
+// `.Press` only, and left-button-agnostic: wheel notches arrive as Wheel events
+// regardless of tracking mode, and every other kind is ignored rather than
+// guessed at.
+apply_mouse :: proc(m: ^Model, mo: rt.Mouse_Msg) -> rt.Cmd {
+	if mo.kind != .Wheel { return rt.cmd_nil() }
+	#partial switch mo.button {
+	case .Wheel_Up:
+		m.top = max(0, m.top - WHEEL_LINES)
+		m.last = .Scroll_Up
+	case .Wheel_Down:
+		m.top = min(max(0, m.nlines - VIEWPORT), m.top + WHEEL_LINES)
+		m.last = .Scroll_Down
+	case:
+		return rt.cmd_nil()   // horizontal wheel: this view does not scroll sideways
+	}
+	// THE WINDOW MOVED, SO THE CARET MAY NOW BE OUTSIDE IT. Pull it back to the
+	// nearest visible line rather than letting cursor() (which returns the zero
+	// Cursor for an off-screen caret) silently stop drawing it -- and note this
+	// is the OPPOSITE direction from follow_cursor, which moves the window to
+	// the caret. Scrolling is the one action where the window leads.
+	m.cy = clamp(m.cy, m.top, min(m.top + VIEWPORT, m.nlines) - 1)
+	clamp_cx(m)
 	return rt.cmd_nil()
 }
 

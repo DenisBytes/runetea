@@ -110,24 +110,299 @@ Key_Msg :: struct {
 Paste_Start_Msg :: struct{}
 Paste_End_Msg   :: struct{}
 
-// Where a paste boundary sits RELATIVE TO THE KEYS decode_keys emitted in the
+// ---------------------------------------------------------------------------
+// T2-B: MOUSE REPORTING.
+//
+// Two wire encodings, both decoded unconditionally (a terminal only ever emits
+// either one after term_enter_raw's opt-in asked it to -- the same reasoning
+// that lets the Kitty CSI-u decoder run unconditionally):
+//
+//   SGR (DECSET 1006):  CSI < Cb ; Cx ; Cy M      press / drag / wheel
+//                       CSI < Cb ; Cx ; Cy m      release
+//   Legacy / X10:       CSI M <Cb+32> <Cx+32> <Cy+32>
+//
+// SGR is the one term_enter_raw asks for, because THE LEGACY ENCODING CANNOT
+// EXPRESS A COLUMN PAST 223: it packs the coordinate into one byte as
+// coordinate + 32, so column 224 needs byte 256 and simply wraps. Legacy is
+// decoded anyway because a terminal that does not understand `?1006h` silently
+// ignores it and keeps sending the old form -- the request is fire-and-forget,
+// exactly like the Kitty push.
+// ---------------------------------------------------------------------------
+
+// Press is the zero value for the same reason Key_Kind.Press is: nothing here
+// constructs a Mouse_Msg without naming `kind`, but keeping the two enums'
+// defaults aligned means one less thing to get wrong when reading both.
+Mouse_Kind :: enum u8 { Press, Release, Motion, Wheel }
+
+// X11 button numbering, and NOT a bit_set: a mouse report names exactly one
+// button (or none), unlike Modifiers, which genuinely is a set.
+//
+// None is the ZERO VALUE and is a real, reachable answer, not a filler: a
+// motion event with no button held reports it, and so does every LEGACY
+// release -- see x10_mouse for that asymmetry. Members are APPENDED and the
+// three runs (Left..Right, Wheel_Up..Wheel_Right, Backward..Button_11) are
+// each contiguous and in protocol order, because mouse_button_bits indexes
+// into them with `first + (Cb & 3)`. Reordering silently renames buttons.
+Mouse_Button :: enum u8 {
+	None,
+	Left, Middle, Right,
+	Wheel_Up, Wheel_Down, Wheel_Left, Wheel_Right,
+	Backward, Forward, Button_10, Button_11,
+}
+
+// COORDINATES ARE ZERO-BASED, (0,0) at the upper-left cell -- both wire
+// encodings are one-based and both are normalised here. This matches
+// ultraviolet's Mouse and Bubble Tea's, and it matches render.odin's Cursor,
+// whose `line`/`col` are also zero-based, so an app can compare a click against
+// a caret without an off-by-one conversion in between.
+//
+// POD, and it has to be: box() rejects anything with a pointer in its field
+// tree (arena.odin's MESSAGE OWNERSHIP CONTRACT) and this crosses a thread
+// boundary through the mailbox like every other Msg. Two enums, two ints and a
+// bit_set -- nothing to own.
+//
+// `mods` REUSES Modifiers rather than defining a second, mouse-shaped modifier
+// set. The wire bits are a different function of a different number from
+// xterm's key modifiers (see mouse_button_bits), but the VOCABULARY is the
+// same three keys, and an app that wants "ctrl+click" should be able to write
+// `.Ctrl in msg.mods` with the same spelling it uses for a keypress.
+Mouse_Msg :: struct {
+	kind:   Mouse_Kind,
+	button: Mouse_Button,
+	x, y:   int,
+	mods:   Modifiers,
+}
+
+// Both encodings bias every byte by 32 to keep it out of the C0 range.
+@(private = "file")
+MOUSE_BYTE_OFFSET :: 32
+
+@(private = "file")
+mouse_is_wheel :: proc(b: Mouse_Button) -> bool {
+	return b >= .Wheel_Up && b <= .Wheel_Right
+}
+
+// Cb, THE ONE BIT LAYOUT BOTH ENCODINGS SHARE. Verified against ultraviolet's
+// parseMouseButton (decoder.go) rather than taken on faith:
+//
+//   bits 0-1  button within the current bank (see bits 6/7)
+//   bit 2   4 Shift
+//   bit 3   8 "meta" in xterm's own documentation -- reported as .Alt, which is
+//            what every terminal actually sends for the Alt key and what the
+//            reference maps it to. RuneTea's Modifiers has a separate .Meta
+//            member (the 4th xterm KEY modifier bit), and deliberately does not
+//            set it here: the two protocols' "meta" are not the same field, and
+//            reporting .Meta for an Alt+click would be a modifier the user did
+//            not press.
+//   bit 4  16 Ctrl
+//   bit 5  32 motion (the button, if any, is being dragged)
+//   bit 6  64 WHEEL bank: 64 up, 65 down, 66 left, 67 right
+//   bit 7 128 EXTRA-BUTTON bank: 128 backward, 129 forward, 130, 131
+//
+// With neither bank bit set, bits 0-1 are 0 left / 1 middle / 2 right / 3 "no
+// button" -- and 3 is what the LEGACY encoding sends for a release, which is
+// why `no_button` comes back separately instead of being folded into the
+// button. SGR ignores it (its final byte carries press-vs-release); X10 needs
+// it. See x10_mouse.
+//
+// The motion bit is NOT honoured for a wheel event: terminals set it
+// spuriously on wheel reports, and a "wheel drag" is not a thing. Same rule as
+// the reference's `isWheel` guard.
+@(private = "file")
+mouse_button_bits :: proc(cb: int) -> (button: Mouse_Button, mods: Modifiers, motion: bool, no_button: bool) {
+	if cb &  4 != 0 { mods += {.Shift} }
+	if cb &  8 != 0 { mods += {.Alt} }
+	if cb & 16 != 0 { mods += {.Ctrl} }
+
+	low := cb & 3
+	switch {
+	case cb & 128 != 0: button = Mouse_Button(int(Mouse_Button.Backward) + low)
+	case cb &  64 != 0: button = Mouse_Button(int(Mouse_Button.Wheel_Up) + low)
+	case low == 3:      button, no_button = .None, true
+	case:               button = Mouse_Button(int(Mouse_Button.Left) + low)
+	}
+	if cb & 32 != 0 && !mouse_is_wheel(button) { motion = true }
+	return
+}
+
+// `CSI < Cb ; Cx ; Cy M|m` -- the SGR report's parameter run, WITH its leading
+// '<'.
+//
+// A DEDICATED PARSER, EXACTLY LIKE kitty_params, AND FOR THE SAME REASON.
+// csi_params rejects the private-prefix bytes '<' '=' '>' '?' by design, and
+// that rejection is load-bearing (read its comment): it is what keeps SGR
+// colour, DECRPM replies and every other private-prefix sequence on the
+// cleanly-ignored path instead of having their parameters silently reinterpreted
+// as key parameters. So the '<' family is handled the way the 'u' family
+// already was -- a separate parser reached from a specific final byte -- and
+// csi_params is not widened by one byte. test_csi_params_still_rejects_colons
+// and test_subparams_are_rejected_outside_csi_u both keep passing unchanged,
+// and the second one now genuinely guards this parser too: `\e[<0;10:5M` has a
+// ':' and must still decode to nothing.
+//
+// STRICTER THAN THE REFERENCE, deliberately. ultraviolet defaults a missing Cx
+// or Cy to 1; here all three fields must be present and numeric, and anything
+// else reports ok = false and lands on the cleanly-ignored path. A mouse report
+// with a missing coordinate is not a report a terminal sends, and inventing
+// column 1 for it would put a plausible-looking click at a position nothing
+// clicked.
+@(private = "file")
+sgr_mouse :: proc(p: []u8, final: u8) -> (m: Mouse_Msg, ok: bool) {
+	if len(p) < 2 || p[0] != '<' { return {}, false }
+	v := [3]int{-1, -1, -1}
+	n := 0
+	for c in p[1:] {
+		switch {
+		case c >= '0' && c <= '9':
+			d := int(c - '0')
+			if v[n] < 0 { v[n] = 0 }
+			// Bounded well above any real terminal geometry; the point is only
+			// that a runaway digit run cannot overflow into a plausible value.
+			if v[n] > 99999 { return {}, false }
+			v[n] = v[n] * 10 + d
+		case c == ';':
+			n += 1
+			if n >= 3 { return {}, false }   // a fourth field is not this grammar
+		case:
+			// ':' sub-parameters, a second private prefix, anything else.
+			return {}, false
+		}
+	}
+	if n != 2 || v[0] < 0 || v[1] < 0 || v[2] < 0 { return {}, false }
+
+	button, mods, motion, _ := mouse_button_bits(v[0])
+	m = Mouse_Msg{button = button, mods = mods, x = v[1] - 1, y = v[2] - 1}
+	// One-based on the wire, zero-based in the Msg. A terminal that reports 0
+	// is out of spec; clamping beats handing an application a negative index.
+	if m.x < 0 { m.x = 0 }
+	if m.y < 0 { m.y = 0 }
+	// MOTION IS TESTED FIRST, and that is only correct because
+	// mouse_button_bits has already suppressed the motion bit for a wheel event
+	// (terminals set it spuriously; a "wheel drag" is not a thing). Written this
+	// way round on purpose: with the wheel case first the suppression would be
+	// dead code that no test could ever catch, and a redundant guard is a guard
+	// nobody maintains. test_mouse_decode_table's "wheel up with the motion bit
+	// set" row is the lever.
+	switch {
+	case motion:                 m.kind = .Motion
+	case mouse_is_wheel(button): m.kind = .Wheel
+	case final == 'm':           m.kind = .Release
+	case:                        m.kind = .Press
+	}
+	return m, true
+}
+
+// `CSI M` + three RAW bytes: Cb+32, Cx+32, Cy+32. Infallible -- any three bytes
+// decode to something -- because the caller has already committed to consuming
+// them (see decode_keys' X10 block for why that is the only safe order).
+//
+// THE ASYMMETRY WITH SGR, DOCUMENTED RATHER THAN PAPERED OVER: this encoding
+// CANNOT SAY WHICH BUTTON WAS RELEASED. A release is Cb bits 0-1 == 3, the same
+// value the protocol uses for "no button", so the button identity is simply not
+// on the wire. Such an event reports `kind = .Release, button = .None`. An app
+// that needs to know which button came up must enable SGR (which term_enter_raw
+// always requests) and, if the terminal ignored that request, track the last
+// press itself. Faking the button by remembering the last press INSIDE the
+// decoder was rejected: it would be a guess presented as a fact, and it breaks
+// outright with two buttons held at once.
+//
+// COORDINATES PAST 223 ARE UNRECOVERABLE HERE. Cx+32 must fit in a byte, so
+// column 224 encodes as byte 0 and is indistinguishable from garbage. A byte
+// below 33 therefore means either an out-of-spec terminal or a wrapped
+// coordinate, and neither can be turned back into the real column; it clamps to
+// 0 rather than reporting a negative index. This limitation IS the reason
+// term_enter_raw always asks for `?1006h`.
+@(private = "file")
+x10_mouse :: proc(b0, b1, b2: u8) -> Mouse_Msg {
+	cb := int(b0)
+	// Defensive, and copied from the reference for the same reason it is there:
+	// a byte below the offset should be impossible, and underflowing into a
+	// negative Cb would scramble every bit test below.
+	if cb >= MOUSE_BYTE_OFFSET { cb -= MOUSE_BYTE_OFFSET }
+
+	button, mods, motion, release := mouse_button_bits(cb)
+	m := Mouse_Msg{
+		button = button,
+		mods   = mods,
+		x      = int(b1) - MOUSE_BYTE_OFFSET - 1,
+		y      = int(b2) - MOUSE_BYTE_OFFSET - 1,
+	}
+	if m.x < 0 { m.x = 0 }
+	if m.y < 0 { m.y = 0 }
+	// Motion first, for the reason spelled out in sgr_mouse.
+	switch {
+	case motion:                 m.kind = .Motion
+	case mouse_is_wheel(button): m.kind = .Wheel
+	case release:                m.kind = .Release
+	}
+	return m
+}
+
+// T2-B: the terminal's FOCUS events. `CSI I` says the terminal window gained
+// focus, `CSI O` says it lost it.
+//
+// TWO ZERO-SIZED TYPES, NOT ONE Focus_Msg{focused: bool}, and the codebase
+// already contains both shapes, so the choice is between two live precedents
+// rather than a free one. Keyboard_Enhancements_Msg carries a VALUE because the
+// value is the entire information content: there is exactly one kind of reply
+// and what an app wants to know is which flags came back. Paste uses two
+// zero-sized types because start and end are two DIFFERENT EVENTS that an app
+// handles with two different pieces of code, and `case Paste_Start_Msg:` reads
+// better than `case Paste_Msg: if msg.start`.
+//
+// Focus is the second shape. An app dims its UI on blur and restores it on
+// focus -- two branches, never one branch parameterised by a bool -- so the
+// type IS the discriminant and there is no residual value left over to carry.
+// It also matches Bubble Tea's own FocusMsg/BlurMsg exactly, which is worth
+// something for anyone porting an app across. Zero-sized additionally means
+// box() returns a nil-data `any` and box_free no-ops, the same free ride
+// Paste_Start_Msg/Paste_End_Msg and Quit_Msg already take.
+Focus_Msg :: struct{}
+Blur_Msg  :: struct{}
+
+// What an out-of-band (non-Key_Msg) event is, for Input_Marker's discriminant.
+//
+// NOTHING HERE IS A SANE DEFAULT, so unlike Key_Kind (whose zero value Press is
+// load-bearing) every construction of an Input_Marker names `kind` explicitly.
+// Members are APPENDED like every other enum in this file.
+Input_Marker_Kind :: enum u8 { Paste_Start, Paste_End, Mouse, Focus, Blur }
+
+// Where a non-key event sits RELATIVE TO THE KEYS decode_keys emitted in the
 // same call: the marker belongs immediately before `out[at]`, and `at ==
 // len(out)` means "after everything".
 //
 // Positions rather than a second, unordered output stream (which is what
 // `enh` is) because ORDER IS THE POINT here. An application that switches into
 // a bulk-insert mode on Paste_Start_Msg needs it before the first pasted
-// character, not after the last one; the keyboard-enhancement reply has no
-// such requirement, arrives once, and can afford to be reported out of band.
-Paste_Marker :: struct {
+// character, not after the last one.
+//
+// T2-B PUT MOUSE AND FOCUS ON THIS SAME LIST rather than giving them a stream
+// of their own, and that is a correctness decision, not a tidiness one. Mouse
+// ordering matters for exactly the reason paste ordering does: a user who
+// clicks to place the caret and then types expects the click to land first, and
+// a 1024-byte read can easily contain both (the terminal buffers while a slow
+// frame renders). The keyboard-enhancement reply is the genuine exception --
+// it arrives once, in answer to a query written before any key can be pressed,
+// so it has no ordering requirement and stays on `enh`.
+//
+// TWO POSITIONED STREAMS WOULD HAVE HAD AN UNRESOLVABLE TIE. `\e[<0;1;1M\e[200~`
+// puts a mouse click and a paste start both at `at == 0`, and with the two on
+// separate lists nothing in either one records which came first on the wire.
+// One list keeps them in decode order by construction, which is why the paste
+// marker type was generalised instead of duplicated.
+//
+// `mouse` is meaningful only when `kind == .Mouse`; it is zero for every other
+// kind, which keeps Input_Marker comparable with == in tests.
+Input_Marker :: struct {
 	at:    int,
-	start: bool,   // true = Paste_Start_Msg, false = Paste_End_Msg
+	kind:  Input_Marker_Kind,
+	mouse: Mouse_Msg,
 }
 
-// decode_keys' bracketed-paste state AND its marker output, in one struct
-// because a caller needs both or neither.
+// decode_keys' cross-call state AND its non-key output, in one struct because a
+// caller needs both or neither.
 //
-// `active` is DECODER STATE THAT MUST PERSIST ACROSS CALLS. The reader calls
+// `in_paste` is DECODER STATE THAT MUST PERSIST ACROSS CALLS. The reader calls
 // decode_keys once per read(), and a paste of any size straddles reads, so
 // "am I inside a paste?" cannot live in a local. It is not a package-level
 // global either: there is more than one decoder in this process (run() and
@@ -136,23 +411,36 @@ Paste_Marker :: struct {
 // The caller owns the struct; both event-loop hosts keep one next to their
 // `pending` buffer.
 //
+// Mouse and focus need no such state -- each of their sequences is
+// self-contained -- so they contribute output here and nothing else.
+//
 // `markers` is CALLER-CLEARED, exactly like `out` and `enh`: decode_keys only
 // appends. Delete it when done -- it is the one allocation this type owns.
-Paste_State :: struct {
-	active:  bool,
-	markers: [dynamic]Paste_Marker,
+Input_State :: struct {
+	in_paste: bool,
+	markers:  [dynamic]Input_Marker,
 }
 
-// Boxes a Paste_Marker as the Msg it denotes. Package-visible because both
+// Boxes an Input_Marker as the Msg it denotes. Package-visible because both
 // event-loop hosts need it and Odin has no closures to share the branch with;
 // context.allocator (never the frame arena) because these cross a thread
 // boundary into the mailbox like every other Msg -- see arena.odin's LIFETIME
-// CONTRACT. Both types are zero-sized, so box() returns a nil-data `any` and
-// box_free no-ops on it, exactly as it already does for Quit_Msg.
+// CONTRACT. Four of the five kinds are zero-sized, so box() returns a nil-data
+// `any` and box_free no-ops on them, exactly as it already does for Quit_Msg;
+// Mouse_Msg is a real (POD) allocation like Key_Msg.
 @(private = "package")
-paste_marker_box :: proc(m: Paste_Marker) -> any {
-	if m.start { return box(Paste_Start_Msg{}, context.allocator) }
-	return box(Paste_End_Msg{}, context.allocator)
+input_marker_box :: proc(m: Input_Marker) -> any {
+	switch m.kind {
+	case .Paste_Start: return box(Paste_Start_Msg{}, context.allocator)
+	case .Paste_End:   return box(Paste_End_Msg{}, context.allocator)
+	case .Mouse:       return box(m.mouse, context.allocator)
+	case .Focus:       return box(Focus_Msg{}, context.allocator)
+	case .Blur:        return box(Blur_Msg{}, context.allocator)
+	}
+	// Unreachable: the switch above is exhaustive over Input_Marker_Kind. Odin
+	// still needs a terminating return, and a nil `any` here would at least fail
+	// loudly at the first type switch rather than pretending to be some Msg.
+	return nil
 }
 
 // The two bracketed-paste sequences, as strings so decode_keys can compare a
@@ -854,7 +1142,9 @@ ss3_decode :: proc(mod_digits: []u8, gl: u8) -> (key: Key_Msg, ok: bool) {
 // event-type sub-parameter on the LEGACY encodings (CSI 1;5:3 A,
 // CSI 3;5:3 ~); bracketed paste (CSI 200~ ... CSI 201~), whose content is
 // streamed as Key_Msgs with `pasted = true` and whose boundaries land in
-// `pst.markers`; and the terminal's keyboard-enhancement reply
+// `st.markers`; mouse reports in BOTH encodings (SGR CSI < Cb;Cx;Cy M/m and
+// legacy CSI M + three raw bytes) and focus in/out (CSI I / CSI O), which land
+// in `st.markers` too; and the terminal's keyboard-enhancement reply
 // (CSI ? <flags> u), which is the one thing here that is not a Key_Msg and so
 // goes to `enh` instead of `out`.
 //
@@ -884,11 +1174,12 @@ ss3_decode :: proc(mod_digits: []u8, gl: u8) -> (key: Key_Msg, ok: bool) {
 // one split across a read boundary still holds back. The ONLY thing that ends
 // paste mode is the `CSI 201~` terminator; a nested `CSI 200~` is literal text.
 //
-// The state lives in `pst` (see Paste_State) because the reader calls this
-// proc once per read and a paste of any size straddles reads. With pst == nil
+// The state lives in `st` (see Input_State) because the reader calls this
+// proc once per read and a paste of any size straddles reads. With st == nil
 // paste is still decoded WITHIN a single buffer, but the mode cannot survive
 // the call and the markers have nowhere to go -- the same degradation
-// enh == nil gives the enhancement reply.
+// enh == nil gives the enhancement reply, and the same one mouse and focus
+// events get (still consumed whole, just dropped).
 //
 // AN UNTERMINATED PASTE (the terminal dies or misbehaves mid-paste) does not
 // wedge anything, and this is worth stating because "hold back" and "wedge"
@@ -905,7 +1196,16 @@ ss3_decode :: proc(mod_digits: []u8, gl: u8) -> (key: Key_Msg, ok: bool) {
 // DOCUMENTED LIMITATIONS -- each of these is a separate future unit, and each
 // is CLEANLY IGNORED here (consumed whole, nothing emitted) rather than
 // leaking bytes as garbage runes:
-//   - mouse reporting (X10, SGR: CSI M ..., CSI < ... M/m);
+//   - the urxvt (CSI 1015) and SGR-PIXEL (CSI 1016) mouse encodings.
+//     term_enter_raw never asks for either, so a terminal never sends one
+//     unbidden; urxvt's `CSI <Cb> ; <Cx> ; <Cy> M` has no private prefix and
+//     would need a way to tell it from a key sequence, and SGR-pixel reports
+//     PIXEL coordinates, which Mouse_Msg (documented as cell coordinates)
+//     cannot carry without a unit field;
+//   - DECSET 9 (X10 press-only tracking). Mouse_Mode has no member for it: it
+//     reports presses and never releases, which makes drag and click-release
+//     UIs silently impossible, and every terminal that supports it supports
+//     1000 as well;
 //   - an UNPAIRED `CSI 201~` (a paste end with no matching start). Reporting a
 //     Paste_End_Msg for it would tell an application to leave a mode it never
 //     entered -- the same class of hazard as term.odin's unpaired Kitty pop;
@@ -919,7 +1219,6 @@ ss3_decode :: proc(mod_digits: []u8, gl: u8) -> (key: Key_Msg, ok: bool) {
 //     folded onto Meta;
 //   - Kitty functional keys Key_Code has no member for: F13-F35, the whole
 //     keypad block, the media keys, and the lone modifier keypresses;
-//   - focus in/out (CSI I / CSI O);
 //   - keypad/DECKPAM keys (ESC O M/X/j-y) and Begin (CSI E / ESC O E);
 //   - Shift+Tab (CSI Z) and rxvt's lowercase-letter arrow forms;
 //   - F13-F20 (CSI 25~ and up), which Key_Code does not carry;
@@ -937,7 +1236,8 @@ ss3_decode :: proc(mod_digits: []u8, gl: u8) -> (key: Key_Msg, ok: bool) {
 // "\e" alone at the very end of the buffer, "\e[" with nothing after it, a
 // CSI whose final byte (0x40-0x7E) hasn't arrived yet, an SS3 whose GL byte
 // hasn't arrived yet, or a UTF-8 lead byte without all of its continuation
-// bytes yet -- must NOT be decoded yet. Emitting a spurious Escape, or a
+// bytes yet, or a legacy mouse report whose three RAW bytes have not all
+// landed -- must NOT be decoded yet. Emitting a spurious Escape, or a
 // spurious U+FFFD replacement rune, for any of these would be the classic bug
 // where a sequence split across two reads turns into a bogus keypress plus
 // garbage once the rest of it arrives and gets decoded on its own. Every "not
@@ -1029,14 +1329,14 @@ decode_keys :: proc(
 	out:    ^[dynamic]Key_Msg,
 	legacy: Legacy_Key_Encoding = {},
 	enh:    ^[dynamic]Keyboard_Enhancements_Msg = nil,
-	pst:    ^Paste_State = nil,
+	st:     ^Input_State = nil,
 ) -> (consumed: int) {
 	// Mirrored into a local and written back on EVERY exit path (there are
-	// several early returns for hold-back). With pst == nil the local is the
+	// several early returns for hold-back). With st == nil the local is the
 	// only state there is, which is what makes paste work within one buffer
 	// but not across calls -- see this proc's doc comment.
-	in_paste := pst != nil && pst.active
-	defer { if pst != nil { pst.active = in_paste } }
+	in_paste := st != nil && st.in_paste
+	defer { if st != nil { st.in_paste = in_paste } }
 
 	i := 0
 	for i < len(data) {
@@ -1060,7 +1360,7 @@ decode_keys :: proc(
 					// this one waits where the top-level lone ESC resolves.
 					if n < len(PASTE_END) { return i }
 					in_paste = false
-					if pst != nil { append(&pst.markers, Paste_Marker{at = len(out)}) }
+					if st != nil { append(&st.markers, Input_Marker{at = len(out), kind = .Paste_End}) }
 					i += len(PASTE_END)
 					continue
 				}
@@ -1143,7 +1443,7 @@ decode_keys :: proc(
 				// lands on the cleanly-ignored path exactly as it always did.
 				if string(data[i:j + 1]) == PASTE_START {
 					in_paste = true
-					if pst != nil { append(&pst.markers, Paste_Marker{at = len(out), start = true}) }
+					if st != nil { append(&st.markers, Input_Marker{at = len(out), kind = .Paste_Start}) }
 					i = j + 1
 					continue
 				}
@@ -1153,6 +1453,98 @@ decode_keys :: proc(
 						i = j + 1
 						continue
 					}
+				}
+				// T2-B, LEGACY/X10 MOUSE: `CSI M` followed by exactly THREE
+				// RAW BYTES. Dispatched here, ahead of csi_decode, because it
+				// is the one construct in this decoder whose length is NOT
+				// determined by the CSI grammar -- and getting that wrong is
+				// the trap this block exists to avoid.
+				//
+				// HOW THIS CANNOT CORRUPT THE CSI SCAN, precisely:
+				//
+				//  1. THE SCAN HAS ALREADY ENDED. The loop above stops at the
+				//     first final byte (0x40-0x7E), which for this sequence is
+				//     the 'M' at `j`. Everything the scanner ever examines lies
+				//     at or before `j`, so the three payload bytes -- which may
+				//     be ANY byte value, including 0x1B, '[', 'M', '~', an
+				//     invalid UTF-8 lead byte or a NUL -- are never fed to it.
+				//     Nor can the resynchronisation arm reach back into them: it
+				//     fires only when the byte AT `j` is out of the final-byte
+				//     range, which it is not here.
+				//  2. THEY ARE NEVER DECODED SEPARATELY. Consumption jumps the
+				//     whole six-byte unit in one step (`i = j + 4`), so the top
+				//     of the loop resumes strictly after the payload. Consuming
+				//     only `j + 1` instead would let the very next iteration
+				//     read Cb+32 as a rune -- and a Cy byte of 0x1B would then
+				//     introduce a phantom escape sequence that eats the user's
+				//     next real keystroke.
+				//  3. THE HOLD-BACK IS DECIDED BEFORE ANY PAYLOAD BYTE IS READ.
+				//     The length is known from the grammar alone (always three),
+				//     so "have all three arrived?" is pure arithmetic on `j` and
+				//     `len(data)`. A 0x1B sitting in the payload can therefore
+				//     never be mistaken for a sequence in flight, and a split
+				//     read can never resolve half a report -- the same
+				//     all-or-nothing rule every other sequence here obeys, just
+				//     with a length the bytes themselves do not announce.
+				//
+				// The guard `ps == pe && pe == j` means "no parameter bytes and
+				// no intermediates", i.e. a BARE `CSI M`. That is what keeps
+				// this arm off the SGR form (`CSI < ... M`, which has
+				// parameters) and off anything else ending in 'M'.
+				//
+				// A `CSI M` never followed by three bytes stalls the decoder on
+				// those three bytes -- bounded, like the unterminated-paste case
+				// above, and equally unrecoverable without a timer. Accepted for
+				// the reason ultraviolet accepts it: on an INPUT stream `CSI M`
+				// is a mouse report and nothing else (its output-side meaning,
+				// Delete Line, is a sequence a program WRITES).
+				if final == 'M' && ps == pe && pe == j {
+					if j + 4 > len(data) { return i }   // fewer than three payload bytes: hold back
+					if st != nil {
+						append(&st.markers, Input_Marker{
+							at = len(out), kind = .Mouse,
+							mouse = x10_mouse(data[j + 1], data[j + 2], data[j + 3]),
+						})
+					}
+					i = j + 4
+					continue
+				}
+				// T2-B, SGR MOUSE: `CSI < Cb ; Cx ; Cy M|m`. The '<' is a
+				// PRIVATE PREFIX BYTE, which csi_params rejects on purpose, so
+				// this goes through sgr_mouse -- its own parser, reached only
+				// from these two final bytes. Exactly the arrangement 'u'
+				// already has with kitty_params, and for the same reason: read
+				// csi_params' comment on why that rejection must not be widened.
+				//
+				// Ordering note: this sits BELOW the X10 block so the bare
+				// `CSI M` case is claimed first. The two are disjoint anyway
+				// (X10 requires an empty parameter run, SGR requires a '<'), but
+				// a reader should not have to prove that to follow the flow.
+				if (final == 'M' || final == 'm') && pe == j {
+					if m, mok := sgr_mouse(data[ps:pe], final); mok {
+						if st != nil {
+							append(&st.markers, Input_Marker{at = len(out), kind = .Mouse, mouse = m})
+						}
+						i = j + 1
+						continue
+					}
+				}
+				// T2-B, FOCUS: `CSI I` in, `CSI O` out. Parameterless and
+				// intermediate-free by definition, so `\e[1I` is NOT focus and
+				// stays on the cleanly-ignored path -- checked rather than
+				// assumed, because 'I' and 'O' are ordinary final bytes that
+				// some other report could reach with parameters attached.
+				//
+				// `CSI O` is a different sequence from `ESC O` (SS3): the '[' is
+				// what tells them apart, and this branch is already inside the
+				// '[' arm.
+				if ps == pe && pe == j && (final == 'I' || final == 'O') {
+					if st != nil {
+						k := Input_Marker_Kind.Focus if final == 'I' else Input_Marker_Kind.Blur
+						append(&st.markers, Input_Marker{at = len(out), kind = k})
+					}
+					i = j + 1
+					continue
 				}
 				if key, ok := csi_decode(data[ps:pe], pe != j, final, legacy); ok {
 					append(out, key)

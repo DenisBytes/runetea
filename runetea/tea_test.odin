@@ -636,3 +636,100 @@ test_bracketed_paste_reaches_update_in_order :: proc(t: ^testing.T) {
 			"run_nbio(): update saw %q, want %q", string(p.model.log[:p.model.n]), want)
 	}
 }
+
+// T2-B, end to end: a mouse report and a focus event have to reach update() IN
+// THEIR PLACE in the key stream, not bolted on at the end of the batch. That is
+// the whole reason decode_keys reports them as POSITIONED markers on the same
+// list bracketed paste uses (input.odin's Input_Marker) rather than on a second
+// unordered stream the way it reports the keyboard-enhancement reply: a user
+// who clicks to place the caret and then types expects the click first, and one
+// 1024-byte read can hold both. Both event-loop hosts have to interleave them,
+// so both are driven here.
+//
+// The script also mixes the two mouse encodings deliberately -- SGR for the
+// click, legacy/X10 for the release, with an 0x1B in the legacy payload -- so
+// this exercises the whole path a real terminal drives, including the three raw
+// bytes that are not CSI grammar.
+Mouse_Log_Model :: struct {
+	log: [64]u8,
+	n:   int,
+	// The last click's coordinates, so this proves the decoded VALUES survive
+	// the box/mailbox round trip and not merely that a message of the right
+	// type arrived.
+	x, y: int,
+}
+
+@(private = "file")
+mouse_log :: proc(m: ^Mouse_Log_Model, ch: u8) {
+	if m.n < len(m.log) { m.log[m.n] = ch; m.n += 1 }
+}
+
+mouse_log_update :: proc(m: ^Mouse_Log_Model, msg: any, alloc: mem.Allocator) -> Cmd {
+	switch v in msg {
+	case Focus_Msg: mouse_log(m, 'F')
+	case Blur_Msg:  mouse_log(m, 'B')
+	case Mouse_Msg:
+		switch v.kind {
+		case .Press:   mouse_log(m, 'P'); m.x, m.y = v.x, v.y
+		case .Release: mouse_log(m, 'R')
+		case .Motion:  mouse_log(m, 'M')
+		case .Wheel:   mouse_log(m, 'W')
+		}
+	case Key_Msg:
+		mouse_log(m, 'k')
+		if v.code == .Rune && v.r == 'q' { return quit_cmd() }
+	}
+	return cmd_nil()
+}
+
+mouse_log_view :: proc(m: Mouse_Log_Model, alloc: mem.Allocator) -> string { return "" }
+
+@(test)
+test_mouse_and_focus_reach_update_in_order :: proc(t: ^testing.T) {
+	// key, SGR press at (10,5), key, legacy release (with 0x1B as the Cy byte),
+	// wheel up, focus in, focus out, then the quit key.
+	script := "a\e[<0;10;5Mb\e[M#*\e\e[<64;1;1M\e[I\e[Oq"
+	want   := "kPkRWFBk"
+
+	{
+		fds: [2]posix.FD
+		testing.expect(t, posix.pipe(&fds) == .OK, "pipe should succeed")
+		posix.write(fds[1], raw_data(script), len(script))
+		posix.close(fds[1])
+
+		src, ok := input_source_from_fd(fds[0])
+		testing.expect(t, ok, "input_source_from_fd should succeed")
+		b := strings.builder_make(); defer strings.builder_destroy(&b)
+
+		p: Program(Mouse_Log_Model)
+		program_init(&p, Mouse_Log_Model{}, mouse_log_update, mouse_log_view)
+		err := run(&p, &src, &b)
+		input_close(&src)
+		posix.close(fds[0])
+
+		testing.expect(t, err == nil, "run should exit cleanly")
+		testing.expectf(t, string(p.model.log[:p.model.n]) == want,
+			"run(): update saw %q, want %q", string(p.model.log[:p.model.n]), want)
+		testing.expectf(t, p.model.x == 9 && p.model.y == 4,
+			"run(): the click landed at (%d,%d), want (9,4)", p.model.x, p.model.y)
+	}
+
+	{
+		fds: [2]posix.FD
+		testing.expect(t, posix.pipe(&fds) == .OK, "pipe should succeed")
+		posix.write(fds[1], raw_data(script), len(script))
+		posix.close(fds[1])
+
+		b := strings.builder_make(); defer strings.builder_destroy(&b)
+		p: Program(Mouse_Log_Model)
+		program_init(&p, Mouse_Log_Model{}, mouse_log_update, mouse_log_view)
+		err := run_nbio(&p, fds[0], &b)
+		posix.close(fds[0])
+
+		testing.expect(t, err == nil, "run_nbio should exit cleanly")
+		testing.expectf(t, string(p.model.log[:p.model.n]) == want,
+			"run_nbio(): update saw %q, want %q", string(p.model.log[:p.model.n]), want)
+		testing.expectf(t, p.model.x == 9 && p.model.y == 4,
+			"run_nbio(): the click landed at (%d,%d), want (9,4)", p.model.x, p.model.y)
+	}
+}

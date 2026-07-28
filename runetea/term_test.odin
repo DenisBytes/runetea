@@ -129,11 +129,12 @@ test_kitty_flag_values_match_the_protocol :: proc(t: ^testing.T) {
 }
 
 // A terminal that never opted in must see ZERO bytes -- no keyboard push, no
-// query, no bracketed-paste enable, and above all nothing on the way out. Both
-// opt-ins default to off (`kb: Kitty_Flags = {}`, `paste: bool = false`)
-// precisely so that every call site that predates them (all 23 programs under
-// examples/ and tools/, plus the golden harness) keeps behaving exactly as it
-// did.
+// query, no bracketed-paste enable, no mouse tracking, no focus reporting, and
+// above all nothing on the way out. All four opt-ins default to off
+// (`kb: Kitty_Flags = {}`, `paste: bool = false`, `mouse: Mouse_Mode = .None`,
+// `focus: bool = false`) precisely so that every call site that predates them
+// (all 24 programs under examples/ and tools/, plus the golden harness) keeps
+// behaving exactly as it did.
 @(test)
 test_no_opt_ins_write_nothing :: proc(t: ^testing.T) {
 	pty, ok := open_test_pty()
@@ -145,6 +146,8 @@ test_no_opt_ins_write_nothing :: proc(t: ^testing.T) {
 	testing.expect(t, term_enter_raw(pty.slave), "term_enter_raw on a pty slave should succeed")
 	testing.expect(t, !g_term.kitty_active, "no flags requested: kitty_active must stay false")
 	testing.expect(t, !g_term.paste_active, "no paste requested: paste_active must stay false")
+	testing.expect(t, g_term.mouse_mode == .None, "no mouse requested: mouse_mode must stay .None")
+	testing.expect(t, !g_term.focus_active, "no focus requested: focus_active must stay false")
 
 	buf: [64]u8
 	testing.expectf(t, drain_master(pty.master, buf[:], 0) == "",
@@ -153,7 +156,7 @@ test_no_opt_ins_write_nothing :: proc(t: ^testing.T) {
 
 	term_restore()
 	testing.expectf(t, drain_master(pty.master, buf[:], 0) == "",
-		"term_restore after an opt-out enter wrote something -- an unpaired pop eats another program's stack entry, and an unpaired ?2004l turns paste reporting off for whoever DID enable it")
+		"term_restore after an opt-out enter wrote something -- an unpaired pop eats another program's stack entry, an unpaired ?2004l turns paste reporting off for whoever DID enable it, and an unpaired ?1000l/?1004l does the same for mouse and focus")
 }
 
 // THE INVARIANT OF THIS TASK. Push once on the way in, pop EXACTLY once on the
@@ -534,4 +537,228 @@ test_paste_resets_on_the_crash_path :: proc(t: ^testing.T) {
 	got := drain_master(pty.master, buf[:], len(want))
 	testing.expectf(t, got == want,
 		"crash path wrote %q, want enable then exactly one reset %q", got, want)
+}
+
+// ---------------------------------------------------------------------------
+// T2-B: mouse tracking and focus reporting, both DECSET/DECRST pairs. Same pty
+// technique and same test SHAPE as the three pairings above, because the
+// invariant is the same one -- never leave the terminal in a state this process
+// put it in.
+//
+// THE HAZARD, stated fresh rather than copied. `?1000h`/`?1002h`/`?1003h`,
+// `?1006h` and `?1004h` are DECSET/DECRST: boolean modes, no stack, no depth.
+// Resetting twice is idempotent, so the specific catastrophe POP-EXACTLY-ONCE
+// exists to prevent -- eating an entry belonging to a program above us, from a
+// stack nobody can inspect -- simply has no analogue here, exactly as it has
+// none for bracketed paste. The guards (`mouse_mode`, `focus_active`) are still
+// required for the general form of the rule: an unpaired `?1000l` turns mouse
+// reporting off for whatever program above us had it on.
+//
+// What is NOT milder is the consequence of FORGETTING the reset, which is why
+// mouse sits high in term_restore_c's worst-first ordering: a terminal left in
+// mouse-reporting mode injects escape-sequence garbage into the user's shell on
+// every click and every scroll flick. That is the same class of damage as a
+// mis-reported keystroke, and it fires far more often.
+// ---------------------------------------------------------------------------
+
+@(test)
+test_mouse_set_and_reset_exactly_once :: proc(t: ^testing.T) {
+	Case :: struct { mode: Mouse_Mode, on, off: string }
+	// Each ON string is the tracking mode followed by `?1006h` -- SGR extended
+	// coordinates, which is NOT optional: the legacy encoding cannot express a
+	// column past 223 (input.odin's x10_mouse). Each OFF string undoes exactly
+	// those two modes and nothing else.
+	for c in ([?]Case{
+		{.Normal,       "\e[?1000h\e[?1006h", "\e[?1006l\e[?1000l"},
+		{.Button_Event, "\e[?1002h\e[?1006h", "\e[?1006l\e[?1002l"},
+		{.Any_Event,    "\e[?1003h\e[?1006h", "\e[?1006l\e[?1003l"},
+	}) {
+		pty, ok := open_test_pty()
+		if !testing.expect(t, ok, "could not open a pty") { return }
+		defer close_test_pty(pty)
+		g_term = {}
+		defer g_term = {}
+
+		testing.expect(t, term_enter_raw(pty.slave, {}, false, c.mode), "term_enter_raw should succeed")
+		testing.expectf(t, g_term.mouse_mode == c.mode,
+			"%v: a successful enable must record the mode, got %v", c.mode, g_term.mouse_mode)
+		testing.expect(t, !g_term.kitty_active, "mouse alone must not touch the keyboard stack")
+		testing.expect(t, !g_term.paste_active, "mouse alone must not touch bracketed paste")
+		testing.expect(t, !g_term.focus_active, "mouse alone must not touch focus reporting")
+
+		buf: [64]u8
+		got := drain_master(pty.master, buf[:], len(c.on))
+		testing.expectf(t, got == c.on, "%v: enabled %q, want %q", c.mode, got, c.on)
+
+		// Three teardowns: the orderly one, a redundant repeat, and the
+		// signal-handler entry point. Exactly one reset must come out. A second
+		// would be harmless on the wire (RESET is idempotent) but it would mean
+		// the flag guard is not working, and the guard is what stops us
+		// resetting a mode we never set at all.
+		term_restore()
+		testing.expectf(t, g_term.mouse_mode == .None, "%v: restore must clear mouse_mode", c.mode)
+		term_restore()
+		term_restore_c()
+
+		buf2: [64]u8
+		got2 := drain_master(pty.master, buf2[:], len(c.off))
+		testing.expectf(t, got2 == c.off,
+			"%v: teardown wrote %q, want exactly one reset %q", c.mode, got2, c.off)
+		// AND NOTHING MORE. drain_master stops the moment it has `want` bytes,
+		// so the assertion above alone would happily pass against three stacked
+		// resets -- it would only ever look at the first one. This second drain
+		// (want == 0, i.e. "prove a negative", which still waits) is what makes
+		// "exactly once" mean exactly once rather than "at least once".
+		buf3: [64]u8
+		testing.expectf(t, drain_master(pty.master, buf3[:], 0) == "",
+			"%v: teardown wrote MORE after the first reset -- the mouse_mode guard is not working", c.mode)
+	}
+}
+
+// THE POINT OF STORING THE MODE rather than a bare bool: the reset must undo
+// EXACTLY the tracking mode that was set. Resetting all three unconditionally
+// (which is what ultraviolet's MouseModeNone does) would turn off modes this
+// process never set -- the same rule the flag guard exists to enforce, broken a
+// different way. Asserted here by proving that a `.Any_Event` session's
+// teardown mentions 1003 and never mentions 1000 or 1002.
+@(test)
+test_mouse_reset_names_only_the_mode_that_was_set :: proc(t: ^testing.T) {
+	pty, ok := open_test_pty()
+	if !testing.expect(t, ok, "could not open a pty") { return }
+	defer close_test_pty(pty)
+	g_term = {}
+	defer g_term = {}
+
+	testing.expect(t, term_enter_raw(pty.slave, {}, false, .Any_Event), "term_enter_raw should succeed")
+	buf: [64]u8
+	drain_master(pty.master, buf[:], len("\e[?1003h\e[?1006h"))
+
+	term_restore()
+	buf2: [64]u8
+	got := drain_master(pty.master, buf2[:], len("\e[?1006l\e[?1003l"))
+	testing.expectf(t, got == "\e[?1006l\e[?1003l",
+		"teardown wrote %q, want only the 1003 reset -- 1000 and 1002 were never set", got)
+	testing.expect(t, !strings.contains(got, "1000"), "teardown must not reset a mode we never set")
+	testing.expect(t, !strings.contains(got, "1002"), "teardown must not reset a mode we never set")
+}
+
+@(test)
+test_focus_set_and_reset_exactly_once :: proc(t: ^testing.T) {
+	pty, ok := open_test_pty()
+	if !testing.expect(t, ok, "could not open a pty") { return }
+	defer close_test_pty(pty)
+	g_term = {}
+	defer g_term = {}
+
+	testing.expect(t, term_enter_raw(pty.slave, {}, false, .None, true), "term_enter_raw should succeed")
+	testing.expect(t, g_term.focus_active, "a successful enable must leave focus_active true")
+	testing.expect(t, g_term.mouse_mode == .None, "focus alone must not enable mouse tracking")
+
+	buf: [64]u8
+	got := drain_master(pty.master, buf[:], len("\e[?1004h"))
+	testing.expectf(t, got == "\e[?1004h", "enabled %q, want %q", got, "\e[?1004h")
+
+	term_restore()
+	testing.expect(t, !g_term.focus_active, "restore must clear focus_active")
+	term_restore()
+	term_restore_c()
+
+	buf2: [64]u8
+	got2 := drain_master(pty.master, buf2[:], len("\e[?1004l"))
+	testing.expectf(t, got2 == "\e[?1004l",
+		"teardown wrote %q, want exactly one reset %q", got2, "\e[?1004l")
+	// ...and nothing more; see the same assertion in
+	// test_mouse_set_and_reset_exactly_once for why the first drain alone is
+	// not enough to prove "exactly once".
+	buf3: [64]u8
+	testing.expectf(t, drain_master(pty.master, buf3[:], 0) == "",
+		"teardown wrote MORE after the first reset -- the focus_active guard is not working")
+}
+
+// ALL FOUR OPT-INS AT ONCE. They are independent layers and must pair
+// independently, and this also pins the RESTORE ORDERING that T2-B changed:
+// termios, then the keyboard pop, then the MOUSE reset, then the FOCUS reset,
+// then the cursor show, then the paste reset -- worst-first, so a second fatal
+// signal landing mid-teardown has already undone the most damaging state. The
+// cursor is absent from the expected bytes because nothing here renders a
+// frame; the other four are all present, in order. See term_restore_c.
+@(test)
+test_all_four_opt_ins_pair_independently :: proc(t: ^testing.T) {
+	pty, ok := open_test_pty()
+	if !testing.expect(t, ok, "could not open a pty") { return }
+	defer close_test_pty(pty)
+	g_term = {}
+	defer g_term = {}
+
+	testing.expect(t, term_enter_raw(pty.slave, {.Disambiguate}, true, .Button_Event, true),
+		"term_enter_raw should succeed")
+	testing.expect(t, g_term.kitty_active && g_term.paste_active &&
+		g_term.mouse_mode == .Button_Event && g_term.focus_active, "all four opt-ins must be armed")
+
+	// ENTER order: keyboard push+query, paste, mouse, focus -- the order
+	// term_enter_raw writes them, which is deliberately the same order the
+	// parameters appear in.
+	want_in := "\e[>1u\e[?u" + "\e[?2004h" + "\e[?1002h\e[?1006h" + "\e[?1004h"
+	buf: [128]u8
+	got := drain_master(pty.master, buf[:], len(want_in))
+	testing.expectf(t, got == want_in, "enter wrote %q, want %q", got, want_in)
+
+	term_restore()
+	term_restore_c()
+
+	// TEARDOWN order: worst-first, and NOT the reverse of the enter order.
+	want_out := "\e[<1u" + "\e[?1006l\e[?1002l" + "\e[?1004l" + "\e[?2004l"
+	buf2: [128]u8
+	got2 := drain_master(pty.master, buf2[:], len(want_out))
+	testing.expectf(t, got2 == want_out, "teardown wrote %q, want %q", got2, want_out)
+}
+
+// The crash path, end to end and for real -- the exact shape of
+// test_kitty_pops_exactly_once_on_the_crash_path and
+// test_paste_resets_on_the_crash_path, for the same reason: a process killed by
+// a signal never runs its `defer`s, so the reset has to come out of guard.odin's
+// crash_handler (which calls term_restore_c directly) or not at all.
+//
+// This is the pairing where forgetting hurts most. A terminal left in
+// mouse-reporting mode after a crash turns every subsequent click and every
+// scroll flick in the user's shell into escape-sequence garbage typed at the
+// command line, and a terminal left in focus-reporting mode does the same on
+// every window switch.
+@(test)
+test_mouse_and_focus_reset_on_the_crash_path :: proc(t: ^testing.T) {
+	pty, ok := open_test_pty()
+	if !testing.expect(t, ok, "could not open a pty") { return }
+	defer close_test_pty(pty)
+
+	pid := posix.fork()
+	if !testing.expect(t, pid >= 0, "fork failed") { return }
+
+	if pid == 0 {
+		// CHILD. No `defer term_restore()`: this proves the SIGNAL path resets.
+		posix.close(pty.master)
+		install_crash_handlers()
+		if !term_enter_raw(pty.slave, {}, false, .Any_Event, true) { posix._exit(1) }
+		posix.raise(posix.Signal.SIGTERM)
+		posix._exit(1)   // NOT REACHED: crash_handler re-raises with SIG_DFL
+	}
+
+	status: c.int
+	exited := false
+	for _ in 0 ..< 200 {
+		if posix.waitpid(pid, &status, {.NOHANG}) == pid { exited = true; break }
+		time.sleep(5 * time.Millisecond)
+	}
+	if !exited {
+		posix.kill(pid, posix.Signal.SIGKILL)
+		testing.expect(t, false, "child did not die within 1s")
+		return
+	}
+	testing.expect(t, posix.WIFSIGNALED(status),
+		"the child must die BY SIGNAL -- if it exited normally, crash_handler never ran")
+
+	buf: [128]u8
+	want := "\e[?1003h\e[?1006h" + "\e[?1004h" + "\e[?1006l\e[?1003l" + "\e[?1004l"
+	got := drain_master(pty.master, buf[:], len(want))
+	testing.expectf(t, got == want,
+		"crash path wrote %q, want enable then exactly one reset of each %q", got, want)
 }

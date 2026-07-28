@@ -23,6 +23,7 @@ import ed "edit"
 //   bracketed paste         multi-line insert, streamed      (CSI 200~ .. 201~)
 //   Tab vs Ctrl+I           two DIFFERENT actions -- Kitty only (see edit's
 //                           apply_key: on the legacy encoding both are 0x09)
+//   mouse wheel             scroll the viewport              (CSI < 64/65;x;y M)
 //
 // Everything above lives in package edit next door, not in this file, so it
 // can be driven through rt.run() from a test with scripted bytes
@@ -78,7 +79,20 @@ main :: proc() {
 	//
 	// The matching teardown for both is written by rt.term_restore() below,
 	// and by the crash-signal path -- exactly once between them.
-	if !rt.term_enter_raw(fd, {.Disambiguate}, true) { fmt.eprintln("not a tty"); os.exit(1) }
+	//
+	// `mouse = .Normal` is DECSET 1000 (press and release) plus DECSET 1006 (SGR
+	// extended coordinates, which term_enter_raw always pairs with a tracking
+	// mode -- the legacy encoding cannot express a column past 223). .Normal and
+	// not .Button_Event or .Any_Event because this editor binds only the WHEEL
+	// (ed.apply_mouse explains why it does not bind click-to-position), and
+	// wheel notches are reported in every tracking mode: asking for drag or
+	// all-motion would flood the reader with reports nothing here consumes.
+	//
+	// Focus reporting (DECSET 1004) is NOT enabled: nothing in this example
+	// reacts to Focus_Msg/Blur_Msg, and enabling a mode with no handler behind
+	// it is exactly the "write nothing you did not need" rule term_enter_raw's
+	// defaults exist to make easy.
+	if !rt.term_enter_raw(fd, {.Disambiguate}, true, .Normal) { fmt.eprintln("not a tty"); os.exit(1) }
 	defer rt.term_restore()
 
 	src, ok := rt.input_source_from_fd(fd)

@@ -363,11 +363,13 @@ reader_thread :: proc(th: ^thread.Thread) {
 	// not a Key_Msg -- see decode_keys' note on the ordering that costs.
 	enh  := make([dynamic]Keyboard_Enhancements_Msg); defer delete(enh)
 	pending: [dynamic]u8;            defer delete(pending)
-	// Bracketed-paste state, owned by THIS reader (input.odin's Paste_State
-	// explains why it cannot be a global): `active` has to survive from one
-	// decode_keys call to the next, because a paste of any size straddles
-	// reads. `markers` is scratch, cleared and reused every read like `keys`.
-	pst := Paste_State{};            defer delete(pst.markers)
+	// The decoder's cross-call state and its non-key output, owned by THIS
+	// reader (input.odin's Input_State explains why it cannot be a global):
+	// `in_paste` has to survive from one decode_keys call to the next, because
+	// a paste of any size straddles reads. `markers` is scratch, cleared and
+	// reused every read like `keys`; since T2-B it carries mouse and focus
+	// events as well as the paste boundaries.
+	st := Input_State{};             defer delete(st.markers)
 
 	for !sync.atomic_load(&rd.stop) {
 		n, ok, woken := input_read(rd.src, buf[:])
@@ -383,8 +385,8 @@ reader_thread :: proc(th: ^thread.Thread) {
 
 		clear(&keys)
 		clear(&enh)
-		clear(&pst.markers)
-		consumed := decode_keys(pending[:], &keys, rd.legacy, &enh, &pst)
+		clear(&st.markers)
+		consumed := decode_keys(pending[:], &keys, rd.legacy, &enh, &st)
 		if consumed > 0 { remove_range(&pending, 0, consumed) }
 
 		// Boxed on the heap, not the frame arena: these cross a thread
@@ -399,14 +401,14 @@ reader_thread :: proc(th: ^thread.Thread) {
 		// decode_keys' note -- so it is flushed at the end.)
 		mi := 0
 		for k, idx in keys {
-			for mi < len(pst.markers) && pst.markers[mi].at <= idx {
-				if reader_send(rd.mailbox, paste_marker_box(pst.markers[mi])) { return }
+			for mi < len(st.markers) && st.markers[mi].at <= idx {
+				if reader_send(rd.mailbox, input_marker_box(st.markers[mi])) { return }
 				mi += 1
 			}
 			if reader_send(rd.mailbox, box(k, context.allocator)) { return }
 		}
-		for ; mi < len(pst.markers); mi += 1 {
-			if reader_send(rd.mailbox, paste_marker_box(pst.markers[mi])) { return }
+		for ; mi < len(st.markers); mi += 1 {
+			if reader_send(rd.mailbox, input_marker_box(st.markers[mi])) { return }
 		}
 		for e in enh  { if reader_send(rd.mailbox, box(e, context.allocator)) { return } }
 	}

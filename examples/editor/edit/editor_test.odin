@@ -46,6 +46,12 @@ CTRL_RIGHT :: "\e[1;5C"
 KITTY_TAB    :: "\e[9u"      // Kitty: Tab
 KITTY_CTRL_I :: "\e[105;5u"  // Kitty: Ctrl+I -- a DIFFERENT key. Legacy: both 0x09.
 KITTY_REPLY  :: "\e[?1u"     // the terminal's answer to term_enter_raw's CSI ? u
+// T2-B. SGR mouse wheel notches: Cb 64 is up, 65 is down. The coordinates are
+// present because the encoding requires them and are irrelevant to a wheel
+// binding -- which is exactly why this editor binds the wheel and not
+// click-to-position (see ed.apply_mouse).
+WHEEL_UP     :: "\e[<64;1;1M"
+WHEEL_DOWN   :: "\e[<65;1;1M"
 
 // Runs one scripted session to completion and hands back the final model.
 // `b` is the caller's so the rendered bytes stay readable after this returns
@@ -396,4 +402,66 @@ test_golden_editor_session :: proc(t: ^testing.T) {
 
 	testing.expectf(t, string(got) == string(want),
 		"byte mismatch\n got: %q\nwant: %q", string(got), string(want))
+}
+
+// T2-B, end to end through rt.run(): a mouse wheel notch arrives as WIRE BYTES,
+// is decoded by rt's SGR mouse path, crosses the mailbox as a Mouse_Msg, and
+// scrolls the viewport. Same instrument as every other test in this file -- the
+// point is that nothing here synthesises a Mouse_Msg; the editor sees exactly
+// what a terminal sends.
+//
+// The document is DOC-shaped (18 lines) so there is somewhere to scroll to:
+// VIEWPORT is 10, so `top` can range over 0..8.
+@(test)
+test_mouse_wheel_scrolls_the_viewport :: proc(t: ^testing.T) {
+	doc := init(`l1
+l2
+l3
+l4
+l5
+l6
+l7
+l8
+l9
+l10
+l11
+l12
+l13
+l14
+l15`)
+
+	// Three notches down: 3 lines each, clamped at nlines - VIEWPORT == 5.
+	m := run_script(t, doc, WHEEL_DOWN)
+	testing.expectf(t, m.top == 3, "one notch down: top = %d, want 3", m.top)
+	testing.expectf(t, m.last == .Scroll_Down, "one notch down: last = %v, want scroll-down", m.last)
+
+	m = run_script(t, doc, WHEEL_DOWN + WHEEL_DOWN + WHEEL_DOWN)
+	testing.expectf(t, m.top == 5, "three notches down: top = %d, want 5 (clamped)", m.top)
+
+	// ...and back up, clamped at 0. Two notches down is 3 then 5 (the clamp),
+	// so one notch back up is 2 -- NOT 3: the clamp is not undone by scrolling
+	// the other way, which is the behaviour every scrollback in every terminal
+	// has and is worth pinning rather than assuming.
+	m = run_script(t, doc, WHEEL_DOWN + WHEEL_DOWN + WHEEL_UP)
+	testing.expectf(t, m.top == 2, "down twice then up once: top = %d, want 2", m.top)
+	testing.expectf(t, m.last == .Scroll_Up, "last = %v, want scroll-up", m.last)
+
+	m = run_script(t, doc, WHEEL_UP + WHEEL_UP)
+	testing.expectf(t, m.top == 0, "up from the top: top = %d, want 0 (clamped)", m.top)
+
+	// THE CARET FOLLOWS THE WINDOW, which is the opposite direction from every
+	// other action in this editor (follow_cursor moves the window to the caret;
+	// scrolling moves the caret to the window). Without it the caret would leave
+	// the viewport and cursor() would return the zero Cursor -- the caret would
+	// simply vanish, with nothing on screen saying why.
+	m = run_script(t, doc, WHEEL_DOWN)
+	testing.expectf(t, m.cy >= m.top && m.cy < m.top + VIEWPORT,
+		"after scrolling, the caret must stay visible: cy = %d, window %d..%d",
+		m.cy, m.top, m.top + VIEWPORT)
+	testing.expectf(t, m.cy == 3, "the caret should be pulled to the top of the window, got %d", m.cy)
+
+	// A wheel event never edits. The document must be byte-identical afterwards.
+	expect_line(t, m, 0, "l1", "wheel must not modify the text")
+	expect_line(t, m, 14, "l15", "wheel must not modify the text")
+	testing.expectf(t, m.nlines == 15, "wheel changed nlines to %d", m.nlines)
 }
