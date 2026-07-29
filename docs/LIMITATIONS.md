@@ -36,7 +36,7 @@ is a limitation documented for maintainers, not for users.
 ### 1.1 Linux only, in practice — **NOT-YET-BUILT** (Darwin/BSD) / **INTRINSIC** (Windows, for v1.0)
 
 `term_size` goes through `core:sys/linux` directly, because `core:sys/posix`
-exposes neither `ioctl` nor a `winsize` struct (`runetea/term.odin:676-686`).
+exposes neither `ioctl` nor a `winsize` struct (`runetea/term.odin, term_size`).
 Darwin and BSD are unvalidated and untested — the design doc's own words are
 *"Ship Linux as verified, Darwin/BSD as best-effort pending a contributor"*
 (`docs/superpowers/specs/2026-07-25-runetea-design.md:515`).
@@ -105,11 +105,11 @@ child that silently inherits it.
 POSIX signal masks are inherited by threads at creation. A minimal repro with
 one unrelated unblocked thread killed the process 5/5 times on an external
 `SIGINT`, *even though a correctly-blocked `sigwait` watcher existed*
-(`runetea/signals.odin:70-83`).
+(`runetea/signals.odin, signal_watcher_start`).
 
 **When it bites:** an application that starts its own worker pool before calling
 `run()`. `run()` gets the ordering right internally
-(`runetea/tea.odin:217-247`), so this only affects apps doing their own
+(`runetea/tea.odin, run`'s signal-watcher-before-dispatcher ordering), so this only affects apps doing their own
 threading.
 
 ---
@@ -184,7 +184,7 @@ unfixable cases: `net.dial_tcp_*` (`core:net` has no timeout), a child-process
 
 ### 2.6 `run()` bounds quit at 100 ms; `run_nbio()` does not — **NOT-YET-BUILT**
 
-`QUIT_GRACE = 100ms` applies to `run()` only (`runetea/tea.odin:281-282`).
+`QUIT_GRACE = 100ms` applies to `run()` only (`runetea/tea.odin, run`'s `QUIT_GRACE`).
 `run_nbio` keeps a fully synchronous teardown and blocks on the slowest Cmd
 (`docs/superpowers/cancellation-decision.md:557-560`).
 
@@ -288,8 +288,8 @@ wrong for anything counting ticks.
 
 ### 2.17 Mailbox capacity is hard-coded at 256 — **NOT-YET-BUILT**
 
-`runetea/tea.odin:212`, `runetea/loop_nbio.odin:52`. A paste over ~1000
-characters fills it and the reader spins (`runetea/tea.odin:453-462`).
+`runetea/tea.odin, run`'s `mailbox_init(&rc.mbox, 256)`, `runetea/loop_nbio.odin:52`. A paste over ~1000
+characters fills it and the reader spins (`runetea/tea.odin, reader_send`).
 
 ### 2.18 The mailbox is single-consumer, and `try_recv`'s `ok=false` is ambiguous — **INTRINSIC**
 
@@ -793,7 +793,7 @@ restores the terminal.
 
 ### 6.8 `Panicked_Error.message` is caller-owned and leaks if you ignore it — **API hazard**
 
-`runetea/tea.odin:16-24`. `delete()` it.
+`runetea/tea.odin, Panicked_Error`. `delete()` it.
 
 ### 6.9 `run()` does not own the terminal — **INTRINSIC**, deliberate
 

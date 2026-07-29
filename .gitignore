@@ -16,6 +16,7 @@
 /runetea/runetea
 /examples/*/simple
 /examples/*/http
+/examples/*/quickstart
 /tools/*/rawcheck
 /tools/*/crashcheck
 /tools/*/msgcheck
@@ -23,3 +24,4 @@
 /tools/*/ttycheck
 /tools/*/wincheck
 /tools/*/golden
+/tools/*/ptyrun

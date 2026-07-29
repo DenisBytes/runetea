@@ -7,7 +7,8 @@
 # default. Prepending a shim that resolves `clang` to clang-18 fixes it with no
 # system changes and no sudo.
 #
-#   ./tools/test.sh          plain test run
+#   ./tools/test.sh          plain test run, plus the leak audit and the
+#                            documentation gate (tools/doccheck/run.sh)
 #   ./tools/test.sh tsan     + thread sanitizer, but see the WARNING below --
 #                              it does NOT detect races on this toolchain
 #   ./tools/test.sh race     the real race gate -- USE THIS for concurrent code
@@ -153,6 +154,35 @@ plain)
 	echo "=== runegloss ==="
 	cd "$ROOT/runegloss"
 	run_with_leak_audit "$ODIN" test . -define:ODIN_TEST_THREADS=1
+
+	# --- documentation gate --------------------------------------------------
+	#
+	# Every Odin code block in README.md and docs/API.md is extracted and
+	# COMPILED, every `main` package under examples/ and tools/ is built, and
+	# examples/quickstart -- the program README.md quotes verbatim -- is run
+	# under a real pty and asserted on. See tools/doccheck/run.sh.
+	#
+	# ON THE GATE, unlike tools/difftest/run.sh, and the difference is the
+	# dependency. difftest needs python3 plus a third-party module (pyte), and
+	# the day that module is missing a shelled-out checker degrades into a skip
+	# -- and a skip inside a green run is indistinguishable from a pass. This
+	# needs awk and the Odin compiler, both of which `odin test` already
+	# required a line ago, so there is no configuration in which it can quietly
+	# not run. It also fails loudly on a block it does not understand rather
+	# than ignoring it, for the same reason the leak audit above fails on an
+	# unallowlisted site.
+	#
+	# WHY IT IS A TEST AND NOT A README CHORE: the samples in those documents
+	# are the first RuneTea code anybody reads, and a sample that no longer
+	# compiles fails on the reader's first five minutes -- when they cannot yet
+	# tell "the doc is stale" from "I typed it wrong" from "this library does
+	# not work". Renaming a public proc must break the docs the same way it
+	# breaks the tests, in the same run, or the docs are only correct until the
+	# next commit.
+	echo
+	echo "=== documentation ==="
+	cd "$ROOT"
+	./tools/doccheck/run.sh
 	;;
 tsan)
 	# WARNING (verified 2026-07-26): `odin test -sanitize:thread` does NOT

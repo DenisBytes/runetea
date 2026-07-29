@@ -26,6 +26,15 @@ import "core:time"
 
 Quit_Msg :: struct {}
 
+// DECLARED BUT NEVER PRODUCED, as of v1.0 -- nothing in this package
+// constructs one, so a `case Killed_Error` in a caller's switch is currently
+// dead code. Recorded here rather than deleted because Bubble Tea's
+// ErrProgramKilled is the shape a future Program.kill()/hard-abort would
+// return, and a variant that quietly appears in a union later is a worse
+// surprise than one that is documented as unreachable now. Anything a running
+// session can actually end with is Interrupted_Error, Panicked_Error or
+// Terminal_Error below (or nil). Stated in docs/API.md §9 too, so a caller
+// does not have to grep for constructions to find out.
 Killed_Error      :: struct {}
 Interrupted_Error :: struct {}
 
