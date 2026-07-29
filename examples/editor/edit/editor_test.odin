@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:os"
 import "core:strings"
 import "core:testing"
+import rg "../../../runegloss"
 import rt "../../../runetea"
 
 // The editor's tests, driven through the REAL rt.run() event loop with
@@ -55,6 +56,23 @@ KITTY_REPLY  :: "\e[?1u"     // the terminal's answer to term_enter_raw's CSI ? 
 WHEEL_UP     :: "\e[<64;1;1M"
 WHEEL_DOWN   :: "\e[<65;1;1M"
 
+// THE COLOUR PROFILE EVERY TEST IN THIS FILE FORCES, and the reason it is a
+// constant here rather than whatever the machine happens to have.
+//
+// rg.new_style() reads $NO_COLOR/$TERM/$COLORTERM. A view built on it renders
+// truecolour SGR under `COLORTERM=truecolor`, 256-colour SGR under
+// `TERM=xterm-256color`, and NO ESCAPES AT ALL under `TERM=dumb` or in a CI job
+// that sets NO_COLOR -- three different byte streams for one model, which would
+// make testdata/editor_session.golden a record of the author's terminal rather
+// than a test. package edit never calls new_style() for exactly this reason (see
+// its `palette`), and this is the value the tests pin.
+//
+// .True_Color specifically: it is the profile that emits the MOST bytes and the
+// most distinguishable ones ("\e[38;2;125;86;244m" -- the accent is legible in
+// the golden by eye), so a down-conversion bug shows up here as a diff rather
+// than as two colours that happen to quantise to the same palette index.
+TEST_PROFILE :: rg.Profile.True_Color
+
 // Runs one scripted session to completion and hands back the final model.
 // `b` is the caller's so the rendered bytes stay readable after this returns
 // (the golden test needs them; the behavioural tests ignore them).
@@ -64,6 +82,15 @@ drive :: proc(t: ^testing.T, start: Model, script: string, b: ^strings.Builder) 
 	src := rt.input_source_from_bytes(transmute([]u8)full)
 	defer rt.input_close(&src)
 
+	start := start
+	// T3-B, and the same rule as p.cursor and p.render_mode below: main.odin
+	// passes rg.default_profile() into ed.init, so a test that left this at the
+	// zero value (.None -- no colour escapes at all) would be driving an
+	// UNSTYLED program while the shipping binary is styled, and the golden would
+	// pin bytes nothing ever emits. Forced rather than detected -- see
+	// TEST_PROFILE.
+	start.profile = TEST_PROFILE
+
 	p: rt.Program(Model)
 	rt.program_init(&p, start, update, view)
 	// Exactly what main.odin does, and it has to be here too: without it these
@@ -72,19 +99,34 @@ drive :: proc(t: ^testing.T, start: Model, script: string, b: ^strings.Builder) 
 	// (which runs inside rt's guarded view call, on every frame) would never be
 	// exercised at all.
 	p.cursor = cursor
-	// T2-C, and here for exactly the same reason p.cursor is: main.odin ships
-	// this program in FULL-SCREEN mode, so a test that drove it inline would be
-	// testing a different program -- the golden would hold rewind bytes the real
-	// editor never emits, and the full-screen path (which is what makes
-	// click_target's coordinates mean anything) would never run here at all.
+	// T2-C/T3-A, and here for exactly the same reason p.cursor is: main.odin
+	// ships this program in .Diff mode, so a test that drove it inline -- or
+	// full-screen -- would be testing a different program.
+	//
+	// AND HERE IS THE HONEST LIMIT OF DOING THAT, because it would otherwise be
+	// invisible: THESE TESTS HAVE NO TTY. run() is called with flush_fd = -1, so
+	// rt.term_size is never consulted and the Renderer's width and height stay 0
+	// == unknown. .Diff models a viewport and refuses to guess at one, so with an
+	// unknown size EVERY frame below degrades to .Full_Screen's exact byte stream
+	// (render.odin's render_diff). The line above is therefore necessary but not
+	// sufficient: it makes the CONFIGURATION match the shipping binary, and the
+	// golden is genuinely the styled full-screen frame the editor falls back to
+	// on a terminal whose size it cannot learn -- but the cell-diff emitter
+	// itself does not run here.
+	//
+	// What covers that gap is test_diff_mode_* below, which drives a SIZED
+	// rt.Renderer over this editor's real view() and cursor() output directly.
+	// Injecting a size into run() was tried first and rejected: the only channel
+	// is a Window_Size_Msg, which can only reach the loop from a SIGWINCH or from
+	// a Cmd running on a pool thread, and a Cmd racing the reader thread's
+	// scripted keys would make the golden non-deterministic.
 	//
 	// The alternate screen is NOT entered here, and that is not an omission: it
-	// is term_enter_raw's job, and these tests deliberately never enter raw mode
-	// (they drive run() over a byte slice, with flush_fd = -1 and no tty in
-	// sight). The two opt-ins are independent by design -- see rt.term_enter_raw
-	// -- so a full-screen renderer with no alt screen is a legal configuration
-	// and exactly the one a test harness wants.
-	p.render_mode = .Full_Screen
+	// is term_enter_raw's job, and these tests deliberately never enter raw mode.
+	// The two opt-ins are independent by design -- see rt.term_enter_raw -- so a
+	// diff renderer with no alt screen is a legal configuration and exactly the
+	// one a test harness wants.
+	p.render_mode = .Diff
 	err := rt.run(&p, &src, b)
 	testing.expectf(t, err == nil, "run should exit cleanly, got %v", err)
 	return p.model
@@ -94,6 +136,51 @@ drive :: proc(t: ^testing.T, start: Model, script: string, b: ^strings.Builder) 
 run_script :: proc(t: ^testing.T, start: Model, script: string) -> Model {
 	b := strings.builder_make(); defer strings.builder_destroy(&b)
 	return drive(t, start, script, &b)
+}
+
+// A frame with every escape sequence removed, so an assertion about what the
+// user SEES does not have to know where the styling happens to start and stop.
+//
+// THIS IS NOT COSMETIC. Before T3-B a text row was the single string " 11 line";
+// it is now "\e[38;5;244m 11 \e[0mline", and `strings.contains(frame, " 11 line")`
+// went from true to false without anything about what is on screen changing.
+// Rewriting those assertions to spell the escapes inline would pin the STYLE in a
+// test about SCROLLING -- so the style lives in the golden (which pins bytes on
+// purpose) and the behavioural assertions read the plain text.
+//
+// The scanner is this file's own (rt's is @(private="package")) and that turns
+// out to be the better arrangement anyway: test_the_view_satisfies_the_diff_
+// renderers_contract below uses the SAME walk to decide whether an escape is an
+// SGR, so the check on what the view is allowed to emit is independent of the
+// implementation whose output it is checking.
+//
+// Returns the index one past the CSI beginning at s[i], and whether that CSI was
+// a well-formed SGR ("\e[" params ";" ... "m"). A non-CSI escape, or a CSI that
+// ends in anything but 'm', is reported not-SGR -- which is a contract violation
+// for a .Diff view, not merely a curiosity.
+@(private = "file")
+scan_csi :: proc(s: string, i: int) -> (next: int, sgr: bool) {
+	if i + 1 >= len(s) || s[i] != 0x1B { return min(i + 1, len(s)), false }
+	if s[i + 1] != '[' { return i + 2, false }   // ESC + something else: not a CSI at all
+	k := i + 2
+	for k < len(s) && ((s[k] >= '0' && s[k] <= '?') || (s[k] >= ' ' && s[k] <= '/')) { k += 1 }
+	if k >= len(s) { return len(s), false }      // truncated
+	return k + 1, s[k] == 'm'
+}
+
+@(private = "file")
+plain :: proc(s: string, alloc := context.temp_allocator) -> string {
+	sb := strings.builder_make(alloc)
+	i := 0
+	for i < len(s) {
+		if s[i] == 0x1B {
+			i, _ = scan_csi(s, i)   // always > i, so this loop always advances
+			continue
+		}
+		strings.write_byte(&sb, s[i])
+		i += 1
+	}
+	return strings.to_string(sb)
 }
 
 @(private = "file")
@@ -250,9 +337,14 @@ test_page_down_scrolls_by_a_viewport :: proc(t: ^testing.T) {
 	// The window is what the view actually paints: after one Page_Down the
 	// last frame must contain line 11 and must NOT contain line 1.
 	b := strings.builder_make(); defer strings.builder_destroy(&b)
+	defer free_all(context.temp_allocator)
 	drive(t, doc, PAGE_DOWN, &b)
 	out := strings.to_string(b)
-	last := out[strings.last_index(out, "RuneTea editor"):]
+	// T3-B: `plain`, because the gutter is styled now and " 11 line" is no longer
+	// contiguous in the bytes -- see plain's own comment for why that is the right
+	// fix here and the golden is the right place to pin the escapes.
+	full := plain(out)
+	last := full[strings.last_index(full, "RuneTea editor"):]
 	// Every text row is now the plain form: the caret is the terminal's REAL
 	// cursor (see cursor()), not a glyph inserted into the text, so line 11 --
 	// the cursor's own line after one Page_Down -- reads exactly like every
@@ -711,4 +803,284 @@ charlie`)
 	cy, cx, ok := click_target(m, GUTTER_COLS + 1, origin + 2, context.temp_allocator)
 	testing.expect(t, ok, "a click on a text row must resolve")
 	testing.expectf(t, cy == 2 && cx == 1, "post-resize click: (%d,%d), want (2,1)", cy, cx)
+}
+
+// ---------------------------------------------------------------------------
+// T3-B: RuneGloss styling, and T3-A's .Diff renderer -- the two things
+// main.odin now ships that nothing used to exercise.
+//
+// Everything above this line drives run() with flush_fd = -1, which means no
+// tty, which means the Renderer's width and height are 0 == unknown, which means
+// .Diff degrades to .Full_Screen's exact bytes (see drive's own comment). These
+// tests close that gap by driving a SIZED rt.Renderer over this editor's real
+// view() and cursor() output -- the same technique tools/difftest/main.odin uses
+// for its measurements, and the only one available without a tty.
+// ---------------------------------------------------------------------------
+
+// A realistic window. 100 columns is narrower than HELP_LINE, so the header
+// really does wrap and the frame really does exercise the multi-row path.
+DIFF_COLS :: 100
+DIFF_ROWS :: 30
+
+// Renders one frame through both renderers and returns what each wrote. Nested
+// procs cannot capture in Odin, so everything is a parameter -- which is also
+// what makes the two renderers provably fed the SAME view string, rather than two
+// separately-built ones that could drift.
+@(private = "file")
+paint_both :: proc(m: Model, r_ref, r_dif: ^rt.Renderer, rb, db: ^strings.Builder) -> (ref, dif: int) {
+	strings.builder_reset(rb)
+	strings.builder_reset(db)
+	// context.temp_allocator stands in for rt's frame arena: view() and cursor()
+	// allocate from whatever they are handed (including everything rg.render
+	// allocates), and the caller free_all's it. Using context.allocator would leak
+	// and tools/test.sh's leak audit would fail the run -- which is precisely the
+	// property this test is here to keep true now that a styling layer allocates
+	// inside view().
+	v := view(m, context.temp_allocator)
+	c := cursor(m, context.temp_allocator)
+	rt.renderer_render(r_ref, v, c)
+	rt.renderer_render(r_dif, v, c)
+	return len(strings.to_string(rb^)), len(strings.to_string(db^))
+}
+
+// THE WHOLE REASON THE EDITOR MOVED TO .Diff: an idle frame is free, and a
+// keystroke costs a fraction of a repaint.
+@(test)
+test_diff_mode_costs_zero_for_an_idle_frame_and_a_fraction_for_a_keystroke :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+
+	m := init("The quick brown fox jumps over the lazy dog.\nSecond line of text.\nThird line.", TEST_PROFILE)
+	m.term_w, m.term_h = DIFF_COLS, DIFF_ROWS
+
+	rb := strings.builder_make(); defer strings.builder_destroy(&rb)
+	db := strings.builder_make(); defer strings.builder_destroy(&db)
+	r_ref: rt.Renderer
+	rt.renderer_init(&r_ref, &rb, DIFF_COLS, DIFF_ROWS, .Full_Screen)
+	defer rt.renderer_destroy(&r_ref)
+	r_dif: rt.Renderer
+	rt.renderer_init(&r_dif, &db, DIFF_COLS, DIFF_ROWS, .Diff)
+	defer rt.renderer_destroy(&r_dif)
+
+	// Frame 1 is a full paint in BOTH modes by definition -- there is nothing on
+	// screen yet to diff against.
+	first_ref, first_dif := paint_both(m, &r_ref, &r_dif, &rb, &db)
+	testing.expectf(t, first_ref > 500, "the initial repaint should be a real frame, got %d B", first_ref)
+	testing.expectf(t, first_dif > 500, "the initial diff frame is a full paint too, got %d B", first_dif)
+
+	// AN IDENTICAL CONSECUTIVE FRAME COSTS ZERO BYTES, and an editor spends most
+	// of its life exactly here -- rt repaints on every message, including ones
+	// that change nothing on screen.
+	for i in 0 ..< 10 {
+		ref, dif := paint_both(m, &r_ref, &r_dif, &rb, &db)
+		testing.expectf(t, dif == 0, "idle frame %d: the diff wrote %d bytes, want 0", i, dif)
+		testing.expectf(t, ref > 500, "idle frame %d: the repaint still wrote %d bytes", i, ref)
+	}
+
+	// ONE KEYSTROKE. Three regions of the frame change -- the inserted character,
+	// the caret's own gutter is already accented, and the Ln/Col + last: fields of
+	// the status bar -- and nothing else does. The bound is deliberately loose
+	// (a quarter of a repaint); the measured figure is ~15%, and pinning the exact
+	// number here would make every future layout tweak a test failure.
+	apply_key(&m, rt.Key_Msg{code = .Rune, r = 'X'})
+	ref, dif := paint_both(m, &r_ref, &r_dif, &rb, &db)
+	testing.expectf(t, dif > 0, "a keystroke must actually repaint something, got %d B", dif)
+	testing.expectf(t, dif * 4 < ref,
+		"a keystroke: diff %d B against repaint %d B -- the diff should be a small fraction", dif, ref)
+
+	// AND MOVING THE CARET REPAINTS THE TWO GUTTERS. The accented gutter follows
+	// m.cy, so Down is the cheapest possible non-trivial frame: two four-cell runs
+	// plus the status bar.
+	apply_key(&m, rt.Key_Msg{code = .Down})
+	_, down := paint_both(m, &r_ref, &r_dif, &rb, &db)
+	testing.expectf(t, down > 0, "moving the caret must repaint the gutters, got %d B", down)
+	testing.expectf(t, down < ref, "a caret move (%d B) should cost less than a full repaint (%d B)", down, ref)
+}
+
+// A resize is the one thing that invalidates .Diff's cell model, and it must
+// resettle: the frame after a resize is a full paint, and the frame after THAT is
+// free again. Worth pinning here rather than trusting, because this editor keeps
+// its OWN copy of the width too (m.term_w, for click_target) and a mismatch
+// between the two would show up as a frame that never stops repainting.
+@(test)
+test_diff_mode_resettles_after_a_resize :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+
+	m := init("alpha\nbravo\ncharlie", TEST_PROFILE)
+	m.term_w, m.term_h = DIFF_COLS, DIFF_ROWS
+
+	rb := strings.builder_make(); defer strings.builder_destroy(&rb)
+	db := strings.builder_make(); defer strings.builder_destroy(&db)
+	r_ref: rt.Renderer
+	rt.renderer_init(&r_ref, &rb, DIFF_COLS, DIFF_ROWS, .Full_Screen)
+	defer rt.renderer_destroy(&r_ref)
+	r_dif: rt.Renderer
+	rt.renderer_init(&r_dif, &db, DIFF_COLS, DIFF_ROWS, .Diff)
+	defer rt.renderer_destroy(&r_dif)
+
+	paint_both(m, &r_ref, &r_dif, &rb, &db)
+	_, idle := paint_both(m, &r_ref, &r_dif, &rb, &db)
+	testing.expectf(t, idle == 0, "before the resize an idle frame should be free, got %d B", idle)
+
+	// The renderer's size and the app's own copy move together, exactly as
+	// rt.apply and update() move them on one Window_Size_Msg.
+	rt.renderer_set_width(&r_dif, 60)
+	rt.renderer_set_height(&r_dif, 20)
+	rt.renderer_set_width(&r_ref, 60)
+	rt.renderer_set_height(&r_ref, 20)
+	update(&m, rt.Window_Size_Msg{w = 60, h = 20}, context.temp_allocator)
+
+	_, after := paint_both(m, &r_ref, &r_dif, &rb, &db)
+	testing.expectf(t, after > 0, "the frame after a resize must be a full repaint, got %d B", after)
+
+	_, settled := paint_both(m, &r_ref, &r_dif, &rb, &db)
+	testing.expectf(t, settled == 0, "the frame after that should be free again, got %d B", settled)
+}
+
+// .Diff'S CONTRACT, ASSERTED RATHER THAN ASSUMED: "SGR escapes, printable text
+// and \n only" (render.odin's KNOWN LIMITS). The diff renderer models SGR per
+// cell and treats every other escape as invisible, so a view that emitted a
+// cursor move, an OSC, or a bare tab would be lying to the cell model -- and the
+// failure would be a corrupted screen on somebody's terminal, not a test failure,
+// because .Full_Screen tolerates all three.
+//
+// This editor has three places it could go wrong and all three are covered by the
+// fixtures below: RuneGloss's own output (which promises SGR only), the document
+// text (a pasted 0x09 or 0x1B must never reach the view), and the status line.
+@(test)
+test_the_view_emits_only_sgr_printable_text_and_newlines :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+
+	// A paste carrying a tab, an ESC and a carriage return -- the three bytes that
+	// would break the cell model -- driven through the real decoder.
+	pasted := run_script(t, init(""), "\e[200~a\tb\e[Ac\rd\e[201~")
+
+	scrolled := run_script(t, long_doc(), PAGE_DOWN)
+
+	helped := init("日本語 wide runes and an emoji: \U0001F600", TEST_PROFILE)
+	helped.help = true
+	helped.kitty = true
+	helped.term_w, helped.term_h = DIFF_COLS, DIFF_ROWS
+
+	Case :: struct { m: Model, what: string }
+	for c in ([?]Case{
+		{init(""),                                    "an empty document"},
+		{init("alpha\nbravo", TEST_PROFILE),          "a plain document"},
+		{pasted,                                      "a document built from a paste containing 0x09/0x1B/0x0D"},
+		{scrolled,                                    "a scrolled viewport"},
+		{helped,                                      "the help panel, wide runes and a known width"},
+	}) {
+		v := view(c.m, context.temp_allocator)
+		i := 0
+		for i < len(v) {
+			b := v[i]
+			if b == 0x1B {
+				next, sgr := scan_csi(v, i)
+				testing.expectf(t, sgr,
+					"%s: the view emitted a non-SGR escape at byte %d (%q) -- .Diff models SGR only",
+					c.what, i, v[i:min(next, len(v))])
+				i = next
+				continue
+			}
+			// C0 controls, tab and carriage return included. "\n" is the ONE
+			// exception: it is the view's own line separator.
+			testing.expectf(t, b >= 0x20 || b == '\n',
+				"%s: the view emitted the control byte 0x%02X at %d -- .Diff models printable cells and \\n only",
+				c.what, b, i)
+			i += 1
+		}
+	}
+}
+
+// THE COLOUR PROFILE IS THE ONLY THING THAT VARIES BETWEEN MACHINES, and it is
+// threaded through the Model rather than read from the environment -- so a frame
+// is a pure function of the Model, which is what makes the golden a test.
+//
+// Also pins the property every layout proc in this file silently depends on: the
+// profile changes the BYTES and never the CELLS. cursor()'s column and
+// click_target's row mapping both go through rt.display_width, which measures SGR
+// as zero width; if that stopped being true, a coloured build would put the caret
+// somewhere a monochrome build did not.
+@(test)
+test_styled_output_is_a_pure_function_of_the_profile :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+
+	base := init("alpha\nbravo\ncharlie")
+	base.term_w, base.term_h = DIFF_COLS, DIFF_ROWS
+	base.cy = 1
+	base.help = true
+
+	frame :: proc(m: Model, p: rg.Profile) -> string {
+		m := m
+		m.profile = p
+		return view(m, context.temp_allocator)
+	}
+
+	none  := frame(base, .None)
+	ansi  := frame(base, .ANSI)
+	c256  := frame(base, .ANSI256)
+	truec := frame(base, .True_Color)
+
+	// SAME MODEL, SAME PROFILE, SAME BYTES -- twice, with allocations in between.
+	testing.expect(t, frame(base, .True_Color) == truec, "view must be deterministic for one profile")
+
+	// .None EMITS NO COLOUR -- and, deliberately, still emits ATTRIBUTES.
+	//
+	// This assertion was written the obvious way first ("under .None the view
+	// contains no escape at all") and it FAILED, correctly: runegloss/render.odin's
+	// build_sgr degrades the two Colors through convert() and passes the Attrs
+	// straight through, on the stated grounds that $NO_COLOR and TERM=dumb are
+	// about colour and that stripping bold/faint would leave a monochrome terminal
+	// with no emphasis at all. So the honest assertion is the one below: every
+	// escape this view emits under .None is an attribute or a reset, and not one
+	// of them names a colour.
+	testing.expect(t, len(none) > 0, "the .None view must still be a frame")
+	{
+		i, seen := 0, 0
+		for i < len(none) {
+			if none[i] != 0x1B { i += 1; continue }
+			next, sgr := scan_csi(none, i)
+			esc := none[i:next]
+			testing.expectf(t, sgr && (esc == "\e[0m" || esc == "\e[1m" || esc == "\e[2m"),
+				"under .None the view emitted %q at byte %d -- only attributes and resets are allowed", esc, i)
+			seen += 1
+			i = next
+		}
+		// Non-vacuity for the loop itself: .None must not accidentally emit nothing
+		// at all, or the check above would pass on an empty set.
+		testing.expectf(t, seen > 0, "the .None view emitted no SGR at all -- bold/faint should survive")
+	}
+
+	// ...and every richer profile does emit escapes, in its own encoding. Pinned
+	// per-profile so a down-conversion that silently fell back to 16 colours
+	// everywhere would be a failure rather than a shrug.
+	testing.expect(t, strings.contains(truec, "\e[38;2;125;86;244m") ||
+	                  strings.contains(truec, "\e[1;38;2;125;86;244m"),
+		"under .True_Color the accent must be emitted as 24-bit RGB")
+	testing.expect(t, strings.contains(c256, "38;5;"), "under .ANSI256 the accent must be a palette index")
+	testing.expect(t, !strings.contains(c256, "38;2;"), "under .ANSI256 nothing may be 24-bit")
+	testing.expect(t, !strings.contains(ansi, "38;5;") && !strings.contains(ansi, "38;2;"),
+		"under .ANSI everything must be one of the 16 SGR colours")
+
+	// THE CELLS ARE IDENTICAL ACROSS ALL FOUR. Same plain text, same display width
+	// per line, whatever the profile.
+	for got, i in ([?]string{none, ansi, c256, truec}) {
+		testing.expectf(t, plain(got) == plain(none),
+			"profile %d changed the visible text, not just the escapes", i)
+		testing.expectf(t, rt.display_width(got) == rt.display_width(none),
+			"profile %d changed the display width: %d vs %d", i, rt.display_width(got), rt.display_width(none))
+	}
+
+	// And the two layout procs agree with that, end to end: the same click on the
+	// same document resolves to the same caret whether the build is coloured or
+	// not.
+	for p in ([?]rg.Profile{.None, .ANSI, .ANSI256, .True_Color}) {
+		m := base
+		m.profile = p
+		origin := rt.rows_for_line(HELP_LINE, DIFF_COLS) + rt.rows_for_line(RULE, DIFF_COLS)
+		cy, cx, ok := click_target(m, GUTTER_COLS + 3, origin + 2, context.temp_allocator)
+		testing.expectf(t, ok && cy == 2 && cx == 3,
+			"profile %v moved where a click lands: (%d,%d) ok=%v, want (2,3) ok=true", p, cy, cx, ok)
+		testing.expectf(t, cursor(m, context.temp_allocator).col == GUTTER_COLS,
+			"profile %v moved the caret's display column", p)
+	}
 }

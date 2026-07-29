@@ -565,8 +565,10 @@ test_diff_style_run_that_grows :: proc(t: ^testing.T) {
 	h := harness_make(20, 2); defer harness_free(h)
 	frame(h, "\e[31mab\e[0mcdef")
 	got := frame(h, "\e[31mabc\e[0mdef")
-	// Only "c" changed -- from default to red. The style must travel with it.
-	testing.expect_value(t, got, "\e[1;3H\e[31mc\e[2;1H")
+	// Only "c" changed -- from default to red. The style must travel with it,
+	// and the frame closes it: see render_diff's frame-closing reset for why a
+	// frame may never end with the terminal still styled.
+	testing.expect_value(t, got, "\e[1;3H\e[31mc\e[0m\e[2;1H")
 }
 
 @(test)
@@ -586,8 +588,9 @@ test_diff_style_run_that_moves :: proc(t: ^testing.T) {
 	frame(h, "\e[31mab\e[0mcdef")
 	got := frame(h, "ab\e[31mcd\e[0mef")
 	// "ab" loses red, "cd" gains it. Two style transitions, and the second one
-	// goes through \e[0m first because the emitter is mid-style.
-	testing.expect_value(t, got, "\e[1;1Hab\e[31mcd\e[2;1H")
+	// goes through \e[0m first because the emitter is mid-style. The trailing
+	// \e[0m is the frame-closing reset, not a third transition.
+	testing.expect_value(t, got, "\e[1;1Hab\e[31mcd\e[0m\e[2;1H")
 }
 
 @(test)
@@ -595,11 +598,18 @@ test_diff_style_is_not_re_emitted_between_cells_that_share_it :: proc(t: ^testin
 	h := harness_make(20, 2); defer harness_free(h)
 	frame(h, "\e[31maaaa\e[0m")
 	got := frame(h, "\e[31mbbbb\e[0m")
-	// No \e[31m: the emitter's SGR state PERSISTS ACROSS FRAMES (the previous
-	// frame's last write left it red), so the style is already established.
-	// Tracking it per-Renderer rather than resetting each frame is what makes
-	// that saving available at all.
-	testing.expect_value(t, got, "\e[1;1Hbbbb\e[2;1H")
+	// ONE \e[31m for all four cells: within a frame, cells that share a style
+	// do not re-emit it. That is what this test is about, and it still holds.
+	//
+	// What changed: the emitter's SGR state no longer persists ACROSS frames.
+	// It used to, and this expectation used to have no \e[31m at all because
+	// the previous frame left the terminal red. render_diff now closes every
+	// frame with a reset -- a frame whose last cell is styled would otherwise
+	// leave the terminal (and the user's shell after exit) in that style -- so
+	// the first styled cell of each frame re-establishes it. That costs these
+	// few bytes on frames which already change cells, and buys back nothing on
+	// idle frames, which still cost exactly 0.
+	testing.expect_value(t, got, "\e[1;1H\e[31mbbbb\e[0m\e[2;1H")
 }
 
 @(test)
@@ -618,8 +628,10 @@ test_diff_el_is_not_used_to_clear_a_styled_tail :: proc(t: ^testing.T) {
 	// Row 0's ten-cell tail AND all of row 1 (the repaint's trailing \e[J also
 	// runs with red active) become RED blanks, written as real spaces. Not one
 	// \e[K anywhere in the frame.
+	// The trailing \e[0m is the frame-closing reset: this frame ends with red
+	// still active, and leaving it set would tint whatever is written next.
 	testing.expect_value(t, got,
-		"\e[1;1H\e[41mab" + "          " + "\e[2;1H" + "            " + "\r")
+		"\e[1;1H\e[41mab" + "          " + "\e[2;1H" + "            " + "\e[0m" + "\r")
 	testing.expect(t, !strings.contains(got, "\e[K"), "a styled tail must not be cleared with EL")
 }
 

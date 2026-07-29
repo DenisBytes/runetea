@@ -765,6 +765,28 @@ render_diff :: proc(r: ^Renderer, lines: []string, cur: Cursor, allow_retry := t
 
 	for y in 0 ..< cur_s.rows { emit_row(r, y, prev, cur_s) }
 
+	// CLOSE THE FRAME'S STYLE. Without this, a frame whose last written cell
+	// sits inside a styled run (a full-width status bar is the ordinary case)
+	// ends with the terminal still in that style, and everything the
+	// application writes afterwards -- or the user's shell after exit --
+	// inherits it. .Full_Screen never had this problem, but only because
+	// RuneGloss closes every row it emits; a hand-written view owes nothing,
+	// and this mode must not depend on its input being well-mannered.
+	//
+	// Clearing emit_style as well as writing the reset is what keeps the
+	// 0-byte contract intact, and the two must move together. The alternative
+	// -- write the reset but leave emit_style set -- would make the NEXT
+	// identical frame emit a second reset for a style the terminal no longer
+	// has, so an idle screen would cost 4 bytes a frame forever instead of 0.
+	// Clearing it costs the cross-frame carry-over instead: the first styled
+	// cell of the next frame re-emits its SGR. That only touches frames which
+	// already change cells, and correctness of the terminal's exit state is
+	// worth more than those few bytes.
+	if r.emit_style != 0 {
+		strings.write_string(r.out, SGR_RESET)
+		r.emit_style = 0
+	}
+
 	when DIFF_FAULT != "no_cursor" {
 		// UNCONDITIONAL, and cheap: diff_move writes nothing when the cursor is
 		// already there, which on an identical frame it always is. This is the

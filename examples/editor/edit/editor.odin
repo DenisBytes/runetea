@@ -13,6 +13,7 @@ import "core:fmt"
 import "core:mem"
 import "core:strings"
 import "core:unicode/utf8"
+import rg "../../../runegloss"
 import rt "../../../runetea"
 
 // Fixed capacities, no [dynamic] anywhere in Model, and that is still
@@ -142,14 +143,111 @@ Model :: struct {
 	// is kept so a resize is visible in the UI rather than silently absorbed.
 	term_w:  int,
 	term_h:  int,
+	// T3-B. WHICH COLOURS THIS TERMINAL CAN SHOW -- one byte, and the only
+	// styling state this Model carries.
+	//
+	// The alternative was to store the six built rg.Styles themselves. A
+	// rg.Style IS storable in a model (it is POD by construction -- see
+	// runegloss/style.odin, and examples/spinner does exactly that), but not in
+	// THIS model: Model is already ~258 KiB and deliberately sized to stay under
+	// the 262144-byte stack-local warning threshold documented on MAX_LINES, and
+	// six Styles is ~1 KiB of that budget spent to avoid rebuilding six structs
+	// that cost no allocation to build. So the ENVIRONMENT-DEPENDENT half lives
+	// here and `palette` below derives the rest per frame.
+	//
+	// ZERO VALUE IS .None -- no colour escapes at all -- so a Model that nobody
+	// told about the terminal renders exactly the bytes this example rendered
+	// before RuneGloss existed. main.odin passes rg.default_profile(); the tests
+	// force one (see editor_test's TEST_PROFILE) so the golden cannot depend on
+	// whatever $TERM the machine running it happens to have.
+	profile: rg.Profile,
+}
+
+// ---------------------------------------------------------------------------
+// styling
+// ---------------------------------------------------------------------------
+
+// The editor's six styles, derived from the one thing that varies between
+// terminals. Built fresh per frame and that is deliberate: rg.Style construction
+// is pure struct assignment with no allocation, and a palette that is a FUNCTION
+// of (profile, width) cannot drift out of date the way a cached copy would after
+// a resize.
+//
+// EVERY STYLE IS BUILT WITH new_style_profile, NEVER new_style. new_style() reads
+// the process-wide detected profile, which is a function of $TERM/$COLORTERM --
+// so a view built on it renders different bytes on different machines, and the
+// golden in testdata/ would be untestable. Threading the profile through from the
+// model is what makes this view a pure function of the model.
+Palette :: struct {
+	header:     rg.Style,   // the key-help line at the top
+	rule:       rg.Style,   // the two horizontal rules, and the "~" filler rows
+	gutter:     rg.Style,   // line numbers
+	gutter_cur: rg.Style,   // ...on the line the caret is on
+	status:     rg.Style,   // the bottom bar
+	help:       rg.Style,   // the Ctrl+I panel
+}
+
+// #7D56F4 is Lipgloss's own signature purple, kept here on purpose: this file is
+// the thing people will copy, and a shared accent between the header, the caret's
+// gutter and the status bar is what makes three separately-styled regions read as
+// one interface.
+ACCENT :: "#7D56F4"
+
+// ANSI 244, a mid grey. A PALETTE INDEX rather than a hex literal because grey is
+// the one colour a user's terminal theme should be allowed to have an opinion
+// about -- rg.color(244) is passed through untouched on any profile that has 256
+// colours, where a hex grey would be quantised to whichever palette slot happens
+// to be nearest.
+MUTED :: 244
+
+palette :: proc(p: rg.Profile, term_w: int) -> Palette {
+	pal: Palette
+
+	pal.header = rg.new_style_profile(p)
+	rg.fg(&pal.header, rg.color(ACCENT))
+	rg.bold(&pal.header, true)
+
+	pal.rule = rg.new_style_profile(p)
+	rg.faint(&pal.rule, true)
+
+	pal.gutter = rg.new_style_profile(p)
+	rg.fg(&pal.gutter, rg.color(MUTED))
+
+	pal.gutter_cur = rg.new_style_profile(p)
+	rg.fg(&pal.gutter_cur, rg.color(ACCENT))
+	rg.bold(&pal.gutter_cur, true)
+
+	pal.status = rg.new_style_profile(p)
+	rg.fg(&pal.status, rg.color("#FFFFFF"))
+	rg.bg(&pal.status, rg.color(ACCENT))
+	// A FLOOR, NOT A CLAMP (runegloss/render.odin): asking for term_w pads the
+	// bar out to the full width of the window, and a status string LONGER than
+	// the window still renders in full rather than being cut. term_w == 0 is
+	// this app's "size unknown" -- and rg.width(0) is "no floor" -- so the two
+	// agree with no `if` here.
+	rg.width(&pal.status, term_w)
+
+	pal.help = rg.new_style_profile(p)
+	rg.fg(&pal.help, rg.color(MUTED))
+	rg.border(&pal.help, rg.ROUNDED)
+	rg.border_fg(&pal.help, rg.color(ACCENT))
+	rg.padding(&pal.help, 0, 1)
+
+	return pal
 }
 
 // ---------------------------------------------------------------------------
 // text primitives
 // ---------------------------------------------------------------------------
 
-init :: proc(text: string) -> Model {
+// `profile` is a TRAILING DEFAULTED PARAMETER, the same opt-in shape
+// rt.term_enter_raw and rt.renderer_init use: .None renders no colour escapes at
+// all, so every existing call site (and every test fixture) keeps its old bytes
+// with nothing said, and only main.odin -- which alone knows what terminal it is
+// attached to -- passes rg.default_profile().
+init :: proc(text: string, profile: rg.Profile = .None) -> Model {
 	m: Model
+	m.profile = profile
 	m.nlines = 1
 	for r in text {
 		if r == '\n' {
@@ -329,10 +427,12 @@ WHEEL_LINES :: 3
 // the frame was not flush against the top of the window.
 //
 // T2-C REMOVED EXACTLY THAT OBSTACLE. main.odin now runs this program with
-// rt.Render_Mode.Full_Screen inside the alternate screen, and that renderer
-// homes to the top-left cell every frame (render.odin's render_full_screen), so
-// VIEW LINE 0 IS SCREEN ROW 0 -- by construction, every frame, with nothing to
-// track. `y` is then a physical row within the frame, and the only remaining
+// rt.Render_Mode.Diff inside the alternate screen, and .Diff delivers exactly
+// the frame .Full_Screen paints -- homed at the top-left cell, every frame -- so
+// VIEW LINE 0 IS SCREEN ROW 0 by construction, with nothing to track. (T2-C used
+// .Full_Screen here; T3-A swapped the delivery, not the frame, which is why this
+// mapping did not have to change.) `y` is then a physical row within the frame,
+// and the only remaining
 // work is the one the inline renderer could not have done either: physical rows
 // are not logical lines, because a view line wider than the terminal wraps onto
 // several of them. click_target does that arithmetic with rt.rows_for_line --
@@ -529,22 +629,33 @@ HEADER_LINES :: 2
 // so the number is never wider than 3.
 GUTTER_COLS :: 4
 
-// The exact text view() paints for viewport row `row`, gutter included.
-// EXTRACTED SO THERE IS ONE COPY, not two: click_target measures these strings
-// to map a screen row back to a line, and a second, hand-kept copy of the
-// formatting would be a mapping that agrees with the paint right up until
-// someone edits one of them.
+// The exact text view() paints for viewport row `row`, gutter included AND
+// STYLED. EXTRACTED SO THERE IS ONE COPY, not two: click_target measures these
+// strings to map a screen row back to a line, and a second, hand-kept copy of the
+// formatting would be a mapping that agrees with the paint right up until someone
+// edits one of them.
+//
+// THE STYLING IS INSIDE THIS PROC, not layered on by view(), for exactly that
+// reason. It costs click_target nothing to measure the styled string -- SGR
+// escapes are zero width to rt.display_width (width.odin's escape pre-pass), so
+// the styled and unstyled forms occupy the same cells -- and measuring the string
+// that is actually painted is the only version of this that stays true when
+// somebody changes the gutter.
 @(private)
-view_row_text :: proc(m: Model, row: int, alloc: mem.Allocator) -> string {
+view_row_text :: proc(m: Model, row: int, pal: ^Palette, alloc: mem.Allocator) -> string {
 	i := m.top + row
-	if i < 0 || i >= m.nlines { return "   ~" }
+	if i < 0 || i >= m.nlines { return rg.render(&pal.rule, "   ~", alloc) }
 	sb := strings.builder_make(alloc)
 	// "% 3d", not "%3d": Odin's core:fmt does NOT follow Go here. "%3d"
 	// pads a number with ZEROS ("001"), and "%-3d" pads with zeros on the
 	// RIGHT -- so `fmt.printf("%-3d", 1)` prints "100", which reads as one
 	// hundred. Only the explicit space flag gives Go's "  1". Verified on
 	// this toolchain, not assumed.
-	fmt.sbprintf(&sb, "% 3d ", i + 1)
+	num := fmt.aprintf("% 3d ", i + 1, allocator = alloc)
+	// The caret's own line gets the accent gutter. Two styles rather than one is
+	// the cheapest possible demonstration of what .Diff buys: moving the caret
+	// down a line repaints eight cells -- two gutters -- and nothing else.
+	strings.write_string(&sb, rg.render(i == m.cy ? &pal.gutter_cur : &pal.gutter, num, alloc))
 	l := m.lines[i]
 	for k in 0 ..< l.n { strings.write_rune(&sb, l.r[k]) }
 	return strings.to_string(sb)
@@ -558,8 +669,9 @@ view_row_text :: proc(m: Model, row: int, alloc: mem.Allocator) -> string {
 // nothing rather than pick a nearby line.
 //
 // WHY THIS IS WELL-DEFINED AND WAS NOT BEFORE: main.odin runs this program with
-// rt.Render_Mode.Full_Screen, whose frames start at the top-left cell every
-// time, so view line 0 is screen row 0 with nothing to track. See apply_mouse.
+// rt.Render_Mode.Diff, which delivers .Full_Screen's frame -- and those start at
+// the top-left cell every time, so view line 0 is screen row 0 with nothing to
+// track. See apply_mouse.
 //
 // PHYSICAL ROWS, NOT LOGICAL LINES, and that is the whole substance of this
 // proc. Every view line above the text area (and every text row above the one
@@ -575,11 +687,19 @@ view_row_text :: proc(m: Model, row: int, alloc: mem.Allocator) -> string {
 @(private)
 click_target :: proc(m: Model, x, y: int, alloc: mem.Allocator) -> (cy, cx: int, ok: bool) {
 	w := m.term_w
+	pal := palette(m.profile, w)
+	// HELP_LINE and RULE unstyled, while view() paints them styled -- and that is
+	// exact, not an approximation: rt.display_width (and therefore rows_for_line)
+	// treats SGR escapes as zero width, so rg.render(&pal.header, HELP_LINE) is
+	// the same number of physical rows as HELP_LINE. Measuring the raw constants
+	// saves two rg.render calls per click for a provably identical answer. The
+	// TEXT rows below are a different case -- they go through view_row_text, the
+	// one copy of that formatting -- because their content is not a constant.
 	row := rt.rows_for_line(HELP_LINE, w) + rt.rows_for_line(RULE, w)
 	if y < row { return 0, 0, false }   // header or the rule under it
 
 	for r in 0 ..< VIEWPORT {
-		text := view_row_text(m, r, alloc)
+		text := view_row_text(m, r, &pal, alloc)
 		rows := rt.rows_for_line(text, w)
 		if y < row + rows {
 			i := m.top + r
@@ -619,28 +739,41 @@ rune_at_display_col :: proc(l: Line, col: int) -> int {
 	return l.n
 }
 
+// The Ctrl+I panel's text, hoisted out of view() because RuneGloss lays a
+// MULTI-LINE block out as one call -- the border and the padding are applied to
+// the whole rectangle, so this cannot be three separate render calls the way it
+// used to be three separate sbprintfln calls.
+HELP_PANEL :: `Ctrl+I toggled this panel. Tab (CSI 9 u) and Ctrl+I (CSI 105;5 u) are
+distinct keys ONLY because the Kitty disambiguation flag is pushed;
+on the legacy encoding both are the byte 0x09 and this panel is dead code.`
+
+// EVERY STRING THIS PROC PRODUCES COMES FROM `alloc`, which rt hands it as the
+// FRAME ARENA (arena.odin's LIFETIME CONTRACT) -- including the ones rg.render
+// allocates. RuneGloss allocates from the allocator it is passed and from nothing
+// else (runegloss/render.odin), so the whole frame, styling included, is reclaimed
+// wholesale when the arena resets and there is nothing here to free by hand. That
+// is what keeps tools/test.sh's leak audit clean with a styling layer in the loop.
 view :: proc(m: Model, alloc: mem.Allocator) -> string {
+	pal := palette(m.profile, m.term_w)
 	sb := strings.builder_make(alloc)
 
-	fmt.sbprintfln(&sb, HELP_LINE)
-	fmt.sbprintfln(&sb, RULE)
+	fmt.sbprintfln(&sb, "%s", rg.render(&pal.header, HELP_LINE, alloc))
+	fmt.sbprintfln(&sb, "%s", rg.render(&pal.rule, RULE, alloc))
 
 	for row in 0 ..< VIEWPORT {
-		fmt.sbprintfln(&sb, "%s", view_row_text(m, row, alloc))
+		fmt.sbprintfln(&sb, "%s", view_row_text(m, row, &pal, alloc))
 	}
 
-	fmt.sbprintfln(&sb, RULE)
-	fmt.sbprintfln(&sb, "Ln %d, Col %d   %d lines   window %d-%d   term %dx%d   kitty:%s   last:%s%s",
+	fmt.sbprintfln(&sb, "%s", rg.render(&pal.rule, RULE, alloc))
+	status := fmt.aprintf("Ln %d, Col %d   %d lines   window %d-%d   term %dx%d   kitty:%s   last:%s%s",
 		m.cy + 1, m.cx + 1, m.nlines, m.top + 1, min(m.top + VIEWPORT, m.nlines),
 		m.term_w, m.term_h,
 		m.kitty ? "on" : "off", ACTION_NAME[m.last],
-		m.pasting ? "   [PASTING]" : "")
+		m.pasting ? "   [PASTING]" : "", allocator = alloc)
+	fmt.sbprintfln(&sb, "%s", rg.render(&pal.status, status, alloc))
 
 	if m.help {
-		fmt.sbprintfln(&sb, RULE)
-		fmt.sbprintfln(&sb, "Ctrl+I toggled this panel. Tab (CSI 9 u) and Ctrl+I (CSI 105;5 u) are")
-		fmt.sbprintfln(&sb, "distinct keys ONLY because the Kitty disambiguation flag is pushed;")
-		fmt.sbprintfln(&sb, "on the legacy encoding both are the byte 0x09 and this panel is dead code.")
+		fmt.sbprintfln(&sb, "%s", rg.render(&pal.help, HELP_PANEL, alloc))
 	}
 
 	return strings.to_string(sb)

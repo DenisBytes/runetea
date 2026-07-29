@@ -233,7 +233,12 @@ measure_editor :: proc() {
 	COLS :: 100
 	ROWS :: 30
 
-	m := edit.init("The quick brown fox jumps over the lazy dog.\nSecond line of text.\nThird line.")
+	// .True_Color, and stated rather than detected, for the same reason
+	// examples/editor/edit's tests force a profile: a measurement whose numbers
+	// depend on $TERM is a measurement nobody can reproduce. It is also the
+	// EXPENSIVE end -- truecolour SGR is the longest escape RuneGloss emits -- so
+	// these numbers are the worst case for the diff, not the flattering one.
+	m := edit.init("The quick brown fox jumps over the lazy dog.\nSecond line of text.\nThird line.", .True_Color)
 	m.term_w = COLS
 	m.term_h = ROWS
 

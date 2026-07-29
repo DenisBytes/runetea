@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:os"
 import "core:strings"
 import "core:sys/posix"
+import rg "../../runegloss"
 import rt "../../runetea"
 import ed "edit"
 
@@ -94,7 +95,8 @@ main :: proc() {
 	// defaults exist to make easy.
 	//
 	// `alt = true` is DECSET 1049, the ALTERNATE SCREEN BUFFER (T2-C) -- the
-	// terminal half of the full-screen renderer selected below. It gives this
+	// terminal half of the cell renderer selected below (.Diff, which delivers
+	// .Full_Screen's frame). It gives this
 	// program a cleared buffer of its own and, on exit, hands the user back their
 	// shell exactly as they left it: scrollback intact, this editor's frames
 	// gone. The matching `?1049l` is written by rt.term_restore() below and by
@@ -113,26 +115,55 @@ main :: proc() {
 	b := strings.builder_make(); defer strings.builder_destroy(&b)
 
 	p: rt.Program(ed.Model)
-	rt.program_init(&p, ed.init(DOC), ed.update, ed.view)
+	// rg.default_profile() detects once from $NO_COLOR/$TERM/$COLORTERM and
+	// caches (runegloss/color.odin). THIS IS THE ONLY PLACE THE ENVIRONMENT IS
+	// READ: package edit never calls new_style(), only new_style_profile(p), so
+	// its view is a pure function of its Model and the same Model renders the
+	// same bytes on every machine -- which is what makes edit/testdata's golden a
+	// test rather than a record of the author's terminal.
+	rt.program_init(&p, ed.init(DOC, rg.default_profile()), ed.update, ed.view)
 	// The REAL terminal cursor, T2-A. Set after program_init because
 	// program_init deliberately does not take it (see rt.Program.cursor) --
 	// every example written before T2 keeps compiling untouched, and only the
 	// one that actually needs a caret pays for one. This replaces the literal
 	// '|' this editor used to paint into its own text; see ed.cursor.
 	p.cursor = ed.cursor
-	// T2-C. The FULL-SCREEN renderer: every frame homes to the top-left cell and
-	// repaints from there, instead of rewinding over the previous one. Two things
-	// follow, and this example needs both. The frame has a KNOWN ORIGIN, which is
-	// what makes ed.click_target able to turn a click's absolute screen row into
-	// a line of the document at all (T2-B declined to bind clicks precisely
-	// because the inline renderer had no origin). And the renderer knows the
-	// terminal's HEIGHT, so a document taller than the window is truncated at the
-	// bottom rather than scrolling the screen out from under the frame.
+	// T3-A. The DIFFED CELL RENDERER: the same frame .Full_Screen paints, but
+	// delivered as the minimum set of writes that turns what is already on screen
+	// into it. Everything .Full_Screen gave this example is still true of .Diff --
+	// it is .Full_Screen's frame, so view line 0 is still screen row 0 and
+	// ed.click_target's coordinates still mean what they meant (render.odin's
+	// Render_Mode) -- and the wire cost collapses. Measured on this exact program
+	// at 100x30 (`./tools/difftest/run.sh measure`): 754 B per keystroke
+	// repainted, 115 B diffed, and 60 idle frames cost 45840 B repainted against
+	// ZERO diffed. A whole interactive session on a real pty (100 keystrokes,
+	// scrolling, a click) came to 8280 B against .Full_Screen's 44686 B.
+	//
+	// AN EDITOR IS THE APPLICATION THIS MODE EXISTS FOR. Typing changes a handful
+	// of cells -- one character, the caret's two gutters, the Ln/Col counter -- in
+	// a frame that is otherwise byte-identical to the last one, which is exactly
+	// the shape a repaint handles worst.
+	//
+	// TWO THINGS .Diff NEEDS THAT .Full_Screen DID NOT, both already true here:
+	//
+	//  1. A KNOWN WIDTH AND HEIGHT. It models a viewport. Both come from
+	//     rt.term_size inside run() (and stay live from Window_Size_Msg); with
+	//     either unknown, every frame silently degrades to .Full_Screen's exact
+	//     bytes. That degradation is why the editor's tests -- which have no tty
+	//     -- cannot exercise this mode through run() alone, and why
+	//     editor_test.odin drives a SIZED Renderer directly on top of doing so.
+	//  2. A VIEW THAT CONTAINS STYLING BUT NO MOTION. SGR escapes are modelled per
+	//     cell; a cursor move, an OSC or a raw tab written by the view would be a
+	//     lie to the cell model. ed.view emits SGR, printable text and "\n" and
+	//     nothing else -- RuneGloss guarantees that of its own output, and this
+	//     editor never writes a control character of its own (Tab indents with
+	//     spaces; a pasted 0x09 is dropped by apply_key). editor_test asserts it
+	//     rather than trusting it.
 	//
 	// Set here rather than passed to program_init for the same reason p.cursor is
 	// (rt.Program.render_mode): .Inline is the zero value, so no example written
 	// before T2-C has to change.
-	p.render_mode = .Full_Screen
+	p.render_mode = .Diff
 	// Seed the app's own copy of the terminal size. rt's renderer gets this
 	// itself from term_size inside run(), but ed.click_target needs the WIDTH too
 	// -- to account for view lines that wrap -- and a Window_Size_Msg only ever

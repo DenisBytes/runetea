@@ -8,6 +8,7 @@ import "core:strconv"
 import "core:strings"
 import "core:sys/posix"
 import "core:time"
+import rg "../../runegloss"
 import rt "../../runetea"
 
 // The Go original fetches https://charm.sh/. Odin core has TCP and DNS
@@ -161,7 +162,55 @@ check_server :: proc(env: rawptr, cancel: ^rt.Cancel_Token) -> any {
 // Msg_Text above.
 Check_Slot :: struct { host: string, port: int, status: int, err: string, done: bool }
 
-Model :: struct { checks: [2]Check_Slot }
+// The four styles this view needs, built once in main and carried in the Model.
+// rg.Style is POD (runegloss/style.odin), so this is just four more value fields
+// -- see examples/spinner's Model for the longer note on why that matters.
+//
+// FOUR STYLES AND NOT ONE PER STATE OF THE UNION: `target` is the constant part
+// of every line and the other three are the three things a check can end up
+// being. That mapping -- one style per outcome, chosen where the outcome is
+// decided -- is what keeps the `if` chain in view() about STATE and not about
+// escape sequences.
+Styles :: struct {
+	target:  rg.Style,   // "http://example.com:80"
+	pending: rg.Style,   // "checking..."
+	ok:      rg.Style,   // a 2xx/3xx status code
+	bad:     rg.Style,   // a 4xx/5xx status code, or a dial/recv error
+}
+
+Model :: struct {
+	checks: [2]Check_Slot,
+	st:     Styles,
+}
+
+// Wide enough for "http://example.com:80" plus room, so the two results line up.
+TARGET_COLS :: 28
+
+// Built once, in main, so the terminal is sniffed once rather than per frame.
+// rg.new_style() -- not new_style_profile -- because this is an APPLICATION
+// deciding what the user's terminal can show; the forced-profile form exists for
+// tests, which must not depend on $TERM (see examples/editor/edit's palette).
+make_styles :: proc() -> Styles {
+	st: Styles
+
+	st.target = rg.new_style()
+	rg.faint(&st.target, true)
+	rg.width(&st.target, TARGET_COLS)
+
+	st.pending = rg.new_style()
+	rg.fg(&st.pending, rg.color(244))
+	rg.italic(&st.pending, true)
+
+	st.ok = rg.new_style()
+	rg.fg(&st.ok, rg.color("#04B575"))
+	rg.bold(&st.ok, true)
+
+	st.bad = rg.new_style()
+	rg.fg(&st.bad, rg.color("#FF5F87"))
+	rg.bold(&st.bad, true)
+
+	return st
+}
 
 // `m` is a POINTER: mutate it in place, return only the Cmd. See
 // rt.Program.update (runetea/tea.odin).
@@ -194,14 +243,30 @@ all_checks_done :: proc(m: Model) -> bool {
 }
 
 view :: proc(m: Model, alloc: mem.Allocator) -> string {
+	// Local copies: rg.render takes a ^Style and `m` is a procedure PARAMETER,
+	// which Odin makes immutable and non-addressable. See examples/spinner's view.
+	st := m.st
 	sb := strings.builder_make(alloc)
 	for c in m.checks {
-		if c.err != "" {
-			fmt.sbprintfln(&sb, "http://%s:%d -> error: %s", c.host, c.port, c.err)
-		} else if c.done {
-			fmt.sbprintfln(&sb, "http://%s:%d -> %d", c.host, c.port, c.status)
-		} else {
-			fmt.sbprintfln(&sb, "http://%s:%d -> checking...", c.host, c.port)
+		// One column of fixed-width targets so the results line up whichever
+		// check finishes first -- rg.width is a FLOOR, so a host name longer than
+		// TARGET_COLS widens its own line rather than being truncated, and the
+		// column simply stops being a column. That is the honest failure mode for
+		// a layout with no wrapping in it.
+		target := fmt.aprintf("http://%s:%d", c.host, c.port, allocator = alloc)
+		fmt.sbprintf(&sb, "%s  ", rg.render(&st.target, target, alloc))
+		switch {
+		case c.err != "":
+			fmt.sbprintfln(&sb, "%s", rg.render(&st.bad, fmt.aprintf("error: %s", c.err, allocator = alloc), alloc))
+		case c.done:
+			// 2xx and 3xx are green, everything else red. The style is picked from
+			// the STATUS, which is the one thing this program went to the network
+			// to find out -- a status list that painted a 500 the same colour as a
+			// 200 would be a list nobody reads.
+			s := c.status < 400 ? &st.ok : &st.bad
+			fmt.sbprintfln(&sb, "%s", rg.render(s, fmt.aprintf("%d", c.status, allocator = alloc), alloc))
+		case:
+			fmt.sbprintfln(&sb, "%s", rg.render(&st.pending, "checking...", alloc))
 		}
 	}
 	return strings.to_string(sb)
@@ -272,10 +337,13 @@ main :: proc() {
 	init := rt.batch(cmds, context.allocator)
 
 	p: rt.Program(Model)
-	rt.program_init(&p, Model{checks = {
-		0 = Check_Slot{host = host1, port = port1},
-		1 = Check_Slot{host = host2, port = port2},
-	}}, update, view, init)
+	rt.program_init(&p, Model{
+		checks = {
+			0 = Check_Slot{host = host1, port = port1},
+			1 = Check_Slot{host = host2, port = port2},
+		},
+		st = make_styles(),
+	}, update, view, init)
 
 	if err := rt.run(&p, &src, &b, fd); err != nil { fmt.eprintln("error:", err) }
 }

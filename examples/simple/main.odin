@@ -7,6 +7,20 @@ import "core:strings"
 import "core:sys/posix"
 import rt "../../runetea"
 
+// DELIBERATELY UNSTYLED AND DELIBERATELY .Inline, while every other example in
+// this directory now uses RuneGloss and the editor uses the .Diff renderer.
+//
+// This file exists to be the smallest complete RuneTea program -- a Model, an
+// update, a view, six lines of terminal setup -- and it is the first thing
+// anybody reads. Every import it does not have is a question the reader does not
+// have to answer before they understand the loop. examples/spinner is one file
+// further on and shows what a styled view looks like (rg.Styles stored in the
+// Model); examples/editor shows the whole apparatus.
+//
+// The same reasoning keeps the renderer at .Inline (the zero value): this program
+// prints three lines and exits, leaving them in the user's scrollback. .Diff and
+// .Full_Screen own the whole viewport, which is the right trade for an editor and
+// the wrong one for a program this size.
 Model :: struct { ticks: int }
 
 // `m` is a POINTER: mutate it in place, return only the Cmd. See

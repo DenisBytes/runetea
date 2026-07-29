@@ -6,6 +6,7 @@ import "core:os"
 import "core:strings"
 import "core:sys/posix"
 import "core:time"
+import rg "../../runegloss"
 import rt "../../runetea"
 
 // T1's iconic deliverable: an animated spinner, driven entirely by rt.tick --
@@ -46,7 +47,22 @@ spin_tick_cmd :: proc() -> rt.Cmd {
 	return rt.tick(FRAME_INTERVAL, spin_tick_fn, struct{}{}, context.allocator)
 }
 
-Model :: struct { frame: int }
+// THE STYLES LIVE IN THE MODEL, and that is the point of writing them here
+// rather than rebuilding them in view(). rg.Style is a PLAIN VALUE TYPE --
+// rt.is_pod_type(rg.Style) is true and runegloss asserts it in its own tests, so
+// there is no string, pointer or slice inside one -- which means it obeys exactly
+// the rule this Model already had to obey (see arena.odin's MESSAGE OWNERSHIP
+// CONTRACT and examples/editor's Model): copying it copies the whole truth, with
+// nothing shared behind it. A styling library whose handle was a pointer into a
+// registry could not be put here at all.
+//
+// It also means the terminal is sniffed ONCE, in main, instead of on every one of
+// the ~10 frames a second this program paints.
+Model :: struct {
+	frame: int,
+	spin:  rg.Style,   // the braille glyph
+	hint:  rg.Style,   // "press 'q' to quit"
+}
 
 // `m` is a POINTER: mutate it in place, return only the Cmd. See
 // rt.Program.update (runetea/tea.odin).
@@ -65,7 +81,25 @@ update :: proc(m: ^Model, msg: any, alloc: mem.Allocator) -> rt.Cmd {
 }
 
 view :: proc(m: Model, alloc: mem.Allocator) -> string {
-	return fmt.aprintf("%c Loading forever... press 'q' to quit\n", FRAMES[m.frame], allocator = alloc)
+	// LOCAL COPIES because rg.render takes a ^Style and `m` is a procedure
+	// PARAMETER -- Odin parameters are immutable and not addressable, so `&m.spin`
+	// does not compile. Two struct copies per frame, no allocation. (rg.render
+	// takes a pointer rather than a value for the same reason its setters do: a
+	// Style is ~200 bytes and copying it at every call site would be the one
+	// avoidable cost in an otherwise allocation-free API.)
+	spin, hint := m.spin, m.hint
+	// EVERY string below comes from `alloc` -- the FRAME ARENA rt hands view() --
+	// including the ones rg.render allocates, since RuneGloss allocates from the
+	// allocator it is passed and from nothing else (runegloss/render.odin).
+	// Nothing here is freed by hand because the arena is reclaimed wholesale after
+	// the frame (arena.odin's LIFETIME CONTRACT). Note aprintf(allocator = alloc)
+	// and NOT tprintf: the temp allocator is a different, process-lifetime arena
+	// that this loop never resets.
+	glyph := fmt.aprintf("%c", FRAMES[m.frame], allocator = alloc)
+	return fmt.aprintf("%s %s\n",
+		rg.render(&spin, glyph, alloc),
+		rg.render(&hint, "Loading forever... press 'q' to quit", alloc),
+		allocator = alloc)
 }
 
 main :: proc() {
@@ -102,13 +136,26 @@ main :: proc() {
 
 	b := strings.builder_make(); defer strings.builder_destroy(&b)
 
+	// THE ONLY PLACE THE ENVIRONMENT IS READ. rg.default_profile() inspects
+	// $NO_COLOR/$TERM/$COLORTERM once and caches; every Style built afterwards
+	// carries a COPY of the answer, so nothing downstream can be surprised by a
+	// re-detection. On a terminal that reports nothing (or under $NO_COLOR) the
+	// profile is .None and both Styles below render their input byte for byte --
+	// this program degrades to exactly the output it had before RuneGloss, with
+	// no `if` anywhere in view().
+	m: Model
+	m.spin = rg.new_style()
+	rg.fg(&m.spin, rg.color("#7D56F4"))
+	m.hint = rg.new_style()
+	rg.faint(&m.hint, true)
+
 	p: rt.Program(Model)
 	// The FIRST tick, fired before any keypress -- exactly the same "an app
 	// whose first action is asynchronous must still show its loading state
 	// immediately" property init_cmd exists for (examples/http's own
 	// comment), here animating from frame 0 the instant the program starts
 	// rather than waiting for a keypress to kick off the first frame.
-	rt.program_init(&p, Model{}, update, view, spin_tick_cmd())
+	rt.program_init(&p, m, update, view, spin_tick_cmd())
 
 	// flush_fd = the tty, so each frame reaches the screen as it is rendered.
 	if err := rt.run(&p, &src, &b, fd); err != nil { fmt.eprintln("error:", err) }
