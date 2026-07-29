@@ -105,7 +105,11 @@ test_decode_double_escape :: proc(t: ^testing.T) {
 test_decode_unsupported_csi_is_cleanly_ignored :: proc(t: ^testing.T) {
 	out := make([dynamic]Key_Msg); defer delete(out)
 	for seq in ([?]string{
-		"\e[?1u", "\e[25~", "\e[9~", "\e[Z", "\e[E",
+		// "\e[Z" USED TO BE ON THIS LIST and was moved off it deliberately: it
+		// is Shift+Tab (kcbt), present in 21 of the 40 terminfo entries on this
+		// machine including xterm, tmux, screen and rxvt, and it is now decoded.
+		// See test_shift_tab_decodes_from_csi_z.
+		"\e[?1u", "\e[25~", "\e[9~", "\e[E",
 		"\e[?2004;1$y",     // DECRPM report (carries an intermediate byte)
 		"\e[>4;2m",         // xterm modifyOtherKeys report: 'm' final, but a '>' prefix
 		"\e[?997;1n",       // light/dark colour-scheme report
@@ -1881,4 +1885,72 @@ test_mouse_and_focus_msgs_are_pod :: proc(t: ^testing.T) {
 	testing.expect_value(t, Mouse_Button{}, Mouse_Button.None)
 	testing.expect_value(t, Mouse_Kind{}, Mouse_Kind.Press)
 	testing.expect_value(t, Mouse_Msg{}.button, Mouse_Button.None)
+}
+
+// ---------------------------------------------------------------------------
+// Shift+Tab (CBT).
+// ---------------------------------------------------------------------------
+//
+// `kcbt=\E[Z` is present in 21 of the 40 terminfo entries installed on this
+// machine -- xterm, xterm-256color, tmux, tmux-256color, screen and all its
+// variants, rxvt, rxvt-unicode -- and "previous field" is a standard binding in
+// every form-shaped TUI. It used to fall through to the cleanly-ignored path,
+// so Shift+Tab simply did nothing on every one of those terminals unless the
+// Kitty protocol was negotiated.
+@(test)
+test_shift_tab_decodes_from_csi_z :: proc(t: ^testing.T) {
+	out := make([dynamic]Key_Msg); defer delete(out)
+	n := decode_keys(transmute([]u8)string("\e[Z"), &out)
+	testing.expect_value(t, n, 3)
+	testing.expect_value(t, len(out), 1)
+	testing.expect_value(t, out[0], Key_Msg{code = .Tab, mods = {.Shift}})
+}
+
+// THE SHIFT IS IN THE FINAL BYTE, so an explicit modifier parameter must be
+// UNIONED with it, not allowed to replace it -- otherwise Ctrl+Shift+Tab would
+// arrive as a plain Ctrl+Tab and a UI would run the wrong binding.
+@(test)
+test_shift_tab_keeps_its_shift_when_another_modifier_is_present :: proc(t: ^testing.T) {
+	out := make([dynamic]Key_Msg); defer delete(out)
+	// CSI 1;5Z -- xterm_mods(5) is {.Ctrl}; the Shift comes from the 'Z'.
+	decode_keys(transmute([]u8)string("\e[1;5Z"), &out)
+	testing.expect_value(t, len(out), 1)
+	testing.expect_value(t, out[0], Key_Msg{code = .Tab, mods = {.Ctrl, .Shift}})
+
+	// CSI 1;6Z -- xterm_mods(6) is {.Shift, .Ctrl} already. The union must be
+	// idempotent, not additive.
+	clear(&out)
+	decode_keys(transmute([]u8)string("\e[1;6Z"), &out)
+	testing.expect_value(t, len(out), 1)
+	testing.expect_value(t, out[0], Key_Msg{code = .Tab, mods = {.Ctrl, .Shift}})
+}
+
+// The two encodings must agree, or the same physical keypress means two
+// different things depending on whether the Kitty push happened to be honoured
+// -- which is exactly the bug this fixes, in the direction nobody would notice.
+@(test)
+test_shift_tab_agrees_between_the_legacy_and_kitty_encodings :: proc(t: ^testing.T) {
+	legacy := make([dynamic]Key_Msg); defer delete(legacy)
+	kitty  := make([dynamic]Key_Msg); defer delete(kitty)
+	decode_keys(transmute([]u8)string("\e[Z"),    &legacy)
+	decode_keys(transmute([]u8)string("\e[9;2u"), &kitty)
+	testing.expect_value(t, len(legacy), 1)
+	testing.expect_value(t, len(kitty), 1)
+	testing.expect_value(t, legacy[0], kitty[0])
+}
+
+// Adding a final byte to csi_letter_code must not have widened anything else:
+// 'Z' is the ONLY entry whose modifier comes from the final byte, and every
+// other letter key must still arrive with exactly the modifiers its parameter
+// named.
+@(test)
+test_only_csi_z_carries_an_implied_modifier :: proc(t: ^testing.T) {
+	out := make([dynamic]Key_Msg); defer delete(out)
+	for seq, i in ([?]string{"\e[A", "\e[B", "\e[C", "\e[D", "\e[F", "\e[H", "\e[P", "\e[Q", "\e[R", "\e[S"}) {
+		clear(&out)
+		decode_keys(transmute([]u8)seq, &out)
+		testing.expectf(t, len(out) == 1, "%q decoded to %d keys", seq, len(out))
+		testing.expectf(t, out[0].mods == {}, "%q must carry no implied modifier, got %v", seq, out[0].mods)
+		_ = i
+	}
 }

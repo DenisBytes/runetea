@@ -28,29 +28,78 @@ import "core:strings"
 Msg_Text :: struct {
 	buf: [MSG_TEXT_CAP]u8,
 	len: u8,
+	// Whether the text that went IN was longer than `buf` could hold, i.e.
+	// whether what comes out is the whole story.
+	//
+	// TRUNCATION STAYS -- what changes is that it is no longer SILENT. The cap
+	// is what makes this type POD (see the type comment), and a fallible
+	// constructor would defeat the one-expression `return box(Err_Msg{reason =
+	// msg_text_from(...)})` shape the type exists for. But "the payload was
+	// clipped and nothing anywhere records that" is the failure shape this
+	// codebase refuses everywhere else, so it is recorded here, in one byte,
+	// and read back with msg_text_truncated.
+	//
+	// Still POD: a bool has no pointer in its field tree, so box() accepts a
+	// Msg_Text exactly as it did before.
+	truncated: bool,
 }
 
+// The most bytes a Msg_Text can carry. 255 rather than 256 because `len` is a
+// u8 and 255 is the largest length it can express -- the buffer is sized to the
+// counter, not the other way round.
+//
+// This is not a soft limit that grows: it is the whole reason the type is POD.
+// A payload that genuinely needs more than 255 bytes needs a different design
+// (a handle into application-owned storage), which v1.0 does not have -- see
+// docs/LIMITATIONS.md.
 MSG_TEXT_CAP :: 255
 
-// Truncates silently past MSG_TEXT_CAP bytes rather than returning an error:
-// Msg_Text exists to drop into a one-expression `return box(Err_Msg{reason =
+// Truncates past MSG_TEXT_CAP bytes rather than returning an error: Msg_Text
+// exists to drop into a one-expression `return box(Err_Msg{reason =
 // msg_text_from(...)}, ...)` inside a Cmd, and a fallible constructor would
-// defeat that. Truncation is a real, measured cost of the POD design -- see
-// the decision doc -- not a hidden one.
+// defeat that. Truncation is a real, measured cost of the POD design -- see the
+// decision doc -- not a hidden one, and `truncated` is what stops it being a
+// quiet one: msg_text_truncated(m) answers "is this the whole message?".
 msg_text_from :: proc(s: string) -> Msg_Text {
 	m: Msg_Text
 	n := copy(m.buf[:], s)
 	m.len = u8(n)
+	m.truncated = len(s) > MSG_TEXT_CAP
 	return m
 }
 
-// Same truncation contract as msg_text_from, via fmt.bprintf into the fixed
+// Same truncation contract as msg_text_from, via fmt.bprintf into a fixed
 // buffer -- no intermediate heap allocation the way fmt.aprintf would need.
+//
+// FORMATS INTO ONE BYTE MORE THAN IT KEEPS, and that is the whole truncation
+// detector. fmt.bprintf simply stops when its backing array is full and has no
+// way to report that it wanted more, so "did it fit?" cannot be asked of a
+// CAP-sized buffer -- a result of exactly CAP is indistinguishable between an
+// exact fit and a clip. With CAP+1 bytes to write into, a result longer than
+// CAP is proof the real output did not fit, and a result of CAP or less is
+// proof it did. Exact in both directions, at the cost of one stack byte.
 msg_text_fmt :: proc(format: string, args: ..any) -> Msg_Text {
+	scratch: [MSG_TEXT_CAP + 1]u8
+	s := fmt.bprintf(scratch[:], format, ..args)
+
 	m: Msg_Text
-	s := fmt.bprintf(m.buf[:], format, ..args)
-	m.len = u8(len(s))
+	n := copy(m.buf[:], s)
+	m.len = u8(n)
+	m.truncated = len(s) > MSG_TEXT_CAP
 	return m
+}
+
+// Whether this Msg_Text is the WHOLE text it was built from, or a 255-byte
+// prefix of it.
+//
+// An accessor rather than a bare field read so that the question has one
+// spelling everywhere and this doc comment has somewhere to live. A caller that
+// wants the full text of an arbitrarily long payload wants a different carrier
+// -- Msg_Text cannot be one and stay POD -- but a caller that merely wants to
+// say "(truncated)" in its status line can, now, know.
+@(require_results)
+msg_text_truncated :: proc(m: Msg_Text) -> bool {
+	return m.truncated
 }
 
 // The ONLY way to get a `string` out of a Msg_Text, and it always allocates

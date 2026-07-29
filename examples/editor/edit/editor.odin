@@ -129,7 +129,7 @@ Model :: struct {
 	// row into a view line means knowing how many PHYSICAL rows each view line
 	// above it occupies, and that is a function of the width (rt.rows_for_line).
 	// Without it, a header line wider than the terminal -- and this view's header
-	// is 105 columns, so on an 80-column terminal it is exactly that -- would
+	// is 101 columns, so on an 80-column terminal it is exactly that -- would
 	// wrap, push everything below it down a row, and every click would land one
 	// line too high.
 	//
@@ -245,6 +245,25 @@ palette :: proc(p: rg.Profile, term_w: int) -> Palette {
 // all, so every existing call site (and every test fixture) keeps its old bytes
 // with nothing said, and only main.odin -- which alone knows what terminal it is
 // attached to -- passes rg.default_profile().
+// THE LOADER SANITISES CONTROL CHARACTERS, and that is a correctness
+// requirement rather than tidiness -- caught by rt.view_diff_safe, which is
+// what test_the_editors_view_satisfies_the_diff_renderers_contract runs over a
+// real view.
+//
+// Every other route into this document already refused to admit a C0 byte:
+// apply_key's paste branch takes only `k.r >= 0x20`, and the Tab KEY inserts
+// TAB_WIDTH spaces rather than a 0x09. init did not, so loading a tab-indented
+// file -- which is what an editor is FOR -- put a literal 0x09 straight into
+// the view. Under rt.Render_Mode.Diff that is silent corruption: a tab is a
+// MOVE to the next tab stop, the cell model does not perform it, and every cell
+// after it on that row is somewhere the renderer does not think it is. Under
+// .Full_Screen (what this example actually runs) it merely renders, which is
+// precisely why it survived unnoticed.
+//
+//   * TAB expands to the same TAB_WIDTH spaces the Tab key inserts, so a loaded
+//     document and a typed one indent identically.
+//   * ANY OTHER C0 (and DEL) is DROPPED, matching the paste branch exactly. A
+//     substitute glyph would be an editor inventing content it cannot save back.
 init :: proc(text: string, profile: rg.Profile = .None) -> Model {
 	m: Model
 	m.profile = profile
@@ -256,6 +275,15 @@ init :: proc(text: string, profile: rg.Profile = .None) -> Model {
 			continue
 		}
 		l := &m.lines[m.nlines - 1]
+		if r == '\t' {
+			for _ in 0 ..< TAB_WIDTH {
+				if l.n >= MAX_COLS { break }
+				l.r[l.n] = ' '
+				l.n += 1
+			}
+			continue
+		}
+		if r < 0x20 || r == 0x7F { continue }
 		if l.n < MAX_COLS { l.r[l.n] = r; l.n += 1 }
 	}
 	return m
@@ -612,7 +640,7 @@ apply_key :: proc(m: ^Model, k: rt.Key_Msg) -> rt.Cmd {
 RULE :: "--------------------------------------------------------------------------"
 
 // The header, hoisted out of view()'s first sbprintfln by T2-C. It is a named
-// constant now because click_target has to MEASURE it (105 columns -- wider than
+// constant now because click_target has to MEASURE it (101 columns -- wider than
 // an 80-column terminal, so it really does wrap in practice) to know which
 // screen row the text area starts on. A literal written twice would be a layout
 // that can silently drift out of agreement with the click mapping.

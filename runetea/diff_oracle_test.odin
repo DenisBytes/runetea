@@ -82,6 +82,18 @@ vt_replay :: proc(s: ^Screen, data: string, scratch: ^[dynamic]u8) {
 
 @(private = "file")
 vt_escape :: proc(s: ^Screen, seq: string, scratch: ^[dynamic]u8) {
+	// OSC 8 -- a hyperlink open or close. Routed through the SAME entry point
+	// screen_write uses (screen_escape), for the reason that proc's comment
+	// gives: a replay that decided differently from the model about what an
+	// escape means would report differences that are its own.
+	//
+	// Note this is the one escape family the replay understands that is not a
+	// CSI, which is why it is tested before the seq[1] == '[' gate rather than
+	// inside the switch below.
+	if len(seq) >= 2 && seq[1] == ']' {
+		screen_osc8(s, seq)
+		return
+	}
 	if len(seq) < 3 || seq[1] != '[' { return }
 	final := seq[len(seq) - 1]
 	body  := seq[2:len(seq) - 1]
@@ -204,9 +216,16 @@ oracle_case :: proc(seed: u64, pyte_safe := false) -> (ok: bool, fail: Oracle_Fa
 	style_table_init(&st)
 	defer style_table_destroy(&st)
 
+	// The LINK table, on exactly the same terms and legitimate for exactly the
+	// same reason: interning is content-addressed, so one OSC 8 payload arriving
+	// from two different streams collapses onto one index by construction.
+	lt: Style_Table
+	style_table_init(&lt)
+	defer style_table_destroy(&lt)
+
 	s_ref, s_dif: Screen
-	screen_init(&s_ref, f.cols, f.rows, &st)
-	screen_init(&s_dif, f.cols, f.rows, &st)
+	screen_init(&s_ref, f.cols, f.rows, &st, &lt)
+	screen_init(&s_dif, f.cols, f.rows, &st, &lt)
 	defer screen_destroy(&s_ref)
 	defer screen_destroy(&s_dif)
 
@@ -232,8 +251,8 @@ oracle_case :: proc(seed: u64, pyte_safe := false) -> (ok: bool, fail: Oracle_Fa
 				return false, Oracle_Fail{
 					seed = seed, frame = frame, row = y, col = x,
 					what = "cell",
-					ref  = fmt.aprintf("%q w=%d sgr=%q", cell_bytes(&s_ref, ca), ca.width, style_bytes(&st, ca.style)),
-					got  = fmt.aprintf("%q w=%d sgr=%q", cell_bytes(&s_dif, cb), cb.width, style_bytes(&st, cb.style)),
+					ref  = fmt.aprintf("%q w=%d sgr=%q link=%q", cell_bytes(&s_ref, ca), ca.width, style_bytes(&st, ca.style), style_bytes(&lt, ca.link)),
+					got  = fmt.aprintf("%q w=%d sgr=%q link=%q", cell_bytes(&s_dif, cb), cb.width, style_bytes(&st, cb.style), style_bytes(&lt, cb.link)),
 				}
 			}
 		}
@@ -641,6 +660,239 @@ test_diff_a_styled_cell_survives_an_unrelated_change_elsewhere :: proc(t: ^testi
 	frame(h, "\e[31mred\e[0m plain\nsecond")
 	got := frame(h, "\e[31mred\e[0m plain\nsecoXd")
 	testing.expect_value(t, got, "\e[2;5HX\e[3;1H")
+}
+
+// ---------------------------------------------------------------------------
+// OSC 8 hyperlinks (T3-C).
+// ---------------------------------------------------------------------------
+//
+// THE BUG THESE CLOSE, stated once here rather than in each test: before T3-C
+// the cell model tracked SGR and nothing else, so the diff renderer consumed an
+// OSC 8 hyperlink for width and dropped it. A view containing a link rendered as
+// unlinked text, and -- worse -- a frame in which ONLY the destination changed
+// produced zero bytes, because every cell compared equal. Silent data loss on
+// both counts.
+//
+// test_diff_a_link_whose_url_changes_repaints_the_run is the one that fails
+// loudest against the old code: it asserts a non-empty frame where the old
+// renderer emitted nothing at all.
+
+@(private = "file")
+LINK_A :: "\e]8;;https://example.com/a\e\\"
+@(private = "file")
+LINK_B :: "\e]8;;https://example.com/b\e\\"
+@(private = "file")
+LINK_OFF :: "\e]8;;\e\\"
+
+@(test)
+test_diff_a_hyperlink_that_appears_is_opened_and_closed :: proc(t: ^testing.T) {
+	h := harness_make(20, 3); defer harness_free(h)
+	frame(h, "plain")
+	got := frame(h, LINK_A + "link" + LINK_OFF)
+	// "plain" -> "link": five cells change (four glyphs plus the freed one).
+	// The four linked cells open the link once between them -- a hyperlink is
+	// established per RUN, not per cell, exactly as a style is -- and the blank
+	// that follows closes it because its own link index is 0.
+	testing.expect_value(t, got, "\e[1;1H" + LINK_A + "link" + LINK_OFF + " " + "\e[2;1H")
+}
+
+@(test)
+test_diff_a_link_whose_url_changes_repaints_the_run :: proc(t: ^testing.T) {
+	h := harness_make(20, 3); defer harness_free(h)
+	frame(h, LINK_A + "abc" + LINK_OFF)
+	// SAME GLYPHS, SAME STYLE, DIFFERENT DESTINATION. This is the case a
+	// style-only cell model cannot see: every cell's bytes and SGR are
+	// identical, so screens_differ answered false and the frame cost 0 bytes
+	// while the user kept the old link. cell_eq now compares `link`.
+	got := frame(h, LINK_B + "abc" + LINK_OFF)
+	testing.expect_value(t, got, "\e[1;1H" + LINK_B + "abc" + LINK_OFF + "\e[2;1H")
+	testing.expect(t, len(got) > 0, "a changed hyperlink destination must not cost zero bytes")
+}
+
+@(test)
+test_diff_a_link_whose_id_changes_repaints_the_run :: proc(t: ^testing.T) {
+	h := harness_make(20, 3); defer harness_free(h)
+	SAME_URL_ID_1 :: "\e]8;id=1;https://example.com\e\\"
+	SAME_URL_ID_2 :: "\e]8;id=2;https://example.com\e\\"
+	frame(h, SAME_URL_ID_1 + "abc" + LINK_OFF)
+	// Same URL, different link IDENTITY -- two runs with different ids are two
+	// separate links to the terminal even when they point at the same place.
+	// This is why screen_osc8 interns params AND URI rather than the URI alone.
+	got := frame(h, SAME_URL_ID_2 + "abc" + LINK_OFF)
+	testing.expect_value(t, got, "\e[1;1H" + SAME_URL_ID_2 + "abc" + LINK_OFF + "\e[2;1H")
+}
+
+@(test)
+test_diff_an_unchanged_hyperlink_frame_still_costs_zero_bytes :: proc(t: ^testing.T) {
+	h := harness_make(20, 3); defer harness_free(h)
+	frame(h, LINK_A + "abc" + LINK_OFF + " tail")
+	// The 0-byte contract is the whole reason .Diff exists and links must not
+	// erode it: the link escapes are STATE, tracked per cell, not bytes
+	// re-sent per frame.
+	testing.expect_value(t, len(frame(h, LINK_A + "abc" + LINK_OFF + " tail")), 0)
+	testing.expect_value(t, len(frame(h, LINK_A + "abc" + LINK_OFF + " tail")), 0)
+}
+
+@(test)
+test_diff_a_hyperlink_that_disappears_is_closed :: proc(t: ^testing.T) {
+	h := harness_make(20, 3); defer harness_free(h)
+	frame(h, LINK_A + "abc" + LINK_OFF)
+	got := frame(h, "abc")
+	// Same three glyphs, now unlinked. The emitter is at link 0 already (the
+	// previous frame closed), so all this costs is the three cells.
+	testing.expect_value(t, got, "\e[1;1Habc\e[2;1H")
+}
+
+@(test)
+test_diff_closes_a_link_left_open_at_the_end_of_a_frame :: proc(t: ^testing.T) {
+	h := harness_make(8, 2); defer harness_free(h)
+	frame(h, "xxxx")
+	// A view that opens a link and never closes it. Left as-is, the terminal
+	// would keep linkifying -- the next frame, the app's own writes, and the
+	// user's shell after exit. render_diff closes every frame it ends styled or
+	// linked, for the same reason it closes SGR.
+	got := frame(h, LINK_A + "ab")
+	testing.expect(t, strings.contains(got, LINK_OFF),
+		"a frame that ends inside a hyperlink must close it")
+	// The close lands where it lands for a reason worth reading: columns 2-3
+	// held "xx" and are now blank at link 0, so diff_link(0) closes the link to
+	// paint THEM -- the frame-closing reset then has nothing left to do. Either
+	// way the terminal is not left linkified, which is the property.
+	testing.expect_value(t, got, "\e[1;1H" + LINK_A + "ab" + LINK_OFF + "  " + "\e[2;1H")
+}
+
+@(test)
+test_diff_never_clears_a_linked_tail_with_el :: proc(t: ^testing.T) {
+	h := harness_make(20, 2); defer harness_free(h)
+	frame(h, "abcdefghijklmnopqrst")
+	// 18 trailing blanks, all INSIDE the link (the view never closes it). \e[K
+	// would erase them, and an erased cell carries no link (screen.odin's
+	// blank_cell) -- so using EL here would drop a hyperlink the frame asked
+	// for. Real spaces under an open link instead. Same rule, and the same one
+	// place it is scoped down, as the styled-tail case.
+	got := frame(h, LINK_A + "ab" + "                  ")
+	testing.expect(t, !strings.contains(got, "\e[K"), "a linked tail must not be cleared with EL")
+	testing.expect_value(t, got,
+		"\e[1;1H" + LINK_A + "ab" + "                  " + LINK_OFF + "\e[2;1H")
+}
+
+@(test)
+test_diff_closes_the_link_before_an_el :: proc(t: ^testing.T) {
+	h := harness_make(20, 2); defer harness_free(h)
+	frame(h, "aaaaaaaaaaaaaaaaaaaa")
+	// Four linked cells, then a 16-cell default blank tail -- long enough that
+	// \e[K wins. The close MUST precede the erase: whether a terminal records
+	// an open hyperlink on the cells \e[K blanks is not fixed by any standard,
+	// so the emitter refuses to find out.
+	got := frame(h, LINK_A + "bbbb" + LINK_OFF)
+	testing.expect_value(t, got, "\e[1;1H" + LINK_A + "bbbb" + LINK_OFF + "\e[K" + "\e[2;1H")
+	// And the ordering, asserted directly rather than only implied by the
+	// byte-exact expectation above.
+	close_at := strings.index(got, LINK_OFF)
+	el_at    := strings.index(got, "\e[K")
+	testing.expect(t, close_at >= 0 && el_at >= 0 && close_at < el_at,
+		"the hyperlink must be closed BEFORE the \\e[K that erases the tail")
+}
+
+@(test)
+test_diff_a_hyperlink_survives_an_unrelated_change_elsewhere :: proc(t: ^testing.T) {
+	h := harness_make(20, 3); defer harness_free(h)
+	frame(h, LINK_A + "abc" + LINK_OFF + "\nsecond")
+	got := frame(h, LINK_A + "abc" + LINK_OFF + "\nsecoXd")
+	// Row 0 is untouched, link and all: a hyperlink costs nothing to KEEP.
+	testing.expect_value(t, got, "\e[2;5HX\e[3;1H")
+}
+
+@(test)
+test_diff_a_link_and_a_style_are_independent_planes :: proc(t: ^testing.T) {
+	h := harness_make(20, 3); defer harness_free(h)
+	frame(h, LINK_A + "\e[31mabc\e[0m" + LINK_OFF)
+	// Only the COLOUR changes; the link is identical. Both attributes must be
+	// re-established for the rewritten cells (the emitter starts each frame at
+	// the default for both), and neither may be confused for the other.
+	got := frame(h, LINK_A + "\e[32mabc\e[0m" + LINK_OFF)
+	testing.expect_value(t, got, "\e[1;1H\e[32m" + LINK_A + "abc" + "\e[0m" + LINK_OFF + "\e[2;1H")
+}
+
+@(test)
+test_diff_a_hyperlink_survives_a_wrap :: proc(t: ^testing.T) {
+	h := harness_make(4, 3); defer harness_free(h)
+	frame(h, "xxxxxxxx")
+	// Eight linked columns on a four-column screen: the link spans a wrap, so
+	// the second physical row's cells carry it too and the emitter has to
+	// re-establish it after the CUP to row 1 (it never assumes the terminal
+	// kept anything across a cursor move).
+	got := frame(h, LINK_A + "abcdefgh" + LINK_OFF)
+	testing.expect_value(t, got,
+		"\e[1;1H" + LINK_A + "abcd" + "\e[2;1H" + "efgh" + LINK_OFF + "\e[3;1H")
+}
+
+@(test)
+test_diff_repaint_prologue_closes_a_link_only_once_links_are_in_play :: proc(t: ^testing.T) {
+	// A program that never uses hyperlinks must emit byte-for-byte what it
+	// emitted before T3-C -- that is the entire compatibility guarantee, and
+	// diff_links_in_play is what delivers it.
+	h := harness_make(10, 3); defer harness_free(h)
+	testing.expect_value(t, frame(h, "hi"), "\e[0m\e[H\e[2J" + "hi" + "\e[2;1H")
+
+	// Once a link HAS been seen, a forced repaint closes any link the previous
+	// occupant of the terminal may have left open -- \e[0m does not do it (SGR
+	// and OSC 8 are independent attribute planes) and \e[2J does not either.
+	h2 := harness_make(10, 3); defer harness_free(h2)
+	got := frame(h2, LINK_A + "hi" + LINK_OFF)
+	testing.expect_value(t, got, "\e[0m" + LINK_OFF + "\e[H\e[2J" + LINK_A + "hi" + LINK_OFF + "\e[2;1H")
+}
+
+@(test)
+test_diff_renderer_clear_closes_an_open_link :: proc(t: ^testing.T) {
+	h := harness_make(10, 3); defer harness_free(h)
+	// A frame that ends inside a link already closes it (see
+	// test_diff_closes_a_link_left_open_at_the_end_of_a_frame), so reach
+	// renderer_clear with emit_link set by clearing mid-frame: drive one frame
+	// whose link IS closed, then assert clear emits no stray close.
+	frame(h, LINK_A + "ab" + LINK_OFF)
+	strings.builder_reset(&h.b)
+	renderer_clear(&h.r)
+	testing.expect_value(t, strings.to_string(h.b), "\e[H\e[J")
+}
+
+// A TRUNCATED ESCAPE IS A CONTRACT VIOLATION, so this test asserts what a
+// RELEASE build does with one and is compiled out of a strict build, where the
+// correct behaviour is the panic contract_test.odin pins instead. The two are
+// the same rule seen from both sides: a debug build refuses the input, a
+// release build degrades in the one direction that cannot open a link nobody
+// asked for.
+when !DIFF_STRICT {
+@(test)
+test_diff_an_unterminated_osc8_changes_nothing :: proc(t: ^testing.T) {
+	h := harness_make(10, 2); defer harness_free(h)
+	frame(h, "xx")
+	// No ST, no BEL: the terminal is still waiting for the rest of this
+	// sequence and will eat whatever is written next. Acting on half a URI
+	// would open a link nobody asked for, so the model treats it as no link
+	// change at all -- the same answer width.odin gives a truncated escape.
+	//
+	// The fragment is at the END of the view on purpose. An unterminated OSC
+	// swallows everything after it (skip_escape returns the end of the string,
+	// deliberately -- see its doc comment), so text placed after one is
+	// consumed as payload rather than painted. That is pre-existing width-layer
+	// behaviour, not something hyperlinks introduced, and putting the fragment
+	// first would test that instead of this.
+	got := frame(h, "ab" + "\e]8;;https://trunca")
+	testing.expect(t, !strings.contains(got, "\e]8"), "an unterminated OSC 8 must not become a link")
+	testing.expect_value(t, got, "\e[1;1Hab\e[2;1H")
+}
+}
+
+@(test)
+test_diff_accepts_bel_terminated_osc8_on_the_way_in :: proc(t: ^testing.T) {
+	h := harness_make(10, 2); defer harness_free(h)
+	frame(h, "xx")
+	// xterm's BEL convention is as common in the wild as the standard ST, so
+	// it is accepted on the way IN -- and normalised to ST on the way OUT, so
+	// there is exactly one spelling on the wire to reason about.
+	got := frame(h, "\e]8;;https://example.com/a\a" + "ab" + "\e]8;;\a")
+	testing.expect_value(t, got, "\e[1;1H" + LINK_A + "ab" + LINK_OFF + "\e[2;1H")
 }
 
 // ---------------------------------------------------------------------------

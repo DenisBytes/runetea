@@ -80,6 +80,35 @@ TOK_EMOJI := []string{"❤️", "\U0001F1EF\U0001F1F5", "\U0001F600"}
 @(private = "file")
 TOK_STYLE := []string{"\e[31m", "\e[1m", "\e[0m", "\e[4m", "\e[42m", "\e[38;5;120m"}
 
+// OSC 8 HYPERLINKS (T3-C). Zero width, like TOK_STYLE, and like TOK_STYLE they
+// are STATE: whatever is written after an open belongs to that link until the
+// next open or the close. Placed by the same mutator as every other token, so
+// the generator freely produces opens with no close, closes with no open,
+// links that straddle a wrap, links that fall off the bottom of the viewport,
+// and links whose run is later overwritten -- which is the point.
+//
+// Four entries, and each one earns its place:
+//   * two DIFFERENT URIs, so "the glyph is the same but the destination
+//     changed" is reachable -- the case a cell model that stored only styles
+//     cannot see at all.
+//   * one with an `id=` parameter, so "same URI, different link identity" is
+//     reachable. That is why screen_osc8 interns params AND URI rather than the
+//     URI alone.
+//   * the close.
+//
+// PYTE-SAFE. pyte's OSC parser consumes an ST- or BEL-terminated string whole
+// and dispatches only codes 0/1/2, so an OSC 8 is swallowed silently and
+// identically on both sides of its comparison. It has no link model, so it
+// cannot CHECK the links -- what it checks is that emitting them corrupted
+// nothing else, which is exactly the half the in-package oracle is weakest on.
+@(private = "file")
+TOK_LINK := []string{
+	"\e]8;;https://example.com\e\\",
+	"\e]8;;https://runetea.invalid/b\e\\",
+	"\e]8;id=7;https://example.com\e\\",
+	"\e]8;;\e\\",
+}
+
 // A running fuzz case: geometry, a document of tokenised lines, and the PRNG
 // state that drives the next mutation.
 Diff_Fuzz :: struct {
@@ -149,12 +178,15 @@ diff_fuzz_destroy :: proc(f: ^Diff_Fuzz) {
 fuzz_token :: proc(f: ^Diff_Fuzz) -> string {
 	roll := fuzz_n(f, 100)
 	switch {
-	case roll < 55: return TOK_ASCII[fuzz_n(f, len(TOK_ASCII))]
-	case roll < 75: return TOK_WIDE[fuzz_n(f, len(TOK_WIDE))]
-	case roll < 85:
+	case roll < 50: return TOK_ASCII[fuzz_n(f, len(TOK_ASCII))]
+	case roll < 70: return TOK_WIDE[fuzz_n(f, len(TOK_WIDE))]
+	case roll < 80:
 		if f.pyte_safe { return TOK_PRECOMPOSED[fuzz_n(f, len(TOK_PRECOMPOSED))] }
 		return TOK_COMBINING[fuzz_n(f, len(TOK_COMBINING))]
-	case roll < 93: return TOK_STYLE[fuzz_n(f, len(TOK_STYLE))]
+	case roll < 88: return TOK_STYLE[fuzz_n(f, len(TOK_STYLE))]
+	// No pyte_safe branch: an OSC 8 is swallowed identically by both models.
+	// See TOK_LINK.
+	case roll < 95: return TOK_LINK[fuzz_n(f, len(TOK_LINK))]
 	case:
 		if f.pyte_safe { return TOK_ASCII[fuzz_n(f, len(TOK_ASCII))] }
 		return TOK_EMOJI[fuzz_n(f, len(TOK_EMOJI))]

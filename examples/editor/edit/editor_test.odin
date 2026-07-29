@@ -1084,3 +1084,97 @@ test_styled_output_is_a_pure_function_of_the_profile :: proc(t: ^testing.T) {
 			"profile %v moved the caret's display column", p)
 	}
 }
+
+// The two comments in editor.odin that state HELP_LINE's width in columns
+// ("wider than an 80-column terminal, so it really does wrap in practice") were
+// wrong for as long as they existed: they said 105, the string is 101. A prose
+// claim about a measurement is a claim that rots, so it is pinned here.
+//
+// The NUMBER is not what matters -- 101 and 105 are both "wider than 80", so
+// nothing behaved differently -- what matters is that the comments cannot drift
+// again without something failing. If HELP_LINE is edited, update both comments
+// and this constant together.
+@(test)
+test_help_line_is_as_wide_as_its_comments_claim :: proc(t: ^testing.T) {
+	HELP_LINE_COLS :: 101
+	testing.expect_value(t, rt.display_width(HELP_LINE), HELP_LINE_COLS)
+	// And the property the comments are actually ABOUT: it wraps at 80.
+	testing.expect(t, HELP_LINE_COLS > 80, "the click-mapping comment assumes HELP_LINE wraps on an 80-column terminal")
+	testing.expect_value(t, rt.rows_for_line(HELP_LINE, 80), 2)
+}
+
+// THE CONTRACT CHECKER, POINTED AT A REAL VIEW.
+//
+// runetea/contract_test.odin proves view_diff_safe classifies escapes
+// correctly; this proves the classification is USEFUL -- that the one non-toy
+// view in this repository actually satisfies the contract, across every colour
+// profile and with the caret in the awkward places.
+//
+// It also turns two of this editor's own design decisions into checked
+// properties instead of comments: that Tab indents with spaces rather than a
+// literal 0x09 (TAB_WIDTH), and that a pasted C0 byte is dropped rather than
+// inserted. Either one regressing would put a control byte in the view, which
+// under rt.Render_Mode.Diff is a screen the renderer models wrongly and never
+// notices -- see examples/editor/main.odin's own note on why it cares.
+@(test)
+test_the_editors_view_satisfies_the_diff_renderers_contract :: proc(t: ^testing.T) {
+	for p in ([?]rg.Profile{.None, .ANSI, .ANSI256, .True_Color}) {
+		m := init("The quick brown fox\nSecond line\n\tliteral tab in the SOURCE\nfourth", p)
+		m.term_w, m.term_h = DIFF_COLS, 30
+
+		// A spread of states: fresh, help toggled, caret moved, text edited,
+		// and a paste containing exactly the bytes that would break it.
+		mutate := [?]proc(m: ^Model){
+			proc(m: ^Model) {},
+			proc(m: ^Model) { m.help = !m.help },
+			proc(m: ^Model) { apply_key(m, rt.Key_Msg{code = .Down}); apply_key(m, rt.Key_Msg{code = .End}) },
+			proc(m: ^Model) { apply_key(m, rt.Key_Msg{code = .Tab}) },
+			proc(m: ^Model) {
+				update(m, rt.Paste_Start_Msg{}, context.temp_allocator)
+				for r in "pa\tsted\ttabs" { apply_key(m, rt.Key_Msg{code = .Rune, r = r, pasted = true}) }
+				update(m, rt.Paste_End_Msg{}, context.temp_allocator)
+			},
+			proc(m: ^Model) { apply_key(m, rt.Key_Msg{code = .Page_Down}) },
+		}
+		for mut in mutate {
+			mut(&m)
+			v := view(m, context.temp_allocator)
+			ok, at, why := rt.view_diff_safe(v)
+			lo := max(at - 20, 0)
+			hi := min(at + 20, len(v))
+			testing.expectf(t, ok,
+				"profile %v: the editor's view violates the .Diff contract (%v) at byte %d: %q",
+				p, why, at, v[lo:hi])
+		}
+	}
+	free_all(context.temp_allocator)
+}
+
+// The loader's own half of the contract above, pinned directly so a regression
+// names the cause rather than only the symptom.
+//
+// This was a LIVE BUG until rt.view_diff_safe was pointed at the editor's view:
+// every other route into the document refused C0 bytes (apply_key's paste
+// branch takes only k.r >= 0x20; the Tab key inserts spaces) but init let a
+// literal 0x09 straight through -- so opening a tab-indented file, the single
+// most ordinary thing to do with an editor, put a cursor-moving control byte in
+// the view.
+@(test)
+test_loading_a_document_sanitises_control_characters :: proc(t: ^testing.T) {
+	m := init("\tindented\nbell\ahere\nnul\x00byte\ndel\x7Fbyte")
+
+	// A tab becomes exactly the TAB_WIDTH spaces the Tab KEY inserts, so a
+	// loaded document and a typed one indent identically.
+	testing.expect_value(t, line_text(m, 0, context.temp_allocator), "    indented")
+	// Every other C0 (and DEL) is dropped, matching the paste branch.
+	testing.expect_value(t, line_text(m, 1, context.temp_allocator), "bellhere")
+	testing.expect_value(t, line_text(m, 2, context.temp_allocator), "nulbyte")
+	testing.expect_value(t, line_text(m, 3, context.temp_allocator), "delbyte")
+
+	// And the property that actually matters, stated as itself.
+	v := view(m, context.temp_allocator)
+	ok, at, why := rt.view_diff_safe(v)
+	testing.expectf(t, ok, "a loaded document must not put %v in the view (byte %d)", why, at)
+
+	free_all(context.temp_allocator)
+}

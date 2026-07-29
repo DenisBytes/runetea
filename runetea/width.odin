@@ -109,7 +109,10 @@ display_width :: proc(s: string, opts := Width_Options{}) -> int {
 // rows_for_line. One scanner, one answer.
 @(private = "package")
 ESC :: 0x1B
-@(private = "file")
+// PACKAGE-PRIVATE, not file-private (T3-C): screen.odin's OSC 8 parser has to
+// recognise the same BEL terminator this scanner consumes, and two spellings of
+// 0x07 in one package is one chance for them to disagree.
+@(private = "package")
 BEL :: 0x07
 
 // skip_escape returns the index one past the escape sequence beginning at

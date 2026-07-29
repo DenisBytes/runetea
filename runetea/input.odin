@@ -738,20 +738,37 @@ csi_tilde_code :: proc(param: int, legacy: Legacy_Key_Encoding) -> (code: Key_Co
 // The letter-final CSI keys: CSI <final>, CSI 1 <final>, CSI 1 ; <mod> <final>.
 // 'R' is F3, which collides with a cursor position report (CSI <row>;<col> R);
 // see decode_keys' doc comment.
-csi_letter_code :: proc(final: u8) -> (code: Key_Code, ok: bool) {
+//
+// `mods` IS THE MODIFIER THE FINAL BYTE ITSELF IMPLIES, which is empty for
+// every entry but one. 'Z' (CBT, "cursor backward tabulation") is Shift+Tab and
+// nothing else -- the shift is in the final byte, not in a parameter -- so it is
+// the only sequence in this grammar whose modifier cannot come from
+// xterm_mods. The caller UNIONS this with whatever an explicit `;<mod>`
+// parameter carried, which is what makes `CSI 1;5Z` (Ctrl+Shift+Tab) come out
+// with both rather than losing the shift.
+//
+// SHIFT+TAB WAS A REAL GAP, not a completeness exercise: `kcbt=\E[Z` is present
+// in 21 of the 40 terminfo entries on this machine, including xterm,
+// xterm-256color, tmux, tmux-256color, screen, rxvt and rxvt-unicode, and
+// "previous field" is a standard binding in every form-shaped TUI. It is also
+// what the Kitty protocol already produced here (CSI 9;2u -> Tab + {.Shift},
+// see kitty_key_code), so before this the same keypress decoded to a key under
+// Kitty and to nothing at all without it.
+csi_letter_code :: proc(final: u8) -> (code: Key_Code, mods: Modifiers, ok: bool) {
 	switch final {
-	case 'A': return .Up, true
-	case 'B': return .Down, true
-	case 'C': return .Right, true
-	case 'D': return .Left, true
-	case 'F': return .End, true
-	case 'H': return .Home, true
-	case 'P': return .F1, true
-	case 'Q': return .F2, true
-	case 'R': return .F3, true
-	case 'S': return .F4, true
+	case 'A': return .Up, {}, true
+	case 'B': return .Down, {}, true
+	case 'C': return .Right, {}, true
+	case 'D': return .Left, {}, true
+	case 'F': return .End, {}, true
+	case 'H': return .Home, {}, true
+	case 'P': return .F1, {}, true
+	case 'Q': return .F2, {}, true
+	case 'R': return .F3, {}, true
+	case 'S': return .F4, {}, true
+	case 'Z': return .Tab, {.Shift}, true   // CBT -- Shift+Tab
 	}
-	return .Rune, false
+	return .Rune, {}, false
 }
 
 // ---------------------------------------------------------------------------
@@ -1080,8 +1097,8 @@ csi_decode :: proc(p: []u8, has_intermed: bool, final: u8, legacy: Legacy_Key_En
 		return Key_Msg{kind = kind, code = code, mods = mods}, true
 	}
 
-	code := csi_letter_code(final) or_return
-	if count == 0 { return Key_Msg{kind = kind, code = code}, true }
+	code, base := csi_letter_code(final) or_return
+	if count == 0 { return Key_Msg{kind = kind, code = code, mods = base}, true }
 	if count > 2 { return {}, false }
 	// The first parameter of a modified cursor/function key is always 1 (the
 	// "one key" repeat count); anything else is a different sequence that
@@ -1090,9 +1107,9 @@ csi_decode :: proc(p: []u8, has_intermed: bool, final: u8, legacy: Legacy_Key_En
 	id := params[0]
 	if id < 0 { id = 1 }
 	if id != 1 { return {}, false }
-	if count == 1 { return Key_Msg{kind = kind, code = code}, true }
+	if count == 1 { return Key_Msg{kind = kind, code = code, mods = base}, true }
 	mods := xterm_mods(params[1]) or_return
-	return Key_Msg{kind = kind, code = code, mods = mods}, true
+	return Key_Msg{kind = kind, code = code, mods = mods + base}, true
 }
 
 // SS3: ESC O <digits>* <GL byte>. The digit run is the same 1+bitmask
@@ -1219,13 +1236,26 @@ ss3_decode :: proc(mod_digits: []u8, gl: u8) -> (key: Key_Msg, ok: bool) {
 //     folded onto Meta;
 //   - Kitty functional keys Key_Code has no member for: F13-F35, the whole
 //     keypad block, the media keys, and the lone modifier keypresses;
-//   - keypad/DECKPAM keys (ESC O M/X/j-y) and Begin (CSI E / ESC O E);
-//   - Shift+Tab (CSI Z) and rxvt's lowercase-letter arrow forms;
+//   - keypad/DECKPAM keys (ESC O M/X/j-y, ESC O w/x/y/q/s/t/u/v/r for the
+//     numeric block, ESC O M for keypad Enter) and Begin (CSI E / ESC O E);
+//   - rxvt's lowercase-letter arrow forms (CSI a/b/c/d) and its '$'-final
+//     shifted keys (CSI 3$ / CSI 7$ / CSI 8$);
+//   - the Linux console's own F1-F5 (CSI [ A .. CSI [ E), which are not CSI at
+//     all under this grammar -- the '[' is a final byte and the letter is left
+//     over. Linux console F6-F12 use the standard tilde forms and DO decode;
 //   - F13-F20 (CSI 25~ and up), which Key_Code does not carry;
 //   - terminfo. The tables here are the xterm/VT220 defaults, not the
 //     terminal's own key table; a terminal that reports something else is a
-//     terminal this decoder does not fully understand. See the real-terminal
-//     capture note in the T1-H report.
+//     terminal this decoder does not fully understand. MEASURED, not asserted:
+//     against every terminfo entry installed on this machine, the xterm
+//     defaults decode 136/157 capabilities for xterm and xterm-256color,
+//     136/138 for tmux and tmux-256color, and 23/25 for screen -- the misses
+//     being exactly the keypad block, F13-F20 and `kmous` (which is the mouse
+//     capability, decoded elsewhere). They decode 20/36 for the Linux console
+//     and 25/71 for rxvt-unicode. So "xterm defaults cover the common
+//     terminals" holds for the terminals people actually use, and does NOT hold
+//     for the Linux console's function keys or for rxvt's modified keys. See
+//     docs/LIMITATIONS.md.
 //   - cursor position reports. CSI <row>;<col> R and modified-F3
 //     (CSI 1;<mod> R) are the same bytes when row == 1, and this decoder
 //     resolves them as F3 because RuneTea never issues a DSR 6n. If that ever

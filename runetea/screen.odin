@@ -72,7 +72,19 @@ Cell :: struct {
 	// width 1. The distinction is what makes "overwriting half a wide cell
 	// repaints the whole cell" expressible at all.
 	width: u8,
-	style: u16,   // index into the shared Style_Table; 0 == default SGR
+	style: u16,   // index into the shared STYLE table (Style_Table); 0 == default SGR
+	// Index into the shared LINK table -- a second Style_Table instance, see
+	// Screen.links. 0 == "this cell is not part of a hyperlink".
+	//
+	// Structurally identical to `style` and for exactly the same reason: an
+	// OSC 8 hyperlink is terminal STATE that applies to every cell written
+	// while it is open, precisely like an SGR attribute. A cell model that
+	// tracks styles but not links reproduces the glyphs and loses the links,
+	// which is silent data loss -- see render.odin's .Diff section.
+	//
+	// FREE, in the literal sense: Cell carried 9 bytes of payload padded to 12,
+	// so this field consumes padding that already existed.
+	link:  u16,
 }
 
 // A cell's cluster bytes. Empty for a blank -- callers that need to PAINT a
@@ -91,6 +103,11 @@ cell_bytes :: proc(s: ^Screen, c: Cell) -> string {
 @(private = "package")
 cell_eq :: proc(sa: ^Screen, ca: Cell, sb: ^Screen, cb: Cell) -> bool {
 	if ca.width != cb.width || ca.style != cb.style || ca.len != cb.len { return false }
+	// `link` participates for the same reason `style` does: two cells with the
+	// same glyph but different hyperlinks are two different things the user can
+	// interact with, and a comparison that ignored it would leave a stale link
+	// on screen forever (the cell "did not change", so it is never repainted).
+	if ca.link != cb.link { return false }
 	if ca.len == 0 { return true }
 	return cell_bytes(sa, ca) == cell_bytes(sb, cb)
 }
@@ -113,6 +130,13 @@ cell_eq :: proc(sa: ^Screen, ca: Cell, sb: ^Screen, cb: Cell) -> bool {
 // RE-EMISSION IS ALWAYS CORRECT because the bytes are accumulated from a known
 // reset point: writing style s onto a terminal known to be at default
 // reproduces s exactly. See emit_style.
+//
+// TWO INSTANCES EXIST, not one (T3-C). The type is a content-addressed intern
+// table for ESCAPE PAYLOADS, and the renderer keeps one for SGR strings and a
+// second for OSC 8 hyperlink payloads (Screen.styles and Screen.links). They
+// are deliberately separate tables rather than one shared namespace: index 0
+// means "the default" in both, and the two vocabularies have nothing to say to
+// each other, so sharing would only make an overflow in one drop the other.
 @(private = "package")
 Style_Table :: struct {
 	spans: [dynamic]Style_Span,
@@ -196,6 +220,7 @@ Screen :: struct {
 	cells:      [dynamic]Cell,
 	text:       [dynamic]u8,
 	styles:     ^Style_Table,   // SHARED with the other Screen; not owned
+	links:      ^Style_Table,   // ditto, for OSC 8 hyperlink payloads
 
 	// --- modelled terminal state ---
 	// x is in [0, cols]: cols means DECAWM PENDING WRAP -- the last column has
@@ -203,13 +228,18 @@ Screen :: struct {
 	// file's header for why that state is kept rather than collapsed.
 	x, y:   int,
 	style:  u16,
+	// The hyperlink currently OPEN, i.e. the one every cell written from here on
+	// belongs to. Carries across frames exactly as `style` does, because the
+	// repaint stream this models never resets it between frames either.
+	link:   u16,
 	hidden: bool,
 }
 
 @(private = "package")
-screen_init :: proc(s: ^Screen, cols, rows: int, styles: ^Style_Table) {
+screen_init :: proc(s: ^Screen, cols, rows: int, styles: ^Style_Table, links: ^Style_Table) {
 	s.cols, s.rows = cols, rows
 	s.styles = styles
+	s.links  = links
 	resize(&s.cells, cols * rows)
 	clear(&s.text)
 	screen_blank(s)
@@ -230,9 +260,10 @@ screen_destroy :: proc(s: ^Screen) {
 @(private = "package")
 screen_blank :: proc(s: ^Screen) {
 	clear(&s.text)
-	for i in 0 ..< len(s.cells) { s.cells[i] = Cell{off = 0, len = 0, width = 1, style = 0} }
+	for i in 0 ..< len(s.cells) { s.cells[i] = Cell{off = 0, len = 0, width = 1, style = 0, link = 0} }
 	s.x, s.y = 0, 0
 	s.style  = 0
+	s.link   = 0
 	s.hidden = false
 }
 
@@ -247,6 +278,7 @@ screen_blank :: proc(s: ^Screen) {
 screen_copy :: proc(dst, src: ^Screen) {
 	dst.cols, dst.rows = src.cols, src.rows
 	dst.styles = src.styles
+	dst.links  = src.links
 	resize(&dst.cells, len(src.cells))
 	clear(&dst.text)
 	for c, i in src.cells {
@@ -261,6 +293,7 @@ screen_copy :: proc(dst, src: ^Screen) {
 	}
 	dst.x, dst.y  = src.x, src.y
 	dst.style     = src.style
+	dst.link      = src.link
 	dst.hidden    = src.hidden
 }
 
@@ -272,25 +305,29 @@ screen_at :: proc(s: ^Screen, x, y: int) -> Cell {
 // Writes a cluster into cell (x, y). The bytes are appended to s.text -- see
 // screen_copy for why that is safe to do unboundedly within a frame.
 @(private = "file")
-put_cell :: proc(s: ^Screen, x, y: int, span: string, width: u8, style: u16) {
+put_cell :: proc(s: ^Screen, x, y: int, span: string, width: u8, style: u16, link: u16) {
 	// A WRITTEN SPACE AND AN ERASED CELL ARE THE SAME THING ON SCREEN, and are
 	// normalised to the same representation here (len == 0) so that they compare
 	// equal. Without this the diff would repaint a cell every time a view
 	// replaced an erased gap with a literal space or vice versa -- and, worse,
 	// the emitter (which paints a blank AS a space) would leave the model
 	// describing something the terminal is not.
+	// A SPACE WRITTEN INSIDE A HYPERLINK IS STILL INSIDE IT (`link` survives the
+	// normalisation below), which is what makes "Click here" one link rather
+	// than two. An ERASED cell is the opposite case and is handled by
+	// blank_cell, which clears the link.
 	if span == " " {
-		s.cells[y * s.cols + x] = Cell{off = 0, len = 0, width = width, style = style}
+		s.cells[y * s.cols + x] = Cell{off = 0, len = 0, width = width, style = style, link = link}
 		return
 	}
 	// A cluster longer than 64 KiB cannot be addressed by `len` (u16). Nothing
 	// real produces one; store it as a blank rather than truncating to a corrupt
 	// prefix, which would put invalid UTF-8 on the wire.
 	if len(span) > int(max(u16)) {
-		s.cells[y * s.cols + x] = Cell{off = 0, len = 0, width = width, style = style}
+		s.cells[y * s.cols + x] = Cell{off = 0, len = 0, width = width, style = style, link = link}
 		return
 	}
-	c := Cell{off = 0, len = u16(len(span)), width = width, style = style}
+	c := Cell{off = 0, len = u16(len(span)), width = width, style = style, link = link}
 	if len(span) > 0 {
 		c.off = u32(len(s.text))
 		append(&s.text, span)
@@ -298,9 +335,26 @@ put_cell :: proc(s: ^Screen, x, y: int, span: string, width: u8, style: u16) {
 	s.cells[y * s.cols + x] = c
 }
 
+// AN ERASED CELL CARRIES NO HYPERLINK -- link = 0, unconditionally, even when a
+// link is open at the moment of the erase. Two reasons, and the second is the
+// load-bearing one:
+//
+//   * It is what a terminal does. xterm-family terminals keep the hyperlink id
+//     in the cell, and erasing the cell erases it along with the glyph.
+//   * IT IS TRUE ON EVERY TERMINAL FOR THE STREAM THE DIFF RENDERER EMITS,
+//     because that emitter closes the link before every \e[K it writes (see
+//     emit_row) -- so nothing is open when the erase runs and no terminal can
+//     record one. The model does not have to be right about a debatable case,
+//     because the emitter never puts the terminal in it.
+//
+// The .Full_Screen repaint, which blasts the view's own bytes, CAN put the
+// terminal in it -- a view whose line opens a hyperlink and never closes it
+// before the renderer's trailing \e[K. That is a documented view-side contract
+// (close your hyperlinks), not something a cell model can fix; see
+// docs/LIMITATIONS.md.
 @(private = "file")
 blank_cell :: proc(s: ^Screen, x, y: int, style: u16) {
-	s.cells[y * s.cols + x] = Cell{off = 0, len = 0, width = 1, style = style}
+	s.cells[y * s.cols + x] = Cell{off = 0, len = 0, width = 1, style = style, link = 0}
 }
 
 // LF / IND: down one row, scrolling the whole screen up if already on the last.
@@ -418,10 +472,13 @@ screen_put :: proc(s: ^Screen, span: string, w: int) {
 		screen_index(s)
 	}
 
-	put_cell(s, s.x, s.y, span, u8(w), s.style)
+	put_cell(s, s.x, s.y, span, u8(w), s.style, s.link)
 	if w == 2 && s.x + 1 < s.cols {
-		// The continuation half. Blank bytes, width 0 -- see Cell.width.
-		s.cells[s.y * s.cols + s.x + 1] = Cell{off = 0, len = 0, width = 0, style = s.style}
+		// The continuation half. Blank bytes, width 0 -- see Cell.width. It
+		// takes the head's link as well as its style: the two halves are one
+		// glyph and must never differ in any attribute, or emit_row's wide-pair
+		// reasoning stops holding.
+		s.cells[s.y * s.cols + s.x + 1] = Cell{off = 0, len = 0, width = 0, style = s.style, link = s.link}
 	}
 	// min(): a wide cluster written in the LAST column advances to `cols`
 	// (pending wrap), it does not spill into the next row. See this file's
@@ -435,10 +492,12 @@ screen_put :: proc(s: ^Screen, span: string, w: int) {
 //
 // ACCUMULATE, DO NOT INTERPRET (see Style_Table). "\e[0m" and "\e[m" reset to
 // index 0; anything else ending in 'm' is appended to whatever is already
-// active. A NON-SGR escape (cursor movement, OSC, DCS) is IGNORED here --
-// stated as a limitation rather than hidden: a view that embeds its own cursor
-// motion is lying to the renderer about where its text lands, and no cell model
-// can survive that. Views contain styling; they must not contain motion.
+// active. A NON-SGR escape that is not an OSC 8 hyperlink (cursor movement,
+// DCS, other OSCs) is IGNORED here -- stated as a limitation rather than
+// hidden: a view that embeds its own cursor motion is lying to the renderer
+// about where its text lands, and no cell model can survive that. Views contain
+// styling and hyperlinks; they must not contain motion. view_diff_safe
+// (contract.odin) is the checkable form of that sentence.
 //
 // ok=false means the style table overflowed; the caller forces a repaint.
 @(private = "package")
@@ -480,6 +539,74 @@ screen_sgr :: proc(s: ^Screen, seq: string, scratch: ^[dynamic]u8) -> (ok: bool)
 @(private = "package")
 STYLE_BYTES_MAX :: 1 << 20
 
+// The bytes an OSC 8 hyperlink escape opens with, and the two ways it can end.
+// Both terminators are accepted on the way IN (xterm's BEL convention is as
+// common in the wild as the standard ST) and only ST is ever written on the way
+// OUT -- one spelling on the wire means one spelling to reason about, and ST is
+// the one the OSC 8 specification itself uses.
+@(private = "package")
+OSC8_OPEN :: "\e]8;"
+@(private = "package")
+ST :: "\e\\"
+
+// Applies one OSC 8 hyperlink escape to the modelled link state. `seq` is the
+// full escape, ESC included, exactly as skip_escape delimited it.
+//
+// THE WIRE FORM is  OSC 8 ; <params> ; <URI> ST|BEL , where <params> is a
+// (usually empty) ':'-separated key=value list -- `id=` is the only one anyone
+// uses, and it exists so two non-adjacent runs can be marked as ONE link. An
+// EMPTY URI is the protocol's "close the current link", which is why the close
+// sequence is the slightly odd-looking "\e]8;;\e\\".
+//
+// WHAT IS INTERNED IS `<params>;<URI>` -- everything between the "8;" and the
+// terminator, verbatim. Not the URI alone, and that is deliberate: `id=1;u` and
+// `id=2;u` are two DIFFERENT links to the terminal even though the destination
+// matches, and folding them together would make the diff skip a cell whose link
+// identity genuinely changed. Same "accumulate, do not interpret" rule
+// screen_sgr follows, and it buys the same thing: any OSC 8 parameter invented
+// after this was written travels through untouched.
+//
+// AN UNTERMINATED OSC 8 CHANGES NOTHING. skip_escape returns the end of the
+// string for one, so the payload is a fragment whose real tail is whatever bytes
+// the application writes next; acting on half a URI would open a link to
+// somewhere nobody asked for. Dropped instead -- the same answer width.odin
+// gives a truncated escape, for the same reason.
+//
+// ok=false means the link table overflowed; the caller forces a repaint,
+// exactly as it does for the style table.
+@(private = "package")
+screen_osc8 :: proc(s: ^Screen, seq: string) -> (ok: bool) {
+	if len(seq) < len(OSC8_OPEN) || seq[:len(OSC8_OPEN)] != OSC8_OPEN { return true }
+
+	body := seq[len(OSC8_OPEN):]
+	switch {
+	case len(body) >= len(ST) && body[len(body) - len(ST):] == ST:
+		body = body[:len(body) - len(ST)]
+	case len(body) >= 1 && body[len(body) - 1] == BEL:
+		body = body[:len(body) - 1]
+	case:
+		return true   // unterminated: not a link yet, so not a link change
+	}
+
+	// Split at the FIRST ';' -- params first, URI (which may itself contain ';')
+	// second. No ';' at all is malformed; ignore it rather than guessing which
+	// half is missing.
+	semi := -1
+	for i in 0 ..< len(body) {
+		if body[i] == ';' { semi = i; break }
+	}
+	if semi < 0 { return true }
+
+	if semi + 1 >= len(body) {
+		s.link = 0   // empty URI: close
+		return true
+	}
+	idx, iok := style_intern(s.links, body)
+	if !iok { return false }
+	s.link = idx
+	return true
+}
+
 // Writes a run of view text -- clusters AND embedded escapes -- at the cursor.
 //
 // THE ESCAPE SPLIT IS display_width's, BYTE FOR BYTE (same ESC scan, same
@@ -497,12 +624,27 @@ screen_write :: proc(s: ^Screen, text: string, scratch: ^[dynamic]u8, opts := Wi
 		if text[i] != ESC { i += 1; continue }
 		screen_write_plain(s, text[seg:i], opts)
 		j := skip_escape(text, i)   // always > i, so this loop always advances
-		if !screen_sgr(s, text[i:j], scratch) { ok = false }
+		if !screen_escape(s, text[i:j], scratch) { ok = false }
 		i   = j
 		seg = i
 	}
 	screen_write_plain(s, text[seg:], opts)
 	return
+}
+
+// THE ONE PLACE an escape found in a view is routed to the state it changes.
+// Exactly two escapes change cell state -- SGR and OSC 8 -- and everything else
+// is consumed for width and dropped, which is the .Diff contract stated in
+// render.odin and checkable via view_diff_safe (contract.odin).
+//
+// Written as a router rather than as two calls at the call site because
+// vt_replay (diff_oracle_test.odin) has to make exactly the same routing
+// decision from the byte stream, and one shared entry point is one decision
+// instead of two that can drift.
+@(private = "package")
+screen_escape :: proc(s: ^Screen, seq: string, scratch: ^[dynamic]u8) -> (ok: bool) {
+	if len(seq) >= 2 && seq[1] == ']' { return screen_osc8(s, seq) }
+	return screen_sgr(s, seq, scratch)
 }
 
 @(private = "file")

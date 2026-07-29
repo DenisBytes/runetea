@@ -1,5 +1,11 @@
 package runegloss
 
+// RuneGloss's own limitations -- no wrapping, no truncation, no layout joins,
+// `width`/`height` as FLOORS rather than clamps, non-canonical SGR resets that
+// silently lose the outer style, the colour-conversion caps -- are consolidated
+// with RuneTea's in ../docs/LIMITATIONS.md, section 7. Read it before assuming
+// this is Lipgloss with different spelling; it is deliberately a subset.
+//
 // The Style value and its setters.
 //
 // ODIN HAS NO METHOD CHAINING AND NO CAPTURING CLOSURES, so Lipgloss's fluent

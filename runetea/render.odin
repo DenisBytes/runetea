@@ -88,6 +88,11 @@ Renderer :: struct {
 	screens:      [2]Screen,
 	front:        int,
 	styles:       Style_Table,
+	// T3-C. The OSC 8 hyperlink payloads any cell may point at, interned on the
+	// same terms and for the same reasons as `styles` -- see Style_Table. A
+	// second table rather than a shared one: index 0 has to mean "no link" here
+	// and "default SGR" there, and an overflow in one must not drop the other.
+	links:        Style_Table,
 	// Reused across frames so a frame allocates nothing: SGR accumulation
 	// scratch, and the per-row dirty mask the emitter expands wide pairs into.
 	sgr_scratch:  [dynamic]u8,
@@ -113,6 +118,9 @@ Renderer :: struct {
 	emit_x:       int,
 	emit_y:       int,
 	emit_style:   u16,
+	// The hyperlink the emitter believes is OPEN on the terminal, on exactly the
+	// same terms as emit_style. 0 == none open.
+	emit_link:    u16,
 }
 
 // Which of the two renderers a Renderer is.
@@ -207,6 +215,7 @@ renderer_init :: proc(
 	r.front         = 0
 	r.emit_x, r.emit_y = 0, 0
 	r.emit_style    = 0
+	r.emit_link     = 0
 }
 
 // Releases the cell grids. NO-OP unless this Renderer actually ran in .Diff
@@ -223,6 +232,7 @@ renderer_destroy :: proc(r: ^Renderer) {
 	screen_destroy(&r.screens[0])
 	screen_destroy(&r.screens[1])
 	style_table_destroy(&r.styles)
+	style_table_destroy(&r.links)
 	delete(r.sgr_scratch)
 	delete(r.dirty)
 	r.sgr_scratch = nil
@@ -606,11 +616,18 @@ paint_frame :: proc(
 //     is nothing to model. With either unknown the frame degrades to
 //     .Full_Screen's exact byte stream and the model is invalidated, so the
 //     first frame after a size arrives repaints in full.
-//   * VIEWS MAY CONTAIN STYLING, NOT MOTION. SGR escapes are tracked per cell.
-//     Any other escape (cursor movement, OSC, DCS) is consumed for width
-//     purposes -- exactly as display_width already does -- and otherwise
-//     ignored, which means a view that moves the terminal's cursor itself is
-//     lying to the model. .Full_Screen tolerates that; this mode cannot.
+//   * VIEWS MAY CONTAIN STYLING AND HYPERLINKS, NOT MOTION. SGR escapes and
+//     OSC 8 hyperlinks are both tracked per cell (T3-C). Any OTHER escape
+//     (cursor movement, DCS, other OSCs) is consumed for width purposes --
+//     exactly as display_width already does -- and otherwise ignored, which
+//     means a view that moves the terminal's cursor itself is lying to the
+//     model. .Full_Screen tolerates that; this mode cannot. view_diff_safe
+//     (contract.odin) turns that sentence into something a caller can CHECK,
+//     and a debug build asserts it on every frame -- see DIFF_STRICT.
+//   * A HYPERLINK MUST BE CLOSED BEFORE THE END OF ITS LINE. The model treats
+//     an erased cell as unlinked, and the diff emitter guarantees that by
+//     closing the link before every \e[K it writes; the .Full_Screen repaint,
+//     which blasts the view's own bytes, cannot. See docs/LIMITATIONS.md.
 //   * A WIDE CLUSTER LANDING ON THE RIGHT MARGIN is modelled as written IN that
 //     column (see screen.odin's header). xterm-family terminals instead leave
 //     the cell blank and wrap the cluster. This is the same one-cell optimism
@@ -627,6 +644,9 @@ paint_frame :: proc(
 //                catch anything.
 //   skip_cell    drops the last changed cell of every row.
 //   drop_style   never re-emits SGR.
+//   drop_link    never re-emits an OSC 8 hyperlink. Catching this is what
+//                proves the oracle actually SEES links rather than merely
+//                tolerating them -- see difffuzz.odin's TOK_LINK.
 //   narrow_wide  advances the cursor by one column after a wide cluster.
 //   no_pair_expand  drops the wide-cell expansion in emit_row. MUST NOT
 //                DIVERGE, and that is a finding, not an oversight -- see
@@ -671,6 +691,17 @@ render_diff :: proc(r: ^Renderer, lines: []string, cur: Cursor, allow_retry := t
 		return
 	} else {
 
+	// THE VIEW CONTRACT, ASSERTED RATHER THAN ONLY DOCUMENTED (contract.odin).
+	// Debug builds only, and before anything else in the frame so the panic
+	// points at the frame that caused it rather than at a screen that has
+	// already drifted. Note it runs even on the degraded no-size path below:
+	// that path emits .Full_Screen's bytes, which TOLERATE motion, so a view
+	// that only ever ran without a known size would otherwise pass every test
+	// and break the first time a real terminal size arrived.
+	when DIFF_STRICT {
+		for line in lines { diff_contract_assert(line) }
+	}
+
 	// NO SIZE, NO VIEWPORT, NO MODEL. Same "do not guess" rule rows_for_line
 	// states for an unknown width -- and the same consequence: the frame is
 	// simply .Full_Screen's, byte for byte, including its DECTCEM pair. The
@@ -707,6 +738,7 @@ render_diff :: proc(r: ^Renderer, lines: []string, cur: Cursor, allow_retry := t
 		screen_blank(prev)
 		r.emit_x, r.emit_y = 0, 0
 		r.emit_style       = 0
+		r.emit_link        = 0
 		r.force_repaint    = false
 	}
 
@@ -759,6 +791,18 @@ render_diff :: proc(r: ^Renderer, lines: []string, cur: Cursor, allow_retry := t
 		// SGR first: \e[2J erases with the ACTIVE background, so clearing under
 		// an unknown (or coloured) style would paint the screen that colour.
 		strings.write_string(r.out, SGR_RESET)
+		// AND CLOSE ANY OPEN HYPERLINK, for the same "the repaint block above
+		// asserted the terminal is at a known state, so make it true" reason --
+		// SGR_RESET does NOT close an OSC 8 link (they are independent attribute
+		// planes) and a link left open by whatever ran before us would otherwise
+		// be inherited by the first cell this frame writes.
+		//
+		// CONDITIONAL, unlike SGR_RESET, and that is the whole compatibility
+		// story of T3-C: a program that never uses hyperlinks emits exactly the
+		// bytes it emitted before. paint_frame has already run by this point, so
+		// a first frame that DOES contain a link has already interned it and
+		// takes this branch. See diff_links_in_play.
+		if diff_links_in_play(r) { strings.write_string(r.out, LINK_CLOSE) }
 		strings.write_string(r.out, HOME)
 		strings.write_string(r.out, ED2)
 	}
@@ -785,6 +829,15 @@ render_diff :: proc(r: ^Renderer, lines: []string, cur: Cursor, allow_retry := t
 	if r.emit_style != 0 {
 		strings.write_string(r.out, SGR_RESET)
 		r.emit_style = 0
+	}
+	// CLOSE THE FRAME'S HYPERLINK, on exactly the reasoning above and with one
+	// extra edge to it: an OSC 8 link left open does not merely tint what comes
+	// next, it makes it CLICKABLE -- including the user's shell prompt after the
+	// program exits. Same emit_link-cleared-with-the-write discipline, same
+	// 0-byte contract on an idle frame.
+	if r.emit_link != 0 {
+		strings.write_string(r.out, LINK_CLOSE)
+		r.emit_link = 0
 	}
 
 	when DIFF_FAULT != "no_cursor" {
@@ -813,19 +866,26 @@ diff_grid_ensure :: proc(r: ^Renderer) {
 	if r.grid_ready && r.screens[0].cols == w && r.screens[0].rows == h { return }
 	if !r.grid_ready {
 		style_table_init(&r.styles)
+		style_table_init(&r.links)
 		r.grid_ready = true
 	}
-	screen_init(&r.screens[0], w, h, &r.styles)
-	screen_init(&r.screens[1], w, h, &r.styles)
+	screen_init(&r.screens[0], w, h, &r.styles, &r.links)
+	screen_init(&r.screens[1], w, h, &r.styles, &r.links)
 	resize(&r.dirty, w)
 	r.front         = 0
 	r.force_repaint = true
 }
 
+// Drops BOTH intern tables, not just the one that overflowed. They are indexed
+// out of the same cells, and screen_blank (below) resets every cell's `style`
+// AND `link` to 0 -- so keeping one table alive would leave it holding entries
+// nothing points at, which is not wrong but is not worth a second code path.
 @(private = "file")
 diff_styles_reset :: proc(r: ^Renderer) {
 	style_table_destroy(&r.styles)
 	style_table_init(&r.styles)
+	style_table_destroy(&r.links)
+	style_table_init(&r.links)
 	screen_blank(&r.screens[0])
 	screen_blank(&r.screens[1])
 	r.force_repaint = true
@@ -875,6 +935,50 @@ diff_move :: proc(r: ^Renderer, x, y: int) {
 // first unless we are already at the default. Costs 4 bytes per style
 // transition and removes an entire class of "the leftover attribute from three
 // cells ago is still on" bugs.
+// The OSC 8 sequence that closes whatever hyperlink is open. See screen.odin's
+// screen_osc8 for why an empty URI is the protocol's "close".
+@(private = "file")
+LINK_CLOSE :: OSC8_OPEN + ";" + ST
+
+// Whether this Renderer has ever seen a hyperlink at all.
+//
+// THE ZERO-COST GUARD, and the reason every byte-exact expectation in this
+// package is unchanged by T3-C: a program whose views contain no OSC 8 never
+// interns one, so this is false forever and not one link byte is ever written.
+// Index 0 is reserved at table init, so "> 1" is "at least one real entry".
+@(private = "file")
+diff_links_in_play :: proc(r: ^Renderer) -> bool {
+	return len(r.links.spans) > 1
+}
+
+// Brings the terminal's open hyperlink to `l`, writing nothing if it is already
+// there. The exact shape of diff_style, and it has to be: a hyperlink is
+// terminal state that applies to everything written next, so the emitter owes
+// it the same "establish before the cell, never assume" discipline.
+//
+// NO RESET-VIA-DEFAULT DANCE, unlike diff_style. An OSC 8 open REPLACES the
+// current link outright rather than accumulating onto it, so going from link A
+// to link B is one sequence, not a close and an open. (diff_style needs the
+// round trip because a style is stored as bytes accumulated from a reset point;
+// a link is stored whole.)
+@(private = "file")
+diff_link :: proc(r: ^Renderer, l: u16) {
+	when DIFF_FAULT == "drop_link" {
+		// INJECTED FAULT: the emitter never re-establishes a cell's hyperlink.
+		return
+	} else {
+	if r.emit_link == l { return }
+	if l == 0 {
+		strings.write_string(r.out, LINK_CLOSE)
+	} else {
+		strings.write_string(r.out, OSC8_OPEN)
+		strings.write_string(r.out, style_bytes(&r.links, l))
+		strings.write_string(r.out, ST)
+	}
+	r.emit_link = l
+	}
+}
+
 @(private = "file")
 diff_style :: proc(r: ^Renderer, s: u16) {
 	when DIFF_FAULT == "drop_style" {
@@ -978,10 +1082,16 @@ emit_row :: proc(r: ^Renderer, y: int, prev, cur: ^Screen) {
 	// or only the background is terminal-dependent, so those cells are written
 	// as real spaces instead. That is the "if you scope styling down, say what
 	// you did" line, and this is the one place it is scoped down.
+	//
+	// A LINKED BLANK IS NOT ELIGIBLE EITHER (c.link != 0), for a stronger reason
+	// than the styled case: \e[K would erase the cell, and the model says an
+	// erased cell carries no link (blank_cell), so using EL there would drop a
+	// hyperlink the frame asked for. Written as a real space under an open link
+	// instead.
 	tail := cols
 	for tail > 0 {
 		c := cur.cells[base + tail - 1]
-		if c.len != 0 || c.width != 1 || c.style != 0 { break }
+		if c.len != 0 || c.width != 1 || c.style != 0 || c.link != 0 { break }
 		tail -= 1
 	}
 	use_el := false
@@ -1027,6 +1137,7 @@ emit_row :: proc(r: ^Renderer, y: int, prev, cur: ^Screen) {
 		}
 		diff_move(r, x, y)
 		diff_style(r, c.style)
+		diff_link(r, c.link)
 		if c.len == 0 {
 			// A blank is painted as a space. Indistinguishable on screen, and
 			// the model normalises the two (see put_cell), so this cannot make
@@ -1047,6 +1158,12 @@ emit_row :: proc(r: ^Renderer, y: int, prev, cur: ^Screen) {
 	if use_el {
 		diff_move(r, el_at, y)
 		diff_style(r, 0)
+		// CLOSE THE LINK BEFORE ERASING. Whether a terminal records the open
+		// hyperlink on the cells \e[K blanks is not something the standards fix,
+		// so the emitter refuses to find out: with nothing open, every terminal
+		// agrees the erased tail is unlinked, which is exactly what blank_cell
+		// models. The model is right by construction rather than by hope.
+		diff_link(r, 0)
 		strings.write_string(r.out, EL)
 		// \e[K does not move the cursor.
 	}
@@ -1163,6 +1280,13 @@ renderer_clear :: proc(r: ^Renderer) {
 		if r.emit_style != 0 {
 			strings.write_string(r.out, SGR_RESET)
 			r.emit_style = 0
+		}
+		// And any open hyperlink, for the reason render_diff's frame-closing
+		// reset gives: this is the last thing the renderer writes, so a link
+		// left open here is a link the user's shell inherits.
+		if r.emit_link != 0 {
+			strings.write_string(r.out, LINK_CLOSE)
+			r.emit_link = 0
 		}
 		strings.write_string(r.out, HOME)
 		strings.write_string(r.out, ED)

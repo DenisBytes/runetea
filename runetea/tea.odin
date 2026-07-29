@@ -1,5 +1,21 @@
 package runetea
 
+// ============================================================================
+// START HERE. This file is RuneTea's entry point -- Program(T), run(), and the
+// event loop that drives them.
+//
+// BEFORE YOU BUILD ON THIS PACKAGE, READ docs/LIMITATIONS.md. It is the single
+// consolidated, user-facing list of what RuneTea does not do, does not do
+// fully, or does differently from what you would reasonably expect: the POD
+// Msg contract, cancellation being cooperative rather than preemptive, what a
+// recovered `update` panic leaves your model in, which platforms are real,
+// which terminal escapes a view may legally contain, and everything else. Each
+// entry says whether it is intrinsic or merely not-yet-built, when it bites,
+// and what to do instead, and cross-references the source comment that argues
+// the case. It exists so that none of that has to be discovered by running
+// into it.
+// ============================================================================
+
 import "core:fmt"
 import "core:mem"
 import "core:strings"
