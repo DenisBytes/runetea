@@ -813,3 +813,109 @@ test_inline_mode_emits_no_full_screen_escapes :: proc(t: ^testing.T) {
 		"\e[?25l" + "a\r\nb\r\n" + "\e[2A\e[1G" + "\e[?25h" +
 		"\e[?25l" + "\e[2B\r" + "\e[1A\e[2K\e[1A\e[2K" + "c\r\n" + "\e[?25h")
 }
+
+// ============================================================================
+// BUG 4: an inline frame TALLER than the screen.
+//
+// \e[<n>A clamps at the top margin. A frame of more physical rows than the
+// terminal has scrolls its own top rows into scrollback, where CUU cannot reach
+// them -- so a rewind that asks for all of them walks up FEWER rows than it
+// asked for, while the matching \e[<n>B walks down all of them. Home slides by
+// the difference, and because last_rows kept over-counting, the slide COMPOUNDED
+// every frame: the display degraded permanently instead of recovering.
+//
+// These tests are byte-exact at a known height, which is the only way to pin
+// it: the defect is entirely in a COUNT, and a count is invisible to anything
+// weaker than the exact byte stream.
+// ============================================================================
+
+@(test)
+test_inline_rewind_is_clamped_to_what_cuu_can_actually_reach :: proc(t: ^testing.T) {
+	b := strings.builder_make(); defer strings.builder_destroy(&b)
+	r: Renderer
+	// Height 3, width unknown -- so rows_for_line is 1 per logical line and the
+	// row count is exactly the line count, with nothing else in play.
+	renderer_init(&r, &b, 0, 3)
+
+	// Five rows onto a three-row terminal. Every line is still painted IN FULL:
+	// .Inline exists to leave output in the user's scrollback, so truncating
+	// here would discard the very thing the mode is for (contrast
+	// render_full_screen's "TRUNCATE AT THE BOTTOM", which protects an absolute
+	// origin .Inline does not have).
+	renderer_render(&r, "a\nb\nc\nd\ne")
+	testing.expect_value(t, strings.to_string(b), "a\r\nb\r\nc\r\nd\r\ne\r\n")
+
+	// Only 2 of those 5 rows are still on screen above the cursor (the terminal
+	// scrolled until the cursor hit the bottom row, leaving height-1 above it),
+	// so the next frame must rewind exactly 2 -- not 5.
+	strings.builder_reset(&b)
+	renderer_render(&r, "x")
+	testing.expect_value(t, strings.to_string(b),
+		"\e[1A\e[2K" + "\e[1A\e[2K" + "x\r\n")
+
+	// And it heals: one row fits, so the frame after that rewinds exactly 1 and
+	// the mode is back to its ordinary behaviour with no residue.
+	strings.builder_reset(&b)
+	renderer_render(&r, "y")
+	testing.expect_value(t, strings.to_string(b), "\e[1A\e[2K" + "y\r\n")
+}
+
+@(test)
+test_inline_cursor_park_is_clamped_so_the_up_down_pair_stays_balanced :: proc(t: ^testing.T) {
+	b := strings.builder_make(); defer strings.builder_destroy(&b)
+	r: Renderer
+	renderer_init(&r, &b, 0, 3)
+
+	// Caret on the FIRST line of a four-row frame on a three-row terminal. The
+	// unclamped park is \e[4A, which the terminal truncates to 2 -- and then the
+	// next frame's \e[4B walks down 4, permanently displacing home. The park is
+	// therefore clamped to the same reachable count the rewind uses, so the pair
+	// is symmetric by construction.
+	renderer_render(&r, "a\nb\nc\nd", Cursor{line = 0, col = 0, show = true})
+	testing.expect_value(t, strings.to_string(b),
+		"\e[?25l" + "a\r\nb\r\nc\r\nd\r\n" + "\e[2A\e[1G" + "\e[?25h")
+
+	// Walk back down by exactly what went up, then rewind exactly what is
+	// reachable.
+	strings.builder_reset(&b)
+	renderer_render(&r, "z")
+	testing.expect_value(t, strings.to_string(b),
+		"\e[?25l" + "\e[2B\r" + "\e[1A\e[2K" + "\e[1A\e[2K" + "z\r\n" + "\e[?25h")
+}
+
+@(test)
+test_inline_on_a_one_row_terminal_emits_no_zero_argument_cuu :: proc(t: ^testing.T) {
+	b := strings.builder_make(); defer strings.builder_destroy(&b)
+	r: Renderer
+	renderer_init(&r, &b, 0, 1)
+
+	// Nothing is ever reachable on a one-row terminal: the cursor is on the only
+	// row there is. "\e[0A" would NOT be a no-op -- a zero CSI parameter means
+	// one -- so the CUU is dropped entirely rather than emitted with a lying
+	// argument, and no frame ever rewinds.
+	renderer_render(&r, "a\nb", Cursor{line = 0, col = 0, show = true})
+	testing.expect_value(t, strings.to_string(b),
+		"\e[?25l" + "a\r\nb\r\n" + "\e[1G" + "\e[?25h")
+
+	strings.builder_reset(&b)
+	renderer_render(&r, "c")
+	testing.expect_value(t, strings.to_string(b), "c\r\n")
+}
+
+// THE PRE-EXISTING BEHAVIOUR MUST BE PRESERVED EXACTLY when the height is
+// unknown (0) -- no fd to query, a failed ioctl, output redirected, or any of
+// the many tests that never supply one. With no height there is no margin to
+// clamp against and guessing one would be strictly worse than the old
+// over-count, which at least matches what a tall terminal does.
+@(test)
+test_inline_with_an_unknown_height_rewinds_every_painted_row :: proc(t: ^testing.T) {
+	b := strings.builder_make(); defer strings.builder_destroy(&b)
+	r: Renderer
+	renderer_init(&r, &b)   // width AND height unknown
+
+	renderer_render(&r, "a\nb\nc\nd\ne")
+	strings.builder_reset(&b)
+	renderer_render(&r, "x")
+	testing.expect_value(t, strings.to_string(b),
+		"\e[1A\e[2K" + "\e[1A\e[2K" + "\e[1A\e[2K" + "\e[1A\e[2K" + "\e[1A\e[2K" + "x\r\n")
+}

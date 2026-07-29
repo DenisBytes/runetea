@@ -770,3 +770,147 @@ test_window_size_msg_updates_both_renderer_dimensions :: proc(t: ^testing.T) {
 	testing.expect_value(t, r.term_width, 80)
 	testing.expect_value(t, r.term_height, 24)
 }
+
+// ============================================================================
+// BUG 1: flush_frame was a single, unlooped posix.write whose result was
+// discarded.
+//
+// write(2) may transfer fewer bytes than asked and report success. The tail of
+// the frame was then silently dropped -- possibly MID-ESCAPE-SEQUENCE, leaving
+// the terminal reading the next frame's bytes as arguments to a sequence that
+// was never finished. term.odin's sticky cursor_hidden flag existed partly to
+// work around this exact call.
+//
+// FORCING A SHORT WRITE. A pipe whose write end is O_NONBLOCK returns a PARTIAL
+// count once its (64 KiB by default) buffer fills, rather than blocking -- which
+// is precisely the shape of the real hazard on a congested tty. Writing a
+// quarter of a megabyte through one guarantees it.
+// ============================================================================
+
+@(private = "file")
+Drain_Ctx :: struct {
+	fd:   posix.FD,
+	got:  [dynamic]u8,
+	want: int,
+}
+
+// Reads until EOF, until `want` bytes have arrived, or until the writer has
+// been silent for a second -- so that a FAILING run reports a byte count
+// instead of hanging the suite.
+@(private = "file")
+drain_body :: proc(th: ^thread.Thread) {
+	dc := cast(^Drain_Ctx)th.data
+	buf: [4096]u8
+	for len(dc.got) < dc.want {
+		pfd := posix.pollfd{fd = dc.fd, events = {.IN}}
+		if posix.poll(&pfd, 1, 1000) <= 0 { return }   // timeout or error: stop
+		n := posix.read(dc.fd, raw_data(buf[:]), len(buf))
+		if n <= 0 { return }                            // EOF or error: stop
+		append(&dc.got, ..buf[:n])
+	}
+}
+
+@(test)
+test_flush_frame_writes_the_whole_frame_through_a_short_writing_fd :: proc(t: ^testing.T) {
+	fds: [2]posix.FD
+	if !testing.expect(t, posix.pipe(&fds) == .OK, "could not open a pipe") { return }
+	defer posix.close(fds[0])
+
+	// Non-blocking WRITE end: once the pipe buffer is full, write(2) transfers
+	// what it can and returns that count instead of blocking. That is the short
+	// write, delivered on demand.
+	fl := transmute(posix.O_Flags)posix.fcntl(fds[1], .GETFL)
+	posix.fcntl(fds[1], .SETFL, fl + {.NONBLOCK})
+
+	// A quarter of a megabyte -- comfortably past any pipe buffer. The content
+	// is a repeating pattern so a truncation anywhere is a length mismatch, and
+	// the payload is deliberately made of escape sequences: dropping the tail of
+	// THIS frame cuts an escape in half, which is the failure the fix is for.
+	frame := strings.builder_make(); defer strings.builder_destroy(&frame)
+	for i in 0 ..< 16384 {
+		strings.write_string(&frame, "\e[1;31mxxxxxxxx\e[0m")
+		_ = i
+	}
+	want := strings.builder_len(frame)
+	testing.expect(t, want > 128 * 1024, "the frame must be bigger than any pipe buffer")
+
+	dc := Drain_Ctx{fd = fds[0], want = want}
+	defer delete(dc.got)
+	th := thread.create(drain_body)
+	defer thread.destroy(th)
+	th.data = &dc
+	th.init_context = context
+	thread.start(th)
+
+	expected := strings.clone(strings.to_string(frame)); defer delete(expected)
+
+	err := flush_frame(&frame, fds[1])
+	testing.expectf(t, err == nil, "flush_frame reported %v on a healthy pipe", err)
+
+	posix.close(fds[1])   // EOF, so the reader stops without waiting out its poll
+	thread.join(th)
+
+	// THE ASSERTION THE BUG FAILS: with one unlooped write only the first
+	// pipe-buffer's worth ever arrives.
+	testing.expectf(t, len(dc.got) == want,
+		"flush_frame delivered %d of %d bytes -- the tail of the frame was dropped", len(dc.got), want)
+	testing.expect(t, string(dc.got[:]) == expected, "the delivered bytes are not the frame")
+
+	// And the builder is emptied exactly once, whatever happened.
+	testing.expect_value(t, strings.builder_len(frame), 0)
+}
+
+// The other half of the policy: a write that CANNOT succeed must end the
+// session with a diagnosis, not spin and not crash. Writing to a read-only fd
+// fails with EBADF every time, on every platform, with no signal involved
+// (unlike a closed pipe, whose EPIPE is preceded by a SIGPIPE that would kill
+// the test runner).
+@(test)
+test_write_all_reports_an_unrecoverable_error_with_its_errno :: proc(t: ^testing.T) {
+	fd := posix.open("/dev/null", {})   // RDONLY is the default/zero flag set
+	if !testing.expect(t, fd >= 0, "could not open /dev/null") { return }
+	defer posix.close(fd)
+
+	err := write_all(fd, "\e[?25l")
+	te, is_terminal := err.(Terminal_Error)
+	if !testing.expectf(t, is_terminal, "a failed write must surface as Terminal_Error, got %v", err) { return }
+	// The errno is the whole point of carrying one: "write failed" cannot be
+	// acted on, "write failed: EBADF" can.
+	testing.expect_value(t, te.errno, posix.Errno.EBADF)
+	testing.expect(t, te.detail != "", "a Terminal_Error must say what failed")
+}
+
+// THE ERROR MUST REACH THE APPLICATION, not merely exist. flush_frame's
+// Terminal_Error is only worth returning if run() actually propagates it, so
+// this drives a whole session against an unwritable flush fd and asserts on
+// what run() hands back. Without the propagation the session would go on
+// painting frames nobody receives, forever, which is the silent-degradation
+// failure this codebase refuses.
+@(test)
+test_run_ends_with_a_terminal_error_when_the_frame_cannot_be_written :: proc(t: ^testing.T) {
+	// run() starts a Signal_Watcher whenever flush_fd >= 0, which blocks
+	// RuneTea's signals on THIS pool worker for the rest of the suite -- see
+	// signals_test.odin's own note. Undo it on the way out.
+	defer signal_unblock_for_child()
+
+	// Read-only: every write to it fails with EBADF, deterministically and with
+	// no signal involved.
+	null_ro := posix.open("/dev/null", {})
+	if !testing.expect(t, null_ro >= 0, "could not open /dev/null") { return }
+	defer posix.close(null_ro)
+
+	// run() returns from the initial paint, before the reader thread exists, so
+	// nothing ever closes this source on its own -- hence the explicit close,
+	// same as every other run()-based test in this file.
+	src := input_source_from_bytes(transmute([]u8)string("q"))
+	defer input_close(&src)
+
+	b := strings.builder_make(); defer strings.builder_destroy(&b)
+	p: Program(Counter)
+	program_init(&p, Counter{}, counter_update, counter_view)
+
+	err := run(&p, &src, &b, null_ro)
+	te, is := err.(Terminal_Error)
+	if !testing.expectf(t, is, "expected a Terminal_Error out of run(), got %v", err) { return }
+	testing.expect_value(t, te.errno, posix.Errno.EBADF)
+}

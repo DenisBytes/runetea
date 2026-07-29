@@ -60,13 +60,45 @@ thing that fails.
 The signal watcher uses it for its own stop nudge (`runetea/signals.odin:14-35`).
 An application cannot use `SIGUSR2` for itself.
 
-### 1.4 The blocked signal mask is inherited by child processes — **INTRINSIC**
+### 1.4 The blocked signal mask is inherited by child processes — **INTRINSIC** (the inheritance) / **FIXED** (having no way to undo it)
 
-`runetea/signals.odin:116`. **When it bites:** the moment you shell out to
-`$EDITOR`, a pager, or a build tool. The child inherits `SIGINT`/`SIGTERM`/
-`SIGWINCH` blocked and becomes un-Ctrl-C-able.
-**What to do instead:** clear the mask yourself before `exec`. Nothing in
-RuneTea does it for you, and RuneTea has no `suspend`/`exec` helper (see 8.1).
+`exec(2)` resets signal *handlers* to `SIG_DFL` and drops the altstack, but it
+does **not** reset the blocked **mask** — so a child spawned while RuneTea's
+watcher mask is installed starts with `SIGINT`/`SIGTERM`/`SIGWINCH`/`SIGUSR2`
+blocked and is un-Ctrl-C-able. That part is POSIX and cannot be changed.
+
+**What was fixed is that there was no supported way to undo it.** RuneTea now
+exposes two public primitives (`runetea/signals.odin`):
+
+- `signal_unblock_for_child()` — unblocks exactly the signals
+  `signal_watcher_start` blocks, on the calling thread. Call it in the child,
+  **between `fork` and `exec`**; it is async-signal-safe (`pthread_sigmask` is
+  on POSIX's list) and does nothing else, precisely so that stays true. It
+  `UNBLOCK`s rather than emptying the mask, so anything the *application*
+  blocked for its own reasons survives.
+- `runetea_signal_set(^posix.sigset_t)` — the one definition of that set, so a
+  caller building its own mask (a `posix_spawn` sigmask attribute, say) does not
+  hard-code a copy that goes stale.
+
+```odin
+pid := posix.fork()
+if pid == 0 {
+    runetea.signal_unblock_for_child()
+    posix.execvp(...)
+    posix._exit(127)
+}
+```
+
+**RuneTea itself execs nothing**, so there is no internal call site to fix: the
+only `fork`/`exec` pairs in the repository are the standalone harnesses under
+`tools/`. Pinned by `test_a_child_process_can_be_given_back_a_clean_signal_mask`,
+which measures `SigBlk` **after a real `exec`** — with and without the call — and
+by `test_runetea_signal_set_covers_every_signal_the_watcher_blocks`, so a signal
+added to the watcher and not to the unblock is a test failure rather than a
+child that silently inherits it.
+
+**Residual:** you must still call it. RuneTea has no `suspend`/`exec` helper
+(see 8.1) that would call it for you.
 
 ### 1.5 `signal_watcher_start` must run before any other thread exists — **INTRINSIC**
 
@@ -205,13 +237,39 @@ closure env are stranded for the life of the process), never twice (a refcount
 decrement against possibly-freed memory). `runetea/timer.odin:56-72`. Plain
 `tick()` deliberately hands out no handle so the common case is unleakable.
 
-### 2.14 Timer subsystem start failure is silent — **NOT-YET-BUILT**
+### 2.14 Timer subsystem start failure — **FIXED**
 
-If `nbio.acquire_thread_event_loop` fails, every future `tick`/`every` on that
-`Dispatcher` never fires, with no error surfaced
-(`runetea/timer.odin:344-355`, `:582-591`). **When it bites:** your spinner
-stops, forever, with no diagnostic. This is the worst-shaped remaining
-limitation in the library and it is on the list to fix.
+*Previously described here as "the worst-shaped remaining limitation in the
+library".* If `nbio.acquire_thread_event_loop` failed, `timer_dispatch` released
+the handle and returned; every future `tick`/`every` on that `Dispatcher` then
+never fired, forever, with **no diagnostic of any kind**. Your spinner simply
+stopped.
+
+It is now a **`Timer_Unavailable_Msg`** delivered through the Mailbox to your
+`update()` — the same shape `Panicked_Msg` (`runetea/cmd.odin`) uses for the
+analogous "a background thing you asked for can never produce a result" case,
+and POD for the same reason (the cause travels as a `Msg_Text`, not a `string`).
+It means exactly one thing, and it is permanent: **no timer on this Dispatcher
+will ever fire.**
+
+**ONCE PER `Dispatcher`, not once per failed dispatch**, and that is a decision
+rather than an economy (`runetea/timer.odin, timer_report_unavailable`). The
+failure is a property of the Dispatcher's single, lazily-started timer thread,
+not of the individual `tick()` that discovered it, and nothing retries the
+acquire — so every later message would carry identical information. It would
+also be actively harmful in exactly the case that matters: animation-driven apps
+re-dispatch on a cadence, and back-pressure on a full Mailbox is retry-forever,
+never drop (2.15), so a per-dispatch report would let a broken timer subsystem
+saturate the Mailbox and stall the very application it was warning.
+
+**Ordinary teardown is not reported.** `timer_service_ensure_started` also
+returns nil after `dispatcher_destroy`, which is shutdown, not a defect; a
+separate `start_failed` flag keeps the two apart on purpose rather than by
+accident of timing.
+
+**What is left is the reaction, which is yours.** RuneTea cannot restart the
+subsystem and does not pretend to: handle the Msg by degrading (a static frame
+instead of a spinner), by polling some other way, or by quitting.
 
 ### 2.15 Back-pressure policy is "retry forever", not "drop" — **NOT-YET-BUILT**
 
@@ -290,20 +348,44 @@ pointed at it — its document loader.
 **What to do instead:** if your view genuinely needs to drive the terminal, use
 `.Full_Screen`, which tolerates anything.
 
-### 3.3 An inline frame taller than the screen corrupts the display — **NOT-YET-BUILT**
+### 3.3 An inline frame taller than the screen — **FIXED**, with a named residual
 
-The inline renderer rewinds with `\e[<n>A`, which **clamps at the top margin**,
-while the matching `\e[<n>B` does not compensate. A frame taller than the
-terminal therefore desynchronises "home" permanently, and the error compounds
-every frame (`runetea/render.odin, `render_inline` ("A frame TALLER than the screen")` — *"Unchanged, not newly
-introduced"*).
+*Previously "the most user-visible unfixed rendering defect in the library".*
+The inline renderer rewinds with `\e[<n>A`, which **clamps at the top margin**.
+A frame taller than the terminal scrolls its own top rows into scrollback, so
+the rewind walked up fewer rows than it asked for while the matching `\e[<n>B`
+walked down all of them — "home" slid, and because `last_rows` kept
+over-counting, the error **compounded every frame**. The display degraded
+permanently instead of recovering.
 
-**When it bites:** any `.Inline` application that renders more lines than the
-terminal has rows. This is the most user-visible unfixed rendering defect in the
-library.
-**What to do instead:** keep inline frames short (that is what the mode is for),
-or use `.Full_Screen`/`.Diff`, which have an absolute origin and truncate
-instead.
+`.Inline` now records **what the rewind can actually reach** rather than what it
+painted: `min(rows, term_height - 1)`, which is provably the number of the
+frame's own rows still on screen above the cursor (`runetea/render.odin,
+render_inline` — "A FRAME TALLER THAN THE SCREEN"). The cursor park is clamped
+to the same number, so the up/down pair stays symmetric by construction.
+
+**IT DOES NOT TRUNCATE, unlike `.Full_Screen`/`.Diff` (3.4), and that asymmetry
+is the point.** Those modes own an absolute origin and repaint it every frame,
+so a line they refuse to paint is a line that would have destroyed the origin.
+`.Inline` owns no origin and exists precisely to **leave its output in the
+user's scrollback** — dropping lines would be the mode discarding the one thing
+it is for, and it could not be undone later either, since the dropped rows would
+already have scrolled past. Every line is still written, in full; only the
+bookkeeping stopped lying.
+
+**With the height unknown (0) the pre-fix behaviour is preserved exactly**, byte
+for byte — no fd to query, a failed `ioctl`, output redirected, the golden
+harness. There is no margin to clamp against and guessing one would be strictly
+worse. Pinned by `test_inline_with_an_unknown_height_rewinds_every_painted_row`;
+the fix itself by three byte-exact tests at known heights, including a one-row
+terminal (where nothing is reachable, and the `\e[0A` that a naive clamp would
+emit is *not* a no-op — a zero CSI parameter means one).
+
+**Residual, and real:** the rows that scrolled off still hold the *old* frame's
+text and no rewind will ever erase them, so scrolling far enough back shows
+stale frames above the live one. Scrollback is not addressable; nothing can fix
+that. It is bounded — the visible viewport is correct on every frame, and the
+mode is exactly as it was the moment frames fit again.
 
 ### 3.4 Content taller than the viewport is truncated at the bottom — **INTRINSIC**, deliberate
 
@@ -626,16 +708,48 @@ SIGQUIT SIGTERM` (`runetea/guard.odin:162-164`). **When it bites:** `kill -9`
 leaves the shell in raw mode and possibly in the alternate screen; recovery is
 blind-typing `reset`.
 
-### 6.2 A short `write` silently drops the tail of a frame — **NOT-YET-BUILT**
+### 6.2 A short `write` dropping the tail of a frame — **FIXED**
 
-`flush_frame` is a single unlooped `posix.write` (`runetea/tea.odin:485-491`),
-and `posix.write` is unlooped throughout `term.odin` (`:304-313`). The
-cursor-hidden flag is *sticky* precisely because "a short write can deliver the
-hide and drop the show" (`:443-452`).
+`flush_frame` used to be a single, unlooped `posix.write` whose result was
+discarded. `write(2)` may transfer fewer bytes than asked and report success, so
+a large frame on a congested tty was silently truncated — **possibly
+mid-escape-sequence**, leaving the terminal reading the next frame's bytes as
+arguments to a sequence that was never finished.
 
-**When it bites:** a large frame on a congested tty can be truncated mid-escape.
-This is a genuine unhandled partial write and, with 2.14, one of the two
-remaining entries in this document that should be fixed rather than documented.
+`flush_frame` now loops until the whole buffer is out (`runetea/tea.odin`,
+`flush_frame`/`write_all`): a short return is progress, `EINTR` retries
+verbatim, `EAGAIN` yields and retries (the same "transient, retry; terminal,
+give up" policy every producer in this codebase already applies to a full
+Mailbox). Pinned by a test that forces real short writes through a non-blocking
+pipe.
+
+**On an unrecoverable error the session ends with `Terminal_Error`** — including
+its `errno`, which the type now carries, because "write to the terminal failed"
+cannot be acted on and "…: EBADF" can. Not a panic: this runs mid-frame with the
+terminal raw and possibly on the alternate screen, and the one thing that must
+still happen is the caller's `defer term_restore()`, which an ordinary unwind
+gets and a panic does not. Not silence either: EIO/EPIPE/EBADF all mean the
+terminal is gone, so continuing would be rendering to nothing at full frame
+rate, forever. `run()` and `run_nbio()` both propagate it, pinned end to end by
+`test_run_ends_with_a_terminal_error_when_the_frame_cannot_be_written`.
+
+**`cursor_hidden` is still sticky, and its comment now says why honestly.** The
+old justification was purely this bug — one subsystem working around another —
+but two independent reasons survive the fix, neither fixable from the writing
+side: a **crash signal** can land between the write that carried the leading
+`\e[?25l` and the one that would have carried the trailing `\e[?25h` (the dying
+process runs no `defer`s, so only `crash_handler` → `term_restore_c`, reading
+that flag, shows the cursor again — pinned by
+`test_cursor_shows_on_the_crash_path_after_a_truncated_frame`), and an
+**unrecoverable write error** mid-flush leaves exactly the same asymmetry.
+Sticky costs an idempotent extra `\e[?25h` at teardown; non-sticky costs an
+invisible cursor forever (`runetea/term.odin, cursor_hide_arm`).
+
+**Residual:** `posix.write` is still unlooped in `term.odin` itself. Those are
+single sequences of at most 16 bytes written outside any frame, and two of them
+(`kitty_enable`, `paste_enable`) already reason explicitly about what a partial
+write means for their rollback flags. A short write there is a different, much
+smaller hazard than a truncated frame, and it is not addressed here.
 
 ### 6.3 A crash in a two-instruction window can emit an unpaired reset — **INTRINSIC**
 
@@ -775,7 +889,9 @@ A permanent ergonomic divergence from Lipgloss (`runegloss/style.odin:5-24`).
 
 ### 8.1 Absent for v1.0 — **NOT-YET-BUILT**
 
-`suspend`/`exec` (shelling out to `$EDITOR`); the full terminal response decoder
+`suspend`/`exec` (shelling out to `$EDITOR` — the *signal-mask* half of doing it
+by hand is now provided and documented, see 1.4; the termios save/restore and
+the process plumbing are not); the full terminal response decoder
 (DA1/2/3, XTGETTCAP, OSC 10/11/12/52, DSR, XTVERSION) — which means **no
 adaptive light/dark theming**; scroll-region optimisation; the declarative
 `View` struct (3.14)
@@ -878,5 +994,27 @@ Four things on this list were closed rather than described:
 Plus one bug the new checker found: `examples/editor`'s loader admitted literal
 tabs and other C0 bytes into the view (10).
 
-The two entries that most deserve to be closed next are **2.14** (silent timer
-subsystem failure) and **6.2** (unlooped `write` dropping a frame's tail).
+## The limitations sweep that followed
+
+The two entries this document nominated to be closed next — **2.14** and
+**6.2** — were closed, along with two more that turned out on inspection to be
+defects rather than design limits:
+
+| Was | Now |
+|---|---|
+| `flush_frame` a single unlooped `write`, tail of a frame silently dropped (6.2) | Looped, `EINTR`/`EAGAIN` handled, unrecoverable failure returns `Terminal_Error` **with its errno** |
+| Timer subsystem start failure completely silent (2.14) | `Timer_Unavailable_Msg` through the Mailbox, once per `Dispatcher` |
+| No way to clear the inherited signal mask for a child process (1.4) | `signal_unblock_for_child()` + `runetea_signal_set()`, documented for the `fork`/`exec` window |
+| An inline frame taller than the screen corrupting the display permanently (3.3) | Rewind and cursor park clamped to what CUU can actually reach; nothing truncated |
+
+Every one of the four is pinned by a test that fails when the fix is reverted.
+Two things were *not* changed while doing it, and are worth stating because
+"fixed" would have been the easier answer:
+
+- **`cursor_hidden`'s stickiness was kept.** The bug it was named after (6.2) is
+  gone, but a crash signal or a write error landing between a frame's hide and
+  its show is a separate, unfixable reason for it. The comment was corrected
+  rather than the code.
+- **`.Inline` was not made to truncate.** `.Full_Screen` and `.Diff` truncate to
+  protect an absolute origin; `.Inline` has none, and truncating would discard
+  the scrollback output the mode exists to produce (3.3).

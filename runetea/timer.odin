@@ -294,6 +294,29 @@ Timer_Service :: struct {
 	loop:           ^nbio.Event_Loop,
 	ready:          sync.Sema,
 
+	// WHY THE START FAILURE IS RECORDED AT ALL, and why in three fields.
+	//
+	// `loop == nil` is ambiguous, and the ambiguity is the whole reason these
+	// exist: it means EITHER "the timer thread could not acquire an nbio event
+	// loop" (a defect the application must be told about -- no Tick or Every on
+	// this Dispatcher will ever fire again) OR "this Dispatcher has already been
+	// torn down" (ordinary shutdown, where a diagnostic would be noise and the
+	// Mailbox is closing anyway). Only the first is reportable.
+	//
+	// `start_failed` and `start_error` are written by the timer thread BEFORE it
+	// posts `ready`, and read by anyone only AFTER waiting on `ready` -- exactly
+	// the same publication discipline `loop` itself already uses, and the reason
+	// neither is under start_mu: timer_service_ensure_started holds start_mu
+	// across its sema_wait, so a thread taking start_mu to publish would
+	// deadlock against it.
+	//
+	// `reported` is the once-per-Dispatcher latch, and it is a separate atomic
+	// because it is written from DISPATCHING threads (any number of them), not
+	// from the timer thread, and never inside start_mu.
+	start_failed:   bool,     // published before `ready` is posted; read only after waiting on it
+	start_error:    Msg_Text, // ditto -- what went wrong, in the same carrier Panicked_Msg uses
+	reported:       bool,     // atomic; see timer_report_unavailable
+
 	// Newly-dispatched handles waiting for the timer thread to arm their
 	// FIRST nbio.timeout, guarded by pending_mu -- see timer_dispatch's own
 	// comment for why registration hands off through this plain, mutex-
@@ -343,13 +366,37 @@ timer_thread_body :: proc(th: ^thread.Thread) {
 
 	ts := cast(^Timer_Service)th.data
 
-	if aerr := nbio.acquire_thread_event_loop(); aerr != nil {
-		// Best-effort failure path: publish with ts.loop left nil so
-		// timer_service_ensure_started's waiter doesn't hang forever, and
-		// exit. Every future tick()/every() dispatch on this Dispatcher
-		// sees ts.started == true with ts.loop == nil and treats it as "will
-		// never fire" (timer_dispatch below) -- a documented limit, not
-		// silently ignored; see docs/superpowers/tick-every-decision.md.
+	// TEST-ONLY FAULT INJECTION, and read before the acquire so the failure
+	// path below is reachable without breaking the process's nbio state. There
+	// is no other way to exercise it: nbio.acquire_thread_event_loop fails only
+	// on an io_uring/epoll setup failure (out of fds, a kernel that refuses),
+	// none of which a test can provoke on demand, and the .Diff renderer's
+	// compile-time RUNETEA_DIFF_FAULT precedent would put this path outside the
+	// default `odin test` gate -- i.e. exactly where the bug lived for four
+	// releases. Costs one relaxed atomic load, once per Dispatcher that ever
+	// uses a timer at all. Set ONLY by timer_test.odin, always restored.
+	forced := sync.atomic_load(&g_timer_force_start_failure)
+
+	aerr: nbio.General_Error
+	if !forced { aerr = nbio.acquire_thread_event_loop() }
+
+	if forced || aerr != nil {
+		// Publish with ts.loop left nil so timer_service_ensure_started's
+		// waiter doesn't hang forever, and exit. Every future tick()/every()
+		// dispatch on this Dispatcher sees ts.started == true with ts.loop ==
+		// nil and treats it as "will never fire" (timer_dispatch below).
+		//
+		// NO LONGER SILENT (was docs/LIMITATIONS.md 2.14, "the worst-shaped
+		// remaining limitation in the library"): start_failed/start_error are
+		// published here, in the same pre-sema_post window ts.loop uses, and
+		// timer_dispatch turns them into a Timer_Unavailable_Msg through the
+		// Mailbox -- the same shape cmd.odin's Panicked_Msg uses for the
+		// analogous "a background thing the app asked for can never produce a
+		// result" case.
+		ts.start_failed = true
+		ts.start_error  = forced \
+			? msg_text_from("timer subsystem: start failure forced by a test") \
+			: msg_text_fmt("timer subsystem: nbio.acquire_thread_event_loop failed: %v", aerr)
 		sync.sema_post(&ts.ready)
 		return
 	}
@@ -584,9 +631,14 @@ timer_dispatch :: proc(d: ^Dispatcher, h: ^Timer_Handle) {
 	loop := timer_service_ensure_started(ts)
 	if loop == nil {
 		// Timer subsystem could not start (or is already torn down) --
-		// best effort, see timer_thread_body's own comment. Release the
-		// subsystem's reference; the Tick/Every simply never fires.
+		// see timer_thread_body's own comment. Release the subsystem's
+		// reference; this Tick/Every will never fire.
 		timer_handle_release(h)
+		// AND SAY SO. This used to be the whole of the failure path, which
+		// meant a Dispatcher whose timer subsystem failed to start went on
+		// accepting tick()/every() forever and firing none of them, with no
+		// diagnostic of any kind -- an app's spinner simply stopped.
+		timer_report_unavailable(d, ts)
 		return
 	}
 
@@ -601,6 +653,86 @@ timer_dispatch :: proc(d: ^Dispatcher, h: ^Timer_Handle) {
 
 	nbio.wake_up(loop)
 }
+
+// Delivered through the Mailbox, to the application's own update(), when a
+// Tick or Every was dispatched onto a Dispatcher whose timer subsystem could
+// not start. It means exactly one thing, and it is permanent: NO TIMER ON THIS
+// DISPATCHER WILL EVER FIRE. Anything the application drives off a Tick or an
+// Every -- a spinner, a poll, a timeout, a debounce -- is dead for the rest of
+// the session and needs a different strategy or an orderly quit.
+//
+// THE SHAPE IS Panicked_Msg's, deliberately (cmd.odin). Both are "a background
+// facility the app asked for can never produce the result it promised", both
+// are reported through the one channel the app is already draining rather than
+// through a return value nobody checks, and both are simply unhandled -- not
+// dropped -- by an update() with no matching case. Using the established shape
+// means there is one convention here, not two.
+//
+// POD, per box()'s MESSAGE OWNERSHIP CONTRACT (arena.odin): Msg_Text, not a
+// bare `string`, exactly as Panicked_Msg does. Pinned by
+// test_timer_unavailable_msg_is_pod.
+Timer_Unavailable_Msg :: struct {
+	reason: Msg_Text,
+}
+
+// ONCE PER DISPATCHER, NOT ONCE PER FAILED DISPATCH -- the judgement call, made
+// here and stated rather than left to be inferred from the atomic.
+//
+// The failure being reported is a property of the DISPATCHER (one timer thread,
+// one nbio event loop, started once, lazily). It is not a property of the
+// individual tick() that happened to be the one that discovered it, and it
+// cannot change back: nothing retries the acquire. So every message after the
+// first would carry identical information.
+//
+// Per-dispatch would also be actively harmful in precisely the situation this
+// exists for. The applications that lean hardest on timers are the ones driving
+// an animation, which re-dispatch on a cadence (a self-reissuing tick, or an
+// every() the app restarts), and back-pressure on a full Mailbox is
+// retry-forever, never drop (deliver_result, cmd.odin; docs/LIMITATIONS.md
+// 2.15). A per-dispatch report would therefore let a broken timer subsystem
+// saturate the Mailbox with warnings and stall the very application it was
+// trying to warn -- a diagnostic that causes a worse failure than the one it
+// describes. One message says the whole truth; the second says nothing new.
+//
+// The latch is an atomic exchange rather than a check-then-set because
+// dispatch() may be called from any number of threads at once (that is exactly
+// what tools/racecheck's timer phase does), and "exactly once" has to survive
+// that.
+//
+// THE TORN-DOWN CASE IS NOT REPORTED, and that is the reason start_failed
+// exists at all: timer_service_ensure_started also returns nil after
+// timer_service_stop, which is ordinary shutdown, not a defect. The Mailbox is
+// closing at that point anyway, so the message could not be delivered -- but
+// gating on start_failed means the distinction is made on purpose rather than
+// by accident of timing.
+@(private = "file")
+timer_report_unavailable :: proc(d: ^Dispatcher, ts: ^Timer_Service) {
+	// Safe to read unsynchronised: written by the timer thread strictly before
+	// its sema_post(&ts.ready), and this call is strictly after the matching
+	// sema_wait inside timer_service_ensure_started. Same publication edge
+	// ts.loop already relies on.
+	if !ts.start_failed { return }
+	if sync.atomic_exchange(&ts.reported, true) { return }
+
+	msg := box(Timer_Unavailable_Msg{reason = ts.start_error}, context.allocator)
+	if deliver_result(d.mailbox, msg) {
+		if d.wake != nil { d.wake(d.wake_data) }
+	} else {
+		// Mailbox already closed -- nothing will ever receive this. Free it
+		// here rather than leak it, exactly as timer_fire does for an
+		// orphaned fire, and for the same reason: this is the thread (and
+		// the allocator) that made the allocation.
+		box_free(msg, context.allocator)
+	}
+}
+
+// TEST-ONLY. When true, the next timer thread to start behaves as though
+// nbio.acquire_thread_event_loop had failed -- see timer_thread_body for why
+// this exists rather than a compile-time RUNETEA_TIMER_FAULT define. Nothing in
+// the library ever writes it; timer_test.odin sets and restores it, and
+// ODIN_TEST_THREADS=1 means no two tests contend for it.
+@(private = "package")
+g_timer_force_start_failure: bool
 
 // Runs on the timer thread, inside nbio.tick(). Delivers the fired Msg
 // straight to the Mailbox -- NOT through run_cmd_task/run_cmd_detached,

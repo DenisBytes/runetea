@@ -62,6 +62,14 @@ Signal_Watcher :: struct {
 	// there until some UNRELATED read or Cmd completion happens to wake it.
 	wake:      proc(rawptr),
 	wake_data: rawptr,
+
+	// The caller's signal mask as it was the instant before
+	// signal_watcher_start blocked our set into it, so signal_watcher_stop
+	// can put it back EXACTLY -- see that proc for why restoring is not
+	// optional and why unblocking our own set would be the wrong way to do
+	// it.
+	saved_mask:  posix.sigset_t,
+	mask_saved:  bool,
 }
 
 // Blocks the handled signals on the calling thread, then waits for them on a
@@ -113,7 +121,73 @@ send_or_retry :: proc(sw: ^Signal_Watcher, msg: any) {
 	}
 }
 
-// Clear this mask before spawning a child process, or $EDITOR inherits it.
+// EXACTLY THE SIGNALS signal_watcher_start BLOCKS, filled into `set`. One
+// definition, three call sites (the blocking call below, the watcher thread's
+// own sigwait set, and signal_unblock_for_child) so the three cannot drift --
+// a signal added to the watcher but not to the child's unblock would be a
+// signal an app's $EDITOR silently inherits blocked, which is the exact bug
+// this proc's existence closes.
+//
+// PUBLIC, and takes the set by pointer, so an application that wants to build
+// a mask of its own (say, to block these across a critical section, or to
+// restore them by hand after a posix_spawn with its own sigmask attribute) can
+// ask RuneTea what it actually blocks rather than hard-coding a copy that goes
+// stale.
+runetea_signal_set :: proc(set: ^posix.sigset_t) {
+	posix.sigemptyset(set)
+	posix.sigaddset(set, .SIGINT)
+	posix.sigaddset(set, .SIGTERM)
+	posix.sigaddset(set, SIG_WAKE)
+	posix.sigaddset(set, SIGWINCH)
+}
+
+// UNBLOCKS RUNETEA'S SIGNALS ON THE CALLING THREAD. Call this in a child
+// process, between fork(2) and exec(2), or the child inherits a blocked
+// SIGINT/SIGTERM/SIGWINCH and is un-Ctrl-C-able.
+//
+// THE PROBLEM THIS EXISTS FOR. signal_watcher_start blocks those signals so a
+// dedicated thread can sigwait() them (see its own doc comment for why that
+// design, and why it must run before any other thread exists). A blocked signal
+// mask is per-thread, is inherited by every thread created afterwards, and --
+// the part that bites -- SURVIVES exec(2). Everything else about a process's
+// signal disposition is reset by exec: handlers go back to SIG_DFL, sigaltstack
+// is dropped. The MASK is not. So a program that shells out to `$EDITOR`, a
+// pager, or a build tool hands it a terminal it cannot be interrupted from, and
+// the symptom (Ctrl+C does nothing) looks like a bug in the child.
+//
+//     pid := posix.fork()
+//     if pid == 0 {
+//         runetea.signal_unblock_for_child()   // <-- here, before exec
+//         posix.execvp(...)
+//         posix._exit(127)
+//     }
+//
+// SAFE BETWEEN fork AND exec, which is not a small claim: the child of a fork
+// in a multi-threaded process (and RuneTea is always multi-threaded -- watcher,
+// reader, pool, timer) may call only async-signal-safe functions. pthread_sigmask
+// is on POSIX's async-signal-safe list, so this call is legal there. It does
+// nothing else -- no allocation, no locks, no logging -- precisely so that stays
+// true.
+//
+// UNBLOCK, NOT SETMASK(empty). This clears exactly what RuneTea blocked and
+// leaves anything the APPLICATION blocked for its own reasons alone. A blanket
+// "empty the mask" would silently undo the embedder's decisions, which is not
+// this library's call to make.
+//
+// RUNETEA ITSELF EXECS NOTHING, so there is no internal call site to fix: the
+// only fork/exec pairs in this repository are test harnesses under tools/
+// (tools/httpquitcheck, tools/tier1check), which are separate `main` programs,
+// not part of the library. This is a primitive for applications, which is what
+// tea.ExecProcess would need if RuneTea ever grows one (docs/LIMITATIONS.md
+// 8.1) -- and what an application needs today to shell out correctly.
+signal_unblock_for_child :: proc() {
+	set: posix.sigset_t
+	runetea_signal_set(&set)
+	posix.pthread_sigmask(.UNBLOCK, &set, nil)
+}
+
+// See signal_unblock_for_child for how an application clears the mask this
+// installs before spawning a child process -- without it, $EDITOR inherits it.
 signal_watcher_start :: proc(sw: ^Signal_Watcher, m: ^Mailbox, tty: posix.FD, wake: proc(rawptr) = nil, wake_data: rawptr = nil) {
 	sw.mailbox = m
 	sw.tty = tty
@@ -122,12 +196,12 @@ signal_watcher_start :: proc(sw: ^Signal_Watcher, m: ^Mailbox, tty: posix.FD, wa
 	sw.wake_data = wake_data
 
 	set: posix.sigset_t
-	posix.sigemptyset(&set)
-	posix.sigaddset(&set, .SIGINT)
-	posix.sigaddset(&set, .SIGTERM)
-	posix.sigaddset(&set, SIG_WAKE)
-	posix.sigaddset(&set, SIGWINCH)
-	posix.pthread_sigmask(.BLOCK, &set, nil)   // Sig.BLOCK, not .SIG_BLOCK
+	runetea_signal_set(&set)
+	// Capture the mask we are about to modify, so stop can restore it exactly.
+	// Passing nil here -- which this used to do -- makes the block permanent
+	// for the life of the calling THREAD: see signal_watcher_stop.
+	posix.pthread_sigmask(.BLOCK, &set, &sw.saved_mask)   // Sig.BLOCK, not .SIG_BLOCK
+	sw.mask_saved = true
 
 	// init_context for the same reason as Task 5's detached dispatch: without
 	// it the watcher thread runs under runtime.default_context(), so the
@@ -154,11 +228,7 @@ signal_watcher_start :: proc(sw: ^Signal_Watcher, m: ^Mailbox, tty: posix.FD, wa
 		sync.sema_post(&sw.ready)
 
 		set: posix.sigset_t
-		posix.sigemptyset(&set)
-		posix.sigaddset(&set, .SIGINT)
-		posix.sigaddset(&set, .SIGTERM)
-		posix.sigaddset(&set, SIG_WAKE)
-		posix.sigaddset(&set, SIGWINCH)
+		runetea_signal_set(&set)
 
 		for !sync.atomic_load(&sw.stop) {
 			sig: posix.Signal
@@ -210,5 +280,24 @@ signal_watcher_stop :: proc(sw: ^Signal_Watcher) {
 	posix.pthread_kill(sw.native, SIG_WAKE)
 	thread.join(sw.thread)
 	thread.destroy(sw.thread)
+
+	// PUT THE CALLER'S SIGNAL MASK BACK. start blocked our set into the
+	// CALLING thread's mask (that is what makes sigwait on the watcher thread
+	// the only delivery path), and pthread_sigmask changes are per-thread and
+	// permanent -- nothing else ever undoes them. Without this, an app that
+	// stops a watcher and carries on runs with SIGINT/SIGTERM/SIGWINCH/SIGUSR2
+	// blocked for the rest of that thread's life, and anything it forks
+	// inherits the same mask (see signal_unblock_for_child, which exists for
+	// the fork-exec case this does not cover).
+	//
+	// SETMASK to the saved value, NOT UNBLOCK of our own set: the caller may
+	// have deliberately blocked one of these signals before ever calling
+	// start, and unblocking our set would silently clear that. Restoring the
+	// exact mask we displaced is the only version that cannot destroy state we
+	// did not create.
+	if sw.mask_saved {
+		posix.pthread_sigmask(.SETMASK, &sw.saved_mask, nil)
+		sw.mask_saved = false
+	}
 	sw.running = false
 }

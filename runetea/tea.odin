@@ -39,7 +39,19 @@ Interrupted_Error :: struct {}
 // the runtime and therefore does its own `defer delete(info.message, ...)`.
 Panicked_Error    :: struct { message: string }
 
-Terminal_Error    :: struct { detail: string } // `detail` is a static string literal; nothing to free
+// `detail` is a static string literal; nothing to free.
+//
+// `errno` is .NONE for every failure that is not a syscall failure (a failed
+// allocation, a failed nbio init). It exists because the one Terminal_Error a
+// running, healthy program can actually hit -- flush_frame's write to the tty
+// giving up -- is unactionable without it: "write to the terminal failed" does
+// not distinguish the pty going away (EIO) from a closed fd (EBADF) from a
+// vanished reader (EPIPE), and this codebase's rule is that a failure reaches
+// the user with what it knows, not with what is convenient to carry. A POSIX
+// Errno is a plain integer enum, so this adds no allocation and nothing to
+// free, and every existing `Terminal_Error{detail = ...}` construction still
+// compiles unchanged with .NONE.
+Terminal_Error    :: struct { detail: string, errno: posix.Errno }
 
 Run_Error :: union { Killed_Error, Interrupted_Error, Panicked_Error, Terminal_Error }
 
@@ -492,18 +504,99 @@ reader_send :: proc(mbox: ^Mailbox, msg: any) -> (closed: bool) {
 	}
 }
 
-// Writes the accumulated frame to flush_fd and resets the builder. With
-// flush_fd < 0 the builder keeps accumulating -- the golden harness reads it.
+// WRITES THE WHOLE BUFFER OR SAYS WHY IT COULD NOT. write(2) is allowed to
+// transfer fewer bytes than it was asked for and report success, and this used
+// to be one unlooped `posix.write` with its result discarded -- so a short write
+// silently dropped the tail of a frame. That is not a cosmetic loss: a frame is
+// a stream of escape sequences, so the cut can land INSIDE one, leaving the
+// terminal parsing the next frame's bytes as the arguments of a sequence that
+// was never finished. Two subsystems already carried workarounds for it
+// (term.odin's sticky cursor_hidden, whose comment named this exact call).
+//
+// THE LOOP'S THREE CASES, and why each is what it is:
+//
+//   n > 0             progress. Advance and keep going; this is the short write
+//                     and it is ORDINARY, not an error -- a tty with a full
+//                     output queue, a signal landing mid-transfer, a pipe.
+//   EINTR             a signal was delivered before ANY byte moved. Retry
+//                     verbatim: nothing was consumed, so there is nothing to
+//                     account for. This package blocks its own signals but
+//                     an application's SIGCHLD/SIGALRM handler is its own
+//                     business, and SA_RESTART is not something we control.
+//   EAGAIN            the fd is O_NONBLOCK (which RuneTea never sets, but an
+//                     embedder can hand us any fd it likes). Yield and retry,
+//                     the same "transient, retry; terminal, give up" policy
+//                     every producer in this codebase already applies to a full
+//                     Mailbox (reader_send, deliver_result, send_or_retry).
+//
+// Anything else -- and a return of 0 for a non-empty buffer, which no character
+// device or pipe is permitted to do and which would otherwise spin forever --
+// is UNRECOVERABLE and ends the session with a Terminal_Error carrying the
+// errno.
+//
+// WHY AN ERROR RETURN AND NOT A PANIC, AND NOT SILENCE. Silence is what the bug
+// was. A panic is worse than the disease: this runs mid-frame, with the terminal
+// in raw mode and possibly on the alternate screen, and the one thing that must
+// still happen is the caller's `defer term_restore()`. Returning a Run_Error
+// gets exactly that -- run() unwinds normally, the dispatcher is reaped, the
+// terminal is restored, and the application is told, in the same union it
+// already handles for every other way a session can end. And the failures that
+// reach here are not survivable anyway: EIO/EPIPE/EBADF all mean the terminal
+// this program was drawing on is gone, so "keep rendering" would be drawing to
+// nothing, forever, at full frame rate.
+//
+// The builder is reset EITHER WAY (deferred): on the error path the session is
+// over, and holding a partial frame's bytes for a retry that will never come
+// only makes the next thing to touch the builder wrong.
+//
+// With flush_fd < 0 the builder keeps accumulating and nothing is written -- the
+// golden harness reads it.
 //
 // package-visible: run_nbio's initial paint (loop_nbio.odin) calls this
 // directly, same as run() does above, for the same reason (paint before the
 // init Cmd is dispatched).
 @(private="package")
-flush_frame :: proc(out: ^strings.Builder, flush_fd: posix.FD) {
-	if flush_fd < 0 { return }
-	s := strings.to_string(out^)
-	if len(s) > 0 { posix.write(flush_fd, raw_data(s), len(s)) }
-	strings.builder_reset(out)
+flush_frame :: proc(out: ^strings.Builder, flush_fd: posix.FD) -> Run_Error {
+	if flush_fd < 0 { return nil }
+	defer strings.builder_reset(out)
+	return write_all(flush_fd, strings.to_string(out^))
+}
+
+// The loop itself, split out of flush_frame so the policy above has exactly one
+// implementation and so a test can drive it against a deliberately short-writing
+// fd without going through a whole Program. See flush_frame for the reasoning.
+@(private="package")
+write_all :: proc(fd: posix.FD, s: string) -> Run_Error {
+	sent := 0
+	for sent < len(s) {
+		// Cleared first: errno is only meaningful after a call that FAILED,
+		// and a stale value from some earlier syscall must not be able to
+		// masquerade as this write's own.
+		posix.set_errno(.NONE)
+		remaining := len(s) - sent
+		n := posix.write(fd, raw_data(s[sent:]), uint(remaining))
+		if n > 0 {
+			sent += int(n)
+			continue
+		}
+		err := posix.errno()
+		#partial switch err {
+		case .EINTR:
+			continue
+		case .EAGAIN:
+			// NOT also .EWOULDBLOCK: on every platform this package builds
+			// for the two are the same numeric value, so listing both would
+			// be a duplicate switch case.
+			thread.yield()
+			continue
+		}
+		// n == 0 with bytes left to send lands here too, with errno .NONE --
+		// deliberately treated as terminal rather than retried, because a
+		// zero-return that is not an error has no defined recovery and
+		// retrying it is an infinite loop.
+		return Terminal_Error{detail = "write to the terminal failed mid-frame", errno = err}
+	}
+	return nil
 }
 
 // One Update/View cycle, guarded. Split out so `run` stays readable and so the
@@ -686,13 +779,20 @@ guarded_render :: proc(p: ^Program($T), fa: ^Frame_Arena, r: ^Renderer, out: ^st
 		frame_reset(fa)
 		diag := fmt.aprintf("[view panicked: %s]", info.message, allocator = frame_allocator(fa))
 		renderer_render(r, diag)
-		flush_frame(out, flush_fd)
+		// A flush failure here is DELIBERATELY DISCARDED, and it is the only
+		// place in this package that discards one. The session is already
+		// ending with Panicked_Error, whose `message` the caller owns and must
+		// free; replacing it with a Terminal_Error would leak that string and
+		// would also report the less informative of the two failures -- the
+		// diagnostic frame not reaching a terminal that has evidently gone away
+		// is a consequence, the panic is the cause.
+		_ = flush_frame(out, flush_fd)
 		frame_reset(fa)
 		return Panicked_Error{message = info.message}
 	}
 
 	renderer_render(r, vs.view, vs.cur)
-	flush_frame(out, flush_fd)
+	ferr := flush_frame(out, flush_fd)
 	frame_reset(fa)
-	return nil
+	return ferr
 }

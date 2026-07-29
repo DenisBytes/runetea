@@ -2,6 +2,7 @@ package runetea
 
 import "core:mem"
 import "core:strings"
+import "core:sync"
 import "core:sys/posix"
 import "core:testing"
 import "core:time"
@@ -406,4 +407,123 @@ test_two_dispatchers_each_get_their_own_timer_thread :: proc(t: ^testing.T) {
 	ok2 := recv_and_free(&m2)
 	testing.expect(t, ok1, "d1's tick should fire on d1's own mailbox")
 	testing.expect(t, ok2, "d2's tick should fire on d2's own mailbox")
+}
+
+// ============================================================================
+// BUG 2: a timer subsystem that fails to start used to fail SILENTLY.
+//
+// timer_dispatch released the handle and returned. Every subsequent tick/every
+// on that Dispatcher then never fired, forever, with no diagnostic of any kind
+// -- an app's spinner simply stopped, an app's poll simply stopped, and nothing
+// anywhere said why. It is now a Timer_Unavailable_Msg through the Mailbox,
+// the same shape cmd.odin's Panicked_Msg uses.
+//
+// The failure is forced through g_timer_force_start_failure -- see
+// timer_thread_body for why a runtime hook rather than a compile-time define
+// (a compile-time one would put this path outside the default test gate, which
+// is exactly where the bug survived).
+// ============================================================================
+
+@(private = "file")
+recv_within :: proc(m: ^Mailbox, d: time.Duration) -> (msg: any, ok: bool) {
+	deadline := time.tick_add(time.tick_now(), d)
+	for time.tick_diff(time.tick_now(), deadline) > 0 {
+		if msg, ok = mailbox_try_recv(m); ok { return }
+		time.sleep(time.Millisecond)
+	}
+	return nil, false
+}
+
+@(test)
+test_timer_start_failure_is_reported_through_the_mailbox :: proc(t: ^testing.T) {
+	sync.atomic_store(&g_timer_force_start_failure, true)
+	defer sync.atomic_store(&g_timer_force_start_failure, false)
+
+	m: Mailbox
+	testing.expect_value(t, mailbox_init(&m, 8), nil)
+	defer mailbox_destroy(&m)
+
+	d: Dispatcher
+	dispatcher_init(&d, &m, 2)
+	defer dispatcher_destroy(&d)
+
+	dispatch(&d, tick(time.Millisecond, tick_result_fn, struct{}{}, context.allocator))
+
+	msg, ok := recv_within(&m, time.Second)
+	defer box_free(msg, context.allocator)
+	if !testing.expect(t, ok, "a timer subsystem that cannot start must say so, not go quiet") { return }
+
+	tu, is := msg.(Timer_Unavailable_Msg)
+	if !testing.expectf(t, is, "expected a Timer_Unavailable_Msg, got %v", msg) { return }
+	testing.expect(t, tu.reason.len > 0, "the message must carry a reason, not an empty one")
+	// A Tick_Result must NEVER arrive on a Dispatcher whose timer thread died:
+	// the point of the message is that this timer can never fire.
+	extra, more := recv_within(&m, 50 * time.Millisecond)
+	defer box_free(extra, context.allocator)
+	testing.expect(t, !more, "nothing else may arrive -- the timer cannot fire")
+}
+
+// ONCE PER DISPATCHER, NOT ONCE PER FAILED DISPATCH. An animation re-dispatches
+// on a cadence and the Mailbox's back-pressure policy is retry-forever, so a
+// per-dispatch report would let a broken timer subsystem saturate the Mailbox
+// and stall the application it was trying to warn. See
+// timer_report_unavailable's own comment for the full argument.
+@(test)
+test_timer_start_failure_is_reported_once_per_dispatcher :: proc(t: ^testing.T) {
+	sync.atomic_store(&g_timer_force_start_failure, true)
+	defer sync.atomic_store(&g_timer_force_start_failure, false)
+
+	m: Mailbox
+	testing.expect_value(t, mailbox_init(&m, 8), nil)
+	defer mailbox_destroy(&m)
+
+	d: Dispatcher
+	dispatcher_init(&d, &m, 2)
+	defer dispatcher_destroy(&d)
+
+	for _ in 0 ..< 5 {
+		dispatch(&d, tick(time.Millisecond, tick_result_fn, struct{}{}, context.allocator))
+	}
+
+	msg, ok := recv_within(&m, time.Second)
+	defer box_free(msg, context.allocator)
+	testing.expect(t, ok, "the first failed dispatch must report")
+	_, is := msg.(Timer_Unavailable_Msg)
+	testing.expect(t, is, "expected a Timer_Unavailable_Msg")
+
+	extra, more := recv_within(&m, 100 * time.Millisecond)
+	defer box_free(extra, context.allocator)
+	testing.expectf(t, !more, "five failed dispatches produced more than one message: %v", extra)
+}
+
+// ORDINARY SHUTDOWN IS NOT A FAILURE. timer_service_ensure_started also returns
+// nil once the Dispatcher has been torn down, and reporting THAT would turn
+// every quit-with-a-timer-in-flight into a spurious diagnostic. start_failed is
+// what tells the two apart.
+@(test)
+test_dispatching_a_timer_after_teardown_reports_nothing :: proc(t: ^testing.T) {
+	m: Mailbox
+	testing.expect_value(t, mailbox_init(&m, 8), nil)
+	defer mailbox_destroy(&m)
+
+	d: Dispatcher
+	dispatcher_init(&d, &m, 2)
+	dispatcher_destroy(&d)
+
+	dispatch(&d, tick(time.Millisecond, tick_result_fn, struct{}{}, context.allocator))
+	msg, ok := recv_within(&m, 100 * time.Millisecond)
+	defer box_free(msg, context.allocator)
+	testing.expectf(t, !ok, "a torn-down Dispatcher must stay quiet, got %v", msg)
+}
+
+// box() panics on a non-POD Msg at RUNTIME, not compile time
+// (docs/LIMITATIONS.md 2.2), so every Msg type this package defines owes a test
+// that boxes it once. This is that test for Timer_Unavailable_Msg.
+@(test)
+test_timer_unavailable_msg_is_pod :: proc(t: ^testing.T) {
+	msg := box(Timer_Unavailable_Msg{reason = msg_text_from("nbio: out of file descriptors")}, context.allocator)
+	defer box_free(msg, context.allocator)
+	tu, is := msg.(Timer_Unavailable_Msg)
+	testing.expect(t, is, "Timer_Unavailable_Msg must survive a box/unbox round trip")
+	testing.expect_value(t, msg_text_string(&tu.reason), "nbio: out of file descriptors")
 }

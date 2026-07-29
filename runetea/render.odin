@@ -44,10 +44,15 @@ Renderer :: struct {
 	term_width: int,
 	// T2-C. The terminal's ROW count, and 0 means "unknown" for exactly the same
 	// reasons term_width's 0 does (no fd to query, term_size() failed, or a test
-	// that never supplied one). READ ONLY BY THE FULL-SCREEN PATH: the inline
-	// renderer has no viewport to clamp against -- its frames sit wherever the
+	// that never supplied one).
+	//
+	// READ BY ALL THREE PATHS, and it means something different in the inline
+	// one. .Full_Screen/.Diff use it as a VIEWPORT BUDGET and truncate content
+	// past it. .Inline still truncates nothing -- its frames sit wherever the
 	// terminal happened to be and scroll the way any other program's output does
-	// -- so a height would have nothing to mean there.
+	// -- but it needs the height to know how far a \e[<n>A can actually reach,
+	// because CUU clamps at the top margin and anything scrolled past it is
+	// unreachable forever. See render_inline's "A FRAME TALLER THAN THE SCREEN".
 	//
 	// term_size() has ALWAYS returned this and both event loops have ALWAYS
 	// discarded it (`if w, _, ok := term_size(...)`); T2-C is the first thing
@@ -1195,9 +1200,46 @@ emit_row :: proc(r: ^Renderer, y: int, prev, cur: ^Screen) {
 // so an `up` that overshot the frame would be truncated on the way up and NOT
 // on the way down, permanently desynchronising home. That is exactly why the
 // placement below clamps into the painted frame instead of trusting the app's
-// coordinates. (A frame TALLER than the screen breaks this, as it already
-// breaks the plain rewind -- see the naive-renderer scope note at the top of
-// this file. Unchanged, not newly introduced.)
+// coordinates.
+//
+// A FRAME TALLER THAN THE SCREEN -- what the `reachable` clamp below is for.
+//
+// CUU clamps at the top margin. A frame of R physical rows painted on a
+// terminal of H rows scrolls the terminal, so once R >= H the frame's topmost
+// R-(H-1) rows are no longer on screen at all: they are in SCROLLBACK, where no
+// escape sequence can reach them. Recording last_rows = R and then asking for R
+// \e[1A's therefore walks up FEWER rows than it asked for (the tail is eaten by
+// the clamp) while the compensating \e[<n>B walks down the full n -- home slides
+// by the difference, and because last_rows keeps over-counting, the error
+// COMPOUNDS every frame rather than healing.
+//
+// The fix is to record what the rewind can actually reach rather than what was
+// painted. After painting R rows (each terminated by "\r\n") the cursor sits at
+// column 1 of screen row c = min(start_row + R, H), and the number of THIS
+// frame's rows still on screen above it is exactly min(R, H-1):
+//
+//   - R <= H-1: c - R = min(start_row, H-R) >= 1 for any start_row >= 1, so
+//     every painted row is still above the cursor. Nothing changes; this is the
+//     overwhelmingly common case and it is byte-for-byte the old behaviour.
+//   - R >= H:   the terminal scrolled until the cursor hit the bottom, so c = H
+//     and precisely H-1 of the frame's rows remain visible above it.
+//
+// NOT TRUNCATION, unlike .Full_Screen/.Diff (see render_full_screen's "TRUNCATE
+// AT THE BOTTOM"). Those modes own an absolute origin and repaint it every
+// frame, so a line they refuse to paint is a line that would have destroyed the
+// origin. .Inline owns no origin and exists precisely to LEAVE ITS OUTPUT IN THE
+// USER'S SCROLLBACK -- dropping lines would be this mode discarding the very
+// thing it is for, and it could not even be undone later, since the truncated
+// rows would already have scrolled past. So every line is still written, in
+// full; only the bookkeeping stops lying. What overflows scrolls away, which is
+// the normal fate of anything printed to a terminal.
+//
+// RESIDUAL, and stated rather than promised away: the rows that scrolled off
+// still hold the OLD frame's text, and no rewind will ever erase them, so a
+// terminal scrolled back far enough shows stale frames above the live one. That
+// is unavoidable -- scrollback is not addressable -- and it is bounded: the
+// visible viewport is correct on every frame, and the moment frames fit again
+// the mode is exactly as it was.
 //
 // Absolute CHA (\e[<col+1>G) rather than relative CUF, even though the cursor
 // is provably at column 1 after the paint: it costs the same handful of bytes,
@@ -1252,7 +1294,13 @@ render_inline :: proc(r: ^Renderer, lines: []string, cur: Cursor) {
 		strings.write_string(r.out, "\r\n")    // raw mode: OPOST is off
 		rows += rows_for_line(line, r.term_width)
 	}
-	r.last_rows = rows
+	// How many of those rows a later \e[<n>A can still reach -- see this proc's
+	// doc comment. With the height UNKNOWN (0) there is nothing to clamp
+	// against and this is `rows`, i.e. the pre-fix behaviour exactly, which is
+	// what every byte-exact test in this package pins.
+	reachable := rows
+	if r.term_height > 0 { reachable = min(rows, r.term_height - 1) }
+	r.last_rows = reachable
 
 	if cur.show {
 		// The column/row arithmetic lives in cursor_cell, SHARED with the
@@ -1262,9 +1310,21 @@ render_inline :: proc(r: ^Renderer, lines: []string, cur: Cursor) {
 		// comment on why an out-of-frame `up` would permanently desynchronise
 		// home rather than merely misplace the caret. rows >= 1 always
 		// (split_lines always yields at least one element), so up >= 1 here.
+		//
+		// CLAMPED TO `reachable` FOR THE SAME REASON THE REWIND IS. The caret's
+		// own row is the one thing in this frame that can sit above the top
+		// margin (its logical line may have scrolled off entirely), and a CUU
+		// the terminal silently truncates unbalances the up/down pair exactly
+		// like an over-long rewind does -- the \e[<n>B on the next frame would
+		// walk down rows the \e[<n>A never walked up. Preferring a caret one or
+		// more rows lower than asked over a permanently displaced home is the
+		// same trade cursor_cell's own clamp already makes.
 		prow, col := cursor_cell(cur, rows_above, rows, r.term_width)
-		up := rows - prow
-		write_csi(r.out, up, "A")
+		up := min(rows - prow, reachable)
+		// up == 0 only on a one-row terminal, where nothing is reachable at
+		// all. "\e[0A" is NOT a no-op -- a zero parameter means one -- so the
+		// CUU is dropped entirely rather than emitted with a lying argument.
+		if up > 0 { write_csi(r.out, up, "A") }
 		write_csi(r.out, col + 1, "G")   // CHA is 1-based
 		r.cursor_up = up
 	}

@@ -444,12 +444,37 @@ CURSOR_SHOW: string : "\e[?25h"
 // undo is written. A frame contains its own hide AND its own show, so in the
 // happy path the terminal ends every frame with the cursor visible and this
 // flag is describing a state that no longer exists. It stays set anyway
-// because the bytes are not written by this proc -- they are BUFFERED, and
-// flush_frame's posix.write is a single unlooped call, so a short write can
-// deliver the hide and drop the show. Clearing the flag per frame would mean
-// the one case where the show went missing is also the one case where restore
-// stays silent. Sticky costs an idempotent extra "\e[?25h" at teardown;
-// non-sticky costs an invisible cursor forever.
+// because the bytes are not written by this proc -- they are BUFFERED, and the
+// interval between the hide reaching the terminal and the show reaching it is
+// not atomic.
+//
+// THE ORIGINAL JUSTIFICATION HAS BEEN FIXED AND THIS FLAG STILL HAS TO BE
+// STICKY. What this comment used to say was that "flush_frame's posix.write is
+// a single unlooped call, so a short write can deliver the hide and drop the
+// show" -- one subsystem working around a bug in another. flush_frame now loops
+// until the whole buffer is written (tea.odin, flush_frame/write_all), so a
+// short write no longer truncates anything. Two independent reasons survive it,
+// and neither is fixable from the writing side:
+//
+//   - A CRASH SIGNAL LANDING MID-FLUSH. The loop can be many write(2) calls, and
+//     a SIGSEGV/SIGTERM can arrive between any two of them -- or inside one,
+//     after the kernel has already accepted the leading "\e[?25l" and before it
+//     accepts the trailing "\e[?25h". The dying process runs no `defer`s; the
+//     only thing that shows the cursor again is guard.odin's crash_handler
+//     calling term_restore_c, which reads THIS FLAG. A flag cleared at the end
+//     of each frame would be false in exactly that window. This is not
+//     hypothetical: test_cursor_shows_on_the_crash_path_after_a_truncated_frame
+//     pins it, with a child that writes only the leading hide and then dies by
+//     signal.
+//   - AN UNRECOVERABLE WRITE ERROR MID-FLUSH. write_all gives up on EIO/EPIPE/
+//     EBADF and returns a Terminal_Error, which unwinds run() into the caller's
+//     `defer term_restore()`. If the hide had already gone out and the show had
+//     not, the same asymmetry applies.
+//
+// Clearing the flag per frame would therefore still mean the one case where the
+// show went missing is also the one case where restore stays silent. Sticky
+// costs an idempotent extra "\e[?25h" at teardown; non-sticky costs an
+// invisible cursor forever.
 //
 // WHY THAT TRADE IS SAFE HERE AND WOULD NOT BE FOR KITTY. `\e[?25h` is
 // DECSET -- one boolean mode, no stack, no depth -- so writing it when the
@@ -511,10 +536,11 @@ term_restore :: proc() {
 // guard (`cursor_hidden`) therefore exists to keep a process that never touched
 // the cursor silent, NOT to prevent a catastrophe, and unlike the other two it
 // is deliberately STICKY once armed -- see cursor_hide_arm for why (the hide is
-// buffered into a frame this proc never sees, and flush_frame's write is not
-// looped, so "the show got dropped" and "the show landed" are indistinguishable
-// from here; leaving a terminal with an invisible cursor is precisely the
-// "actively wrong output" this comment's last paragraph warns about).
+// buffered into a frame this proc never sees, and the flush that carries it is
+// interruptible by a crash signal and abortable on a write error, so "the show
+// got dropped" and "the show landed" are indistinguishable from here; leaving a
+// terminal with an invisible cursor is precisely the "actively wrong output"
+// this comment's last paragraph warns about).
 //
 // MOUSE AND FOCUS ARE DECSET/DECRST TOO (T2-B), so the pairing hazard is the
 // mild one, not the Kitty one, and that is stated rather than inherited:
