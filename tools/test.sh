@@ -136,6 +136,23 @@ plain)
 	echo "=== examples/editor/edit ==="
 	cd "$ROOT/examples/editor/edit"
 	run_with_leak_audit "$ODIN" test . -define:ODIN_TEST_THREADS=1
+
+	# runegloss is a SIBLING PACKAGE that imports runetea (for display_width --
+	# there is exactly one implementation of it in this repo, in
+	# runetea/width.odin, and runegloss measures everything with it). The
+	# import is one-directional, so this could in principle have lived in
+	# $PKG's own test run -- it does not, for the same reason edit does not:
+	# runegloss imports runetea, so a runetea test importing runegloss would be
+	# an import cycle.
+	#
+	# Same leak audit, same allowlist, and here the allowlist should be
+	# entirely unused: nothing in runegloss starts a thread or calls run(), and
+	# render() allocates only from the allocator it is handed. A green run
+	# prints "no leaks reported at all" for this package.
+	echo
+	echo "=== runegloss ==="
+	cd "$ROOT/runegloss"
+	run_with_leak_audit "$ODIN" test . -define:ODIN_TEST_THREADS=1
 	;;
 tsan)
 	# WARNING (verified 2026-07-26): `odin test -sanitize:thread` does NOT
