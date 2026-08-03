@@ -1,43 +1,89 @@
-# RuneTea
+<h1 align="center">RuneTea</h1>
 
-RuneTea is a terminal-UI framework for [Odin](https://odin-lang.org): an Elm
-architecture (one model, one `update`, one `view`) driven by a real event loop
-that turns keystrokes, mouse reports, window resizes, signals and background
-work into messages. It is a port of Go's [Bubble
-Tea](https://github.com/charmbracelet/bubbletea), and `runegloss/` is its
-[Lipgloss](https://github.com/charmbracelet/lipgloss) — for anyone who wants
-that shape of TUI in a language with no garbage collector, no closures, and an
-explicit allocator on every call.
+<p align="center">
+  <b>The Elm Architecture for <a href="https://odin-lang.org">Odin</a>.</b><br>
+  A port of <a href="https://github.com/charmbracelet/bubbletea">Bubble Tea</a> — for terminals, without a garbage collector.
+</p>
 
-**Platform: Linux is verified. macOS and BSD are not.** See
-[Platforms](#platforms) — it is the first thing to read if you are not on
-Linux.
+<p align="center">
+  <a href="https://github.com/DenisBytes/runetea/blob/main/LICENSE"><img alt="MIT licence" src="https://img.shields.io/badge/licence-MIT-blue.svg"></a>
+  <a href="https://odin-lang.org"><img alt="Odin dev-2026-07" src="https://img.shields.io/badge/Odin-dev--2026--07-6699cc.svg"></a>
+  <img alt="352 tests" src="https://img.shields.io/badge/tests-352%20passing-brightgreen.svg">
+  <img alt="Linux verified" src="https://img.shields.io/badge/Linux-verified-brightgreen.svg">
+  <img alt="macOS and BSD unverified" src="https://img.shields.io/badge/macOS%20%7C%20BSD-unverified-orange.svg">
+  <a href="docs/API.md"><img alt="API docs" src="https://img.shields.io/badge/docs-API-informational.svg"></a>
+</p>
 
 ---
+
+```text
+What should we buy at the market?
+
+  [ ] Buy carrots
+> [x] Buy celery
+  [ ] Buy kohlrabi
+
+Press q to quit.
+```
+
+<sup>Not a mock-up. Every screen in this README was captured from a real pty by <a href="tools/ptyrun">tools/ptyrun</a> and replayed through a third-party VT100 emulator.</sup>
+
+RuneTea gives you one model, one `update`, one `view`, and a real event loop
+that turns keystrokes, mouse reports, window resizes, signals and background
+work into messages. `runegloss/` is its [Lipgloss](https://github.com/charmbracelet/lipgloss):
+colours that degrade to whatever the terminal can actually show, plus padding,
+borders and alignment.
+
+It is written for a language with **no garbage collector, no closures, and an
+explicit allocator on every call** — so the places where it diverges from Bubble
+Tea are the places where Go's design leaned on a feature Odin does not have.
+Those divergences are named, measured, and listed in one table below.
+
+> [!IMPORTANT]
+> **Linux is the verified platform.** macOS and BSD compile but have never been
+> run — no machine was available. See [Platform support](#platform-support)
+> before you build on either.
 
 ## Contents
 
-- [Quickstart](#quickstart)
-- [The architecture](#the-architecture)
-- [Messages](#messages)
-- [Commands](#commands)
-- [Render modes](#render-modes)
-- [Terminal opt-ins](#terminal-opt-ins)
-- [RuneGloss](#runegloss)
-- [Examples](#examples)
-- [Platforms](#platforms)
-- [Limitations — required reading](#limitations--required-reading)
-- [Tests and gates](#tests-and-gates)
-- [Documentation map](#documentation-map)
+- [Install](#install) · [Quickstart](#quickstart) · [Coming from Bubble Tea](#coming-from-bubble-tea)
+- [What you get](#what-you-get) · [Examples](#examples) · [The `.Diff` renderer](#the-diff-renderer) · [RuneGloss](#runegloss)
+- [Platform support](#platform-support) · [Limitations](#limitations) · [Tests and gates](#tests-and-gates) · [Documentation](#documentation)
 
----
+## Install
+
+Odin has no package manager, so RuneTea is vendored. Either drop the two
+directories into your tree and import them by relative path — which is what
+every example here does — or add the repo as a submodule and give it a
+collection name:
+
+```console
+$ git submodule add https://github.com/DenisBytes/runetea.git vendor/runetea
+$ odin build . -collection:rune=vendor/runetea
+```
+
+<!-- doccheck: skip needs the -collection flag it is documenting; verified by hand, not compilable standalone -->
+```odin
+import rt "rune:runetea"
+import rg "rune:runegloss"
+```
+
+Requires **Odin `dev-2026-07`** or newer. No third-party dependencies, at all —
+`core:` only.
+
+To try it before you vendor it:
+
+```console
+$ git clone https://github.com/DenisBytes/runetea.git && cd runetea
+$ odin run examples/quickstart
+```
 
 ## Quickstart
 
-A complete program. It is
-[`examples/quickstart/main.odin`](examples/quickstart/main.odin), quoted
-verbatim — `tools/doccheck/run.sh` fails the test suite if this block and that
-file ever differ, so what you are reading is a program that compiles and runs.
+Here is a complete program: a list you can move around and tick items off. It
+is [`examples/quickstart/main.odin`](examples/quickstart/main.odin) quoted
+verbatim — the test suite fails if this block and that file ever differ, so
+what you are reading below compiles and runs.
 
 <!-- doccheck: file examples/quickstart/main.odin -->
 ```odin
@@ -132,86 +178,51 @@ main :: proc() {
 }
 ```
 
-Build and run it:
-
 ```console
-$ odin build examples/quickstart -out:quickstart
-$ ./quickstart
+$ odin run examples/quickstart
 ```
 
-Press `j`, then space, then `q`, and the terminal shows this — captured from a
-real pty by `tools/ptyrun`, which is also how the test suite checks it:
+Three things there are worth naming, because they are the three ways RuneTea
+differs from Bubble Tea at the call site:
 
-```text
-What should we buy at the market?
-
-  [ ] Buy carrots
-> [x] Buy celery
-  [ ] Buy kohlrabi
-
-Press q to quit.
-```
-
-Three things in that program are worth naming before anything else, because
-they are the three ways RuneTea differs from Bubble Tea at the call site:
-
-1. **`update` takes `^Model`** and returns only a `Cmd`. Bubble Tea's `Update`
-   takes and returns a model by value.
+1. **`update` takes `^Model`** and returns only a `Cmd`.
 2. **`run()` does not own the terminal.** You call `term_enter_raw` and pair it
-   with `defer term_restore()` yourself. Bubble Tea's `Program` does this for
-   you; here the layer that entered raw mode is the layer that leaves it.
-3. **Every allocation names its allocator.** `view` is handed a per-frame arena
-   and everything it builds from that allocator is reclaimed wholesale when the
+   with `defer term_restore()` yourself — the layer that entered raw mode is the
+   layer that leaves it.
+3. **Every allocation names its allocator.** `view` is handed a per-frame arena;
+   everything it builds from that allocator is reclaimed wholesale when the
    frame ends. Nothing in a view is ever freed by hand.
 
----
+## Coming from Bubble Tea
 
-## The architecture
+If you know Bubble Tea, this table is the whole port.
 
-Three procedures and a struct:
+| Bubble Tea (Go) | RuneTea (Odin) | Why it changed |
+|---|---|---|
+| `tea.Model` interface | `rt.Program($T)` | Parametric, not an interface — Go only checks that your methods *exist*, not that `Update` returns the concrete type it was given. |
+| `Update(Msg) (Model, Cmd)` | `update(m: ^T, msg: any, alloc) -> Cmd` | The by-value round-trip made LLVM codegen superlinear in `sizeof(T)`. See below. |
+| `View() string` | `view(m: T, alloc) -> string` | The allocator is a parameter; the frame arena is reclaimed for you. |
+| `tea.Cmd` = `func() Msg` | `rt.cmd_from(proc, env, alloc)` | Odin has no closures, so the captured environment is an explicit `env` value. |
+| `tea.Msg` = `any` | `any`, **but POD only** | No GC, so message ownership has to be decidable: one allocation per message, freed by the loop. |
+| `tea.Batch(a, b)` | `rt.batch([]rt.Cmd{a, b}, alloc)` | Odin variadics must come last, and the allocator is explicit everywhere. |
+| `tea.Sequence(a, b)` | `rt.sequence([]rt.Cmd{a, b}, alloc)` | Same. |
+| `tea.Tick` | `rt.tick(...)` / `rt.every(...)` | `tick` hands back no handle, so the reissue-from-`update` animation pattern cannot leak. |
+| `tea.Quit` | `rt.quit_cmd()` | — |
+| `tea.NewProgram(m, opts...).Run()` | `rt.term_enter_raw(...)`, then `rt.run(&p, ...)` | Opt-ins are parameters, not functional options; the app owns the tty. |
+| `tea.WithAltScreen()` | `alt = true` | — |
+| `tea.WithMouseCellMotion()` | `mouse = .Button_Event` | — |
+| `lipgloss.NewStyle().Bold(true)` | `s := rg.new_style(); rg.bold(&s, true)` | No method chaining in Odin; `Style` is a plain value you can store in your model. |
 
-<!-- doccheck: decl arch -->
-```odin
-Model :: struct { count: int }
+<details>
+<summary><b>Why <code>update</code> takes a pointer — the measurements</b></summary>
 
-// Mutates the model in place; returns the next Cmd (or rt.cmd_nil()).
-update :: proc(m: ^Model, msg: any, alloc: mem.Allocator) -> rt.Cmd {
-	if k, ok := msg.(rt.Key_Msg); ok && k.code == .Escape { return rt.quit_cmd() }
-	m.count += 1
-	return rt.cmd_nil()
-}
+<br>
 
-// Pure: model in, frame string out, allocated from the frame arena.
-view :: proc(m: Model, alloc: mem.Allocator) -> string {
-	return fmt.aprintf("count: %d", m.count, allocator = alloc)
-}
-```
-
-wired up with `program_init` and driven by `run`:
-
-<!-- doccheck: body arch -->
-```odin
-p: rt.Program(Model)
-rt.program_init(&p, Model{}, update, view)
-// optional, and all defaulted: an initial Cmd, a cursor callback, a render
-// mode, a legacy-key encoding.
-p.render_mode = .Inline
-```
-
-`Program` is parametric over the model type (`Program($T)`) rather than an
-interface. That is *stronger* checking than Go's: Go verifies only that your
-methods exist, not that `Update` returns the same concrete type it was given.
-The cost is that a model cannot be swapped for a different type mid-run — use a
-state enum, or make `T` itself a vtable.
-
-### Why `update` takes a pointer
-
-This is the one deliberate, breaking divergence from Bubble Tea's value-based
-`Update`, and it is not an aesthetic preference: **the by-value round-trip made
-LLVM codegen superlinear in `sizeof(T)`**, which put a hard, invisible ceiling
-on how large a model a RuneTea application could have. Measured as wall-clock
-`odin build` of a minimal program whose model is an `[N]int`, before and after
-(commit `e9773a1`):
+This is the one breaking divergence, and it is not an aesthetic preference.
+Bubble Tea's value-based `Update` made LLVM code generation superlinear in
+`sizeof(T)`, which put a hard, invisible ceiling on how large a model a RuneTea
+application could have. Wall-clock `odin build` of a minimal program whose model
+is an `[N]int`:
 
 | model size | by value | by pointer |
 |---|---|---|
@@ -222,85 +233,71 @@ on how large a model a RuneTea application could have. Measured as wall-clock
 | 1 MiB | not attempted | 1.20 s |
 
 Nothing *fails* at 64 KiB — a build simply stops finishing, which is the worst
-shape a limit can have. The full bisection is in the comment on
-`Program.update` in [`runetea/tea.odin`](runetea/tea.odin).
+shape a limit can have. The full bisection is on `Program.update` in
+[`runetea/tea.odin`](runetea/tea.odin).
 
 **What it cost, stated plainly:** crash recovery no longer protects model
 *state*. With the by-value signature a panicking `update` left the model at its
 last good value, because the recovery jump skipped the assignment. With a
-pointer, `update` writes into your model directly, so a panic partway through
-leaves it half-mutated. RuneTea still guarantees that the process survives, the
-terminal is restored, the frame arena is reclaimed and `run()` returns
-`Panicked_Error` — it guarantees nothing about the model's contents afterwards.
-The only mitigation that works is structural: do everything that can fail
-first, into locals, and write into `m^` last. See
-[`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) 6.6.
+pointer, a panic partway through leaves the model half-mutated. RuneTea still
+guarantees the process survives, the terminal is restored, the frame arena is
+reclaimed and `run()` returns `Panicked_Error` — it guarantees nothing about the
+model's contents afterwards. The mitigation is structural: do everything that
+can fail first, into locals, and write into `m^` last.
+([`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) 6.6.)
 
----
+</details>
 
-## Messages
+## What you get
 
-A `Msg` is any value. `update` receives it as `any` and type-switches on it:
+**Input, decoded properly.** A full CSI/SS3 grammar: arrows, Home/End/PgUp/PgDn,
+F1–F12 in all three encodings, the xterm modifier bitmask, and the
+[Kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/) —
+which makes Tab and Ctrl+I, Enter and Ctrl+M, Escape and Ctrl+`[` **different
+keys** instead of one shared byte. A partially-arrived sequence is never
+decoded; it is held back until it completes or the buffer proves it cannot.
 
-<!-- doccheck: decl arch -->
+**Messages.** Keys, mouse (SGR extended, 0-based cells), window resize via
+`SIGWINCH`, focus/blur, bracketed paste, plus notice messages for the things
+that usually fail silently — which Kitty flags the terminal actually took, a
+background `Cmd` that panicked and was recovered, a timer subsystem that could
+not start.
+
+<!-- doccheck: decl tour -->
 ```odin
+Model :: struct { count: int }
+
 handle :: proc(m: ^Model, msg: any, alloc: mem.Allocator) -> rt.Cmd {
 	switch v in msg {
 	case rt.Key_Msg:                    // a keypress (or a pasted rune)
 		if v.code == .Rune && v.r == 'q' { return rt.quit_cmd() }
-	case rt.Mouse_Msg:                  // press/release/motion/wheel, 0-based cells
+	case rt.Mouse_Msg:                  // press/release/motion/wheel
 		m.count = v.x
 	case rt.Window_Size_Msg:            // SIGWINCH; w/h in cells
 		m.count = v.w
-	case rt.Focus_Msg:                  // terminal focus gained
-	case rt.Blur_Msg:                   // terminal focus lost
+	case rt.Focus_Msg, rt.Blur_Msg:     // terminal focus
 	case rt.Paste_Start_Msg:            // bracketed paste opened
 	case rt.Paste_End_Msg:              // ...and closed
 	case rt.Keyboard_Enhancements_Msg:  // which Kitty flags the terminal took
-	case rt.Panicked_Msg:               // a background Cmd panicked and was recovered
-	case rt.Timer_Unavailable_Msg:      // no tick()/every() on this session will ever fire
+	case rt.Panicked_Msg:               // a background Cmd panicked, and survived
+	case rt.Timer_Unavailable_Msg:      // no tick()/every() will ever fire
 	}
 	return rt.cmd_nil()
 }
 ```
 
-**Every message type must be POD.** `box()` — the function that puts a value on
-the wire — rejects any type with a `string`, pointer, slice, map or `any`
-anywhere in its field tree, at runtime, the first time that path executes. This
-is the single largest permanent ergonomic cost of the design, and it is what
-makes message ownership decidable: exactly one allocation per message, freed by
-the loop. For short text there is `Msg_Text` (a 255-byte inline buffer that
-records whether it truncated); for anything larger, keep the payload in your own
-storage and send a handle.
+**Commands.** Background work that delivers a message back into the loop. No
+closures, so the environment is explicit — `cmd_from` heap-clones it for you.
+`batch` runs children concurrently, `sequence` runs them in order.
 
+<!-- doccheck: decl tour -->
 ```odin
-Fetched_Msg :: struct {
-	id:     int,
-	status: int,
-	err:    rt.Msg_Text,   // NOT `string` -- box() would reject it
-}
-```
-
-Test it once and the runtime check becomes a compile-time-ish guarantee:
-`rt.is_pod_type(Fetched_Msg)` is a plain boolean you can assert in your own
-tests. See [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) 2.1–2.4.
-
----
-
-## Commands
-
-A `Cmd` is work that happens off the update loop and delivers a message back
-into it. Odin has no closures, so the captured environment is explicit: a named
-procedure plus an `env` value that `cmd_from` heap-clones for you.
-
-<!-- doccheck: decl cmds -->
-```odin
-Fetch_Env :: struct { id: int }
+Fetch_Env      :: struct { id: int }
 Fetch_Done_Msg :: struct { id: int, ok: bool }
 
 fetch :: proc(env: rawptr, cancel: ^rt.Cancel_Token) -> any {
 	e := cast(^Fetch_Env)env
-	// ... do the slow thing, polling cancel_requested if it can take a while ...
+	// ... the slow thing, polling `cancel` if it can take a while ...
 	if rt.cancel_requested(cancel) { return nil }
 	return rt.box(Fetch_Done_Msg{id = e.id, ok = true}, context.allocator)
 }
@@ -308,85 +305,114 @@ fetch :: proc(env: rawptr, cancel: ^rt.Cancel_Token) -> any {
 start :: proc(id: int) -> rt.Cmd {
 	return rt.cmd_from(fetch, Fetch_Env{id = id}, context.allocator)
 }
+
+both :: proc() -> rt.Cmd { return rt.batch([]rt.Cmd{start(1), start(2)}, context.allocator) }
 ```
 
-Cancellation is **cooperative polling, never preemption**: a `Cancel_Token`
-cannot interrupt a Cmd blocked in a syscall it never returns from. A Cmd that
-wants to be interruptible must do bounded waits and check the token between
-them. `examples/http` shows the shape.
+> Cancellation is **cooperative polling, never preemption.** A `Cancel_Token`
+> cannot interrupt a Cmd blocked in a syscall that never returns, so quitting
+> takes as long as your slowest blocking Cmd.
 
-**Composition.** `batch` runs its children concurrently; `sequence` runs them
-one after another, each waiting for the last:
+**Every `Msg` must be POD.** `box()` rejects any type with a `string`, pointer,
+slice, map or `any` anywhere in its field tree. That is the largest permanent
+ergonomic cost of the design, and it is what makes ownership decidable without a
+GC. For short text there is `Msg_Text` (a 255-byte inline buffer that records
+whether it truncated); for anything bigger, keep it in your own storage and send
+a handle. `rt.is_pod_type(T)` is a plain boolean you can assert in your own tests.
 
-<!-- doccheck: decl cmds -->
-```odin
-both :: proc() -> rt.Cmd {
-	return rt.batch([]rt.Cmd{start(1), start(2)}, context.allocator)
-}
+**Crash safety, in two tiers.** A panicking `update` or `Cmd` is caught, the
+terminal restored, and `run()` returns rather than leaving the user in a broken
+tty. Fatal signals are caught too, by a handler that is `proc "c"` and
+async-signal-safe. (Bounds violations and nil derefs are *not* recoverable —
+they end the process, with the terminal restored.)
 
-in_order :: proc() -> rt.Cmd {
-	return rt.sequence([]rt.Cmd{start(1), start(2)}, context.allocator)
-}
+## Examples
+
+Each is its own `main` package. All five screens below are real captures.
+
+```console
+$ odin run examples/quickstart   # a list picker -- this README's quickstart
+$ odin run examples/simple       # the smallest possible program: a key counter
+$ odin run examples/spinner      # tick()-driven animation + RuneGloss styling
+$ odin run examples/http         # batch() of two concurrent, cancellable network Cmds
+$ odin run examples/editor       # the whole apparatus at once
 ```
 
-Both take a **slice, not a variadic** (Odin variadics must be last, and the
-allocator is explicit everywhere in this package). A `tick`/`every` placed
-inside a `sequence` gates nothing — see
-[`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) 2.11.
+<details>
+<summary><b>examples/simple</b> — a Model, an update, a view, and nothing else</summary>
 
-**Timers.** `tick` fires once after a duration and hands back no handle, which
-is what makes the common animation pattern — reissue from `update` on every
-fire — structurally unable to leak. `every` repeats on its own and hands back a
-`Timer_Handle` you must pass to `timer_stop` exactly once.
+<br>
 
-<!-- doccheck: decl cmds -->
-```odin
-Frame_Msg :: struct { t: time.Tick }
+```text
+Hi. This program will exit on 'q'.
 
-frame_fn :: proc(env: rawptr, t: time.Tick) -> any {
-	return rt.box(Frame_Msg{t = t}, context.allocator)
-}
+Keys pressed: 4
+```
+</details>
 
-next_frame :: proc() -> rt.Cmd {
-	return rt.tick(100 * time.Millisecond, frame_fn, struct{}{}, context.allocator)
-}
+<details>
+<summary><b>examples/spinner</b> — animation driven entirely by <code>tick</code>, no keypress</summary>
 
-// A poll that runs until you stop it. Keep the handle; call rt.timer_stop(h)
-// exactly once, even if it already fired.
-poll :: proc() -> (rt.Cmd, ^rt.Timer_Handle) {
-	return rt.every(1 * time.Second, frame_fn, struct{}{}, context.allocator)
-}
+<br>
+
+```text
+⠦ Loading forever... press 'q' to quit
 ```
 
-`quit_cmd()` ends the session; returning it from `update` is how a program
-exits.
+Braille frames advanced by a `tick` reissued from `update` on every fire — the
+same pattern Bubble Tea's `bubbles/spinner` uses, and the reason `tick` hands
+back no handle to leak.
+</details>
 
----
+<details open>
+<summary><b>examples/editor</b> — <code>.Diff</code>, alt screen, mouse, paste, Kitty keys, a real cursor</summary>
 
-## Render modes
+<br>
 
-Set `p.render_mode` before `run()`. `.Inline` is the zero value, so a program
-that says nothing keeps the inline renderer.
+```text
+RuneTea editor   arrows Home End PgUp PgDn   Ctrl+<-/-> word   Tab indent   Ctrl+I help   Ctrl+C quit
+--------------------------------------------------------------------------
+  1 Hello, RuneTea! The quick brown fox jumps over the lazy dog.
+  2 Type anything. Arrow keys move the caret, and Left at column 1
+  3 wraps to the end of the previous line.
+  4 Ctrl+Left and Ctrl+Right jump whole words -- that is CSI 1;5D
+  5 and CSI 1;5C, the xterm modifier encoding.
+  6 Backspace deletes backwards (0x7F). Delete deletes FORWARD
+  7 (CSI 3~). They are different sequences and different actions.
+  8 Home and End go to the ends of this line.
+  9 PageUp and PageDown scroll by a whole viewport, which is why
+ 10 this document is deliberately longer than the ten rows the
+--------------------------------------------------------------------------
+Ln 1, Col 17   18 lines   window 1-10   term 106x18   kitty:off   last:insert
+```
+
+Read this one once the quickstart makes sense. Its model, `update` and `view`
+live in a separate package (`examples/editor/edit`) precisely so they can be
+driven through the real `run()` loop from scripted input bytes in a test, rather
+than only by a human staring at a terminal.
+</details>
+
+## The `.Diff` renderer
+
+Set `p.render_mode` before `run()`. `.Inline` is the zero value.
 
 | Mode | What it does | Use it for |
 |---|---|---|
-| `.Inline` | Rewinds over its own previous frame and repaints, leaving output in your scrollback. | Prompts, pickers, progress, anything short that should still be on screen after the program exits. |
-| `.Full_Screen` | Repaints an absolute origin every frame and clears below itself. Truncates content taller than the viewport. | Applications that own the viewport. Pair with `alt = true` (below) for the usual full-screen experience. |
-| `.Diff` | The *same frame* `.Full_Screen` paints, delivered as the minimum set of writes that turns what is on screen into it. | The same applications — over ssh, in tmux, on a slow link, or any time you would rather not repaint an unchanged screen 60 times a second. |
-
-### The measurement
+| `.Inline` | Rewinds over its own previous frame and repaints, leaving output in your scrollback. | Prompts, pickers, progress — anything that should still be on screen after the program exits. |
+| `.Full_Screen` | Repaints from an absolute origin every frame. | Applications that own the viewport. Pair with `alt = true`. |
+| `.Diff` | The **same frame** `.Full_Screen` paints, delivered as the minimum set of writes that turns what is on screen into it. | The same applications — over ssh, in tmux, on a slow link. |
 
 From `./tools/difftest/run.sh measure`, on a 100×30 screen:
 
 ```text
-  identical consecutive frames   repaint 2017 B    diff 0 B   (0.0%)
-  one changed cell               repaint 2017 B    diff 17 B   (0.8%)
-  five changed cells, one line   repaint 2017 B    diff 21 B   (1.0%)
+  identical consecutive frames   repaint 2017 B    diff 0 B      (0.0%)
+  one changed cell               repaint 2017 B    diff 17 B     (0.8%)
+  five changed cells, one line   repaint 2017 B    diff 21 B     (1.0%)
   full-screen change             repaint 2017 B    diff 2055 B   (101.9%)
 
 --- 60 fps for one second, static screen (the ssh case) ---
-  repaint: 121020 bytes/s      diff: 2060 bytes/s (2060 of that is frame 1's
-  initial paint; every later frame is 0)
+  repaint: 121020 bytes/s      diff: 2060 bytes/s
+  (2060 of that is frame 1's initial paint; every later frame is 0)
 
 --- examples/editor, typing 'The quick brown fox' (19 keystrokes) ---
   19 frames    repaint 14341 B total, 754 B/frame
@@ -395,98 +421,27 @@ From `./tools/difftest/run.sh measure`, on a 100×30 screen:
 ```
 
 **An identical consecutive frame costs zero bytes.** That is the single most
-useful fact about this library: a full-screen application can re-render as often
-as it likes and pay nothing for the frames that did not change, and a real
-editor session pays about a seventh of a repaint for the ones that did. The
-worst case — every cell different — is 101.9% of a repaint, i.e. the diff is
-never meaningfully worse than the thing it replaces.
+useful fact about this library: re-render as often as you like and pay nothing
+for the frames that did not change. A real editing session pays about a seventh
+of a repaint for the ones that did, and the worst case — every cell different —
+is 101.9%, so the diff is never meaningfully worse than the thing it replaces.
 
-**What `.Diff` costs you.** It models exactly two escapes per cell, SGR and
-OSC 8 hyperlinks. A view containing a tab, a carriage return, a cursor-motion
-sequence, an erase or a window-title OSC is lying to that model: it renders
-correctly under `.Full_Screen` and wrongly under `.Diff`. This is checkable —
+**What it costs you.** `.Diff` models exactly two escapes per cell: SGR and
+OSC 8 hyperlinks. A view containing a tab, a carriage return, a cursor motion,
+an erase or a window-title OSC is lying to that model — it renders correctly
+under `.Full_Screen` and wrongly under `.Diff`. This is checkable:
 `rt.view_diff_safe(view)` is a public, allocation-free predicate you can assert
-in your own tests, and debug builds assert it on every frame. It also needs the
-terminal's width *and* height; with either unknown it degrades to
-`.Full_Screen`'s exact byte stream. See
-[`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) 3.2 and 3.5.
-
-### The cursor
-
-`.Inline`, `.Full_Screen` and `.Diff` all place the real terminal cursor if you
-ask them to, via an optional per-frame callback. A program that never sets one
-emits not a single extra byte.
-
-```odin
-Prompt_Model :: struct { typed: string }
-
-caret :: proc(m: Prompt_Model, alloc: mem.Allocator) -> rt.Cursor {
-	// `line` indexes the view's "\n"-separated LOGICAL lines. `col` is a
-	// DISPLAY column -- what rt.display_width measures -- and not a byte or
-	// rune index, which would put the caret in the wrong place the moment the
-	// prefix contains a wide rune or a styling escape.
-	prefix := fmt.aprintf("prompt> %s", m.typed, allocator = alloc)
-	return rt.Cursor{line = 2, col = rt.display_width(prefix), show = true}
-}
-```
-
----
-
-## Terminal opt-ins
-
-`term_enter_raw` puts the tty in raw mode and, optionally, turns on terminal
-features. **Every one of them defaults to off, and off means not one byte is
-written.** A terminal must never be left in a state this process did not
-deliberately enter, so each opt-in is paired with a teardown that `term_restore`
-(and the crash-signal path) performs exactly once.
-
-<!-- doccheck: body -->
-```odin
-fd := posix.FD(os.fd(os.stdin))
-
-// install_crash_handlers FIRST -- term_enter_raw arms its restore flag before
-// tcsetattr has touched the tty, and a crash in that window is only
-// recoverable if a handler already exists.
-rt.install_crash_handlers()
-ok := rt.term_enter_raw(
-	fd,
-	{.Disambiguate},  // kb:     Kitty keyboard protocol flags
-	true,             // paste:  bracketed paste (DECSET 2004)
-	.Normal,          // mouse:  .None / .Normal / .Button_Event / .Any_Event
-	false,            // focus:  focus in/out reporting (DECSET 1004)
-	true,             // alt:    the alternate screen buffer (DECSET 1049)
-)
-if !ok { os.exit(1) }
-defer rt.term_restore()
-```
-
-| Parameter | What it buys | What it costs |
-|---|---|---|
-| `kb: Kitty_Flags` | `.Disambiguate` makes Tab and Ctrl+I, Enter and Ctrl+M, Escape and Ctrl+`[` **different keys** instead of one shared byte, and removes the lone-`ESC` ambiguity entirely. `.Report_Event_Types` adds press/repeat/release. `.Alternate_Keys`, `.All_Keys_As_Escapes`, `.Associated_Text` are the rest of the protocol. | Fire-and-forget: a terminal without Kitty support ignores it and keys keep arriving in the legacy encoding. `.Report_Event_Types` makes **every key arrive twice** — enable it only together with a `kind == .Press` filter. |
-| `paste: bool` | Pasted text arrives bracketed by `Paste_Start_Msg`/`Paste_End_Msg`, with every rune flagged `pasted = true`, so a newline in a paste is not Enter and a `q` is not your quit binding. | The content is *streamed* as ordinary `Key_Msg`s, not delivered as one string — a `string` payload is illegal in a Msg. That is O(1) memory for an arbitrarily large paste. |
-| `mouse: Mouse_Mode` | `.Normal` reports press and release; `.Button_Event` adds drag; `.Any_Event` reports every cell the pointer crosses. Coordinates are 0-based cells, matching `Cursor`. | `.Any_Event` is a flood of wakeups. RuneTea always pairs the tracking mode with SGR extended coordinates (`?1006h`), because the legacy encoding cannot express a column past 223. |
-| `focus: bool` | `Focus_Msg` / `Blur_Msg` when the terminal window gains or loses focus. | Nothing, if you handle them. Enabling a mode with no handler behind it is the thing these defaults exist to make easy to avoid. |
-| `alt: bool` | The alternate screen buffer: a cleared buffer of your own, and on exit the user's shell exactly as they left it, scrollback intact. | Deliberately **independent** of `render_mode`. `.Full_Screen` without `alt` repaints over the user's scrollback; `alt` without `.Full_Screen` is a legal (if unusual) inline session inside the alt buffer. Ask for both if you want the usual full-screen experience. |
-
-Whether the terminal actually honoured the Kitty request arrives as a
-`Keyboard_Enhancements_Msg`; a terminal with no support never replies at all,
-so "no message" means "legacy encoding". `examples/editor` prints
-`kitty:on`/`kitty:off` in its status line for exactly this reason.
-
----
+in your own tests, and debug builds assert it on every frame.
 
 ## RuneGloss
 
-`runegloss/` is a styling layer in the shape of Lipgloss: colours with
-automatic down-conversion to what the terminal can actually show, attributes,
-padding, margins, alignment, and borders. Odin has no method chaining, so
-Lipgloss's fluent builder becomes a mutable value plus `^Style` setters.
+Colours with automatic down-conversion to whatever the terminal can actually
+show, attributes, padding, margins, alignment and borders. Odin has no method
+chaining, so Lipgloss's fluent builder becomes a mutable value plus `^Style`
+setters — and a `Style` is a **plain value type**, so you can build it once and
+keep it in your model.
 
-**A `Style` is a plain value type** — no strings, no pointers, no slices — so
-you can store one in your model, copy it, and hand copies around with no
-aliasing. That is why the shipped examples build their styles once in `main`
-and keep them in the `Model` instead of rebuilding them every frame.
-
+<!-- doccheck: decl gloss -->
 ```odin
 styled_box :: proc(alloc: mem.Allocator) -> string {
 	box := rg.new_style()             // profile detected from $NO_COLOR/$TERM/$COLORTERM
@@ -502,9 +457,6 @@ styled_box :: proc(alloc: mem.Allocator) -> string {
 }
 ```
 
-On a truecolour terminal that is a grey rounded frame around a white-on-purple
-box, thirty columns wide:
-
 ```text
 ╭──────────────────────────────╮
 │                              │
@@ -513,166 +465,116 @@ box, thirty columns wide:
 ╰──────────────────────────────╯
 ```
 
-and the bytes it actually emits, with escapes made visible, are:
-
-```text
-\e[38;5;240m╭──────────────────────────────╮\e[0m
-\e[38;5;240m│\e[0m\e[1;38;2;250;250;250;48;2;125;86;244m                              \e[0m\e[38;5;240m│\e[0m
-\e[38;5;240m│\e[0m\e[1;38;2;250;250;250;48;2;125;86;244m       Hello, RuneGloss       \e[0m\e[38;5;240m│\e[0m
-\e[38;5;240m│\e[0m\e[1;38;2;250;250;250;48;2;125;86;244m                              \e[0m\e[38;5;240m│\e[0m
-\e[38;5;240m╰──────────────────────────────╯\e[0m
-```
-
-Note that every style is one SGR sequence with its parameters in a fixed order.
-That is not cosmetic: `.Diff` interns styles by their exact byte spelling, so
-two spellings of the same style are two styles and a cell that "did not change"
-would be repainted forever. RuneGloss guarantees the fixed spelling of anything
-it emits; a hand-written view owes it to itself.
-
 On a terminal that reports no colour — or under `$NO_COLOR` — the profile is
 `.None` and `render` returns its input byte for byte, with no `if` anywhere in
-your view.
+your view. Truecolour degrades to 256 and then to 16 by nearest CIE76 ΔE in
+CIELAB space, not by truncation.
 
-**RuneGloss is deliberately a subset of Lipgloss.** There is no wrapping, no
-truncation, and no `JoinHorizontal`/`JoinVertical`/`table`/`tree`/`list`;
-`width` and `height` are floors, not clamps, so content wider than `width`
-widens the block rather than being cut. See
-[`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) section 7 before assuming
-otherwise.
+Every style RuneGloss emits is **one SGR sequence with its parameters in a fixed
+order**. That is not cosmetic: `.Diff` interns styles by their exact byte
+spelling, so two spellings of one style would be two styles, and a cell that
+"did not change" would repaint forever.
 
----
+> RuneGloss is deliberately a subset of Lipgloss: no wrapping, no truncation, no
+> `JoinHorizontal`/`JoinVertical`/`table`/`tree`/`list`. `width` and `height` are
+> floors, so content wider than `width` widens the block rather than being cut.
 
-## Examples
+## Platform support
 
-Each is its own `main` package. Build with `odin build <dir> -out:<name>`, or
-run straight from source with `odin run`:
+| Platform | Status |
+|---|---|
+| **Linux** | **Verified.** Every test, the race gate, the pty harnesses and every byte-count in this README was run here. |
+| **macOS / BSD** | **Unverified.** The code paths exist and the package compiles, but no machine was available — not one test, not one frame has ever run. |
+| **Windows** | Out of scope for v1.0. It is a separate console backend, not a port. |
 
-```console
-$ odin run examples/quickstart   # this README's quickstart: a list picker, .Inline
-$ odin run examples/simple       # the smallest possible program: a key counter
-$ odin run examples/spinner      # tick()-driven animation + RuneGloss styling
-$ odin run examples/http         # batch() of two concurrent, cancellable network Cmds
-$ odin run examples/editor       # the whole apparatus: .Diff, alt screen, mouse,
-                                 # bracketed paste, Kitty keys, a real cursor
-```
+The terminal-size query is the first thing to expect trouble from on a Mac or a
+BSD; `.Diff` and full-screen truncation both depend on it. **If you run RuneTea
+on either, a bug report — or a green test run — is the single most valuable
+contribution available right now.**
 
-`examples/editor` is the one to read once the quickstart makes sense: its
-model, `update` and `view` live in a separate package (`examples/editor/edit`)
-precisely so they can be driven through the real `run()` loop from scripted
-input bytes in a test, rather than only by a human staring at a terminal.
-
----
-
-## Platforms
-
-**Linux is the verified platform.** Everything in this repository — the 352
-tests, the ThreadSanitizer race gate, the pty harnesses, the byte-count
-measurements — was run on Linux, and the terminal-size query goes through
-`core:sys/linux` directly because `core:sys/posix` exposes neither `ioctl` nor
-a `winsize` struct.
-
-**macOS and BSD are UNVERIFIED.** Those code paths exist and the package
-compiles, but **no Mac or BSD machine was available**, so nothing on them has
-ever been run — not one test, not one frame. Treat any claim about them as
-untested. The size query is the first thing to expect trouble from, and
-`.Diff` mode plus full-screen truncation both depend on it.
-
-**Windows is out of scope for v1.0.** It is a separate console backend, not a
-port.
-
-If you run RuneTea on a Mac or a BSD, a bug report — or a green test run — is
-the single most valuable contribution available right now.
-
----
-
-## Limitations — required reading
+## Limitations
 
 [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) is 1,000 lines and it is not
 marketing. It is the consolidated list of everything RuneTea does not do, does
-not do fully, or does differently from what you would reasonably expect, each
-entry labelled **INTRINSIC** (cannot be fixed without changing the design),
-**NOT-YET-BUILT** (a real gap with a known shape) or **TOOLCHAIN** (Odin's
-`core:` libraries, not RuneTea), each saying when it bites and what to do
-instead, and each cross-referencing the source comment that argues the case.
+not do fully, or does differently from what you would reasonably expect — each
+entry labelled **INTRINSIC**, **NOT-YET-BUILT** or **TOOLCHAIN**, each saying
+when it bites and what to do instead, each citing the source comment that argues
+the case.
 
-**Read it before adopting.** Not skim — read. The entries most likely to change
-your design are:
+**Read it before adopting.** The entries most likely to change your design:
 
-- **2.1** every `Msg` must be POD, checked at *runtime* (2.2).
-- **2.5** cancellation is polling, never preemption; quit takes as long as your
-  slowest blocking Cmd.
-- **3.2** what a `.Diff` view may and may not contain.
-- **5.5** there is no terminfo consultation — measured against 40 installed
-  entries, with the two populations it fails named.
-- **6.5** bounds violations and nil derefs are *not* recoverable; they end the
-  process (with the terminal restored).
-- **6.6** a recovered `update` panic leaves your model half-mutated.
-- **7.1** RuneGloss has no wrapping and no truncation.
-
----
+| | |
+|---|---|
+| **2.1 / 2.2** | Every `Msg` must be POD, checked at *runtime*. |
+| **2.5** | Cancellation is polling, never preemption. |
+| **3.2** | What a `.Diff` view may and may not contain. |
+| **5.5** | No terminfo consultation — measured against 40 installed entries. |
+| **6.5** | Bounds violations and nil derefs are *not* recoverable. |
+| **6.6** | A recovered `update` panic leaves your model half-mutated. |
+| **7.1** | RuneGloss has no wrapping and no truncation. |
 
 ## Tests and gates
 
 ```console
-$ ./tools/test.sh          # 352 tests across three packages, + leak audit + doc gate
+$ ./tools/test.sh          # 352 tests, three packages, + leak audit + doc gate
 $ ./tools/test.sh race     # the real race gate: ThreadSanitizer over tools/racecheck
-$ ./tools/difftest/run.sh  # the diff renderer cross-checked against pyte (needs python3 + pyte)
+$ ./tools/difftest/run.sh  # the diff renderer cross-checked against pyte
 ```
 
-**What each gate actually checks.**
-
-`./tools/test.sh` runs `odin test` over the three packages that hold tests —
-`runetea` (281), `examples/editor/edit` (26) and `runegloss` (45), 352 in total
-— as three invocations rather than one, because both of the latter *import*
-`runetea` and a single test package would be an import cycle. It then does two
-things `odin test` does not:
-
-- **A leak audit.** `odin test`'s tracking allocator prints leaks but does not
-  fail for them, and a suite that always reports leaks cannot report a *new*
-  one. The audit turns the report into a gate: every leak site must be on an
-  allowlist naming exactly one deliberate, bounded entry (one `^Thread` struct
-  per `run()` session), or the run fails.
-- **The documentation gate** (`tools/doccheck/run.sh`): every Odin code block
-  in this README and in [`docs/API.md`](docs/API.md) is extracted and compiled,
-  every `main` package under `examples/` and `tools/` is built, and the
-  quickstart is executed under a real pty and asserted on. A sample that stops
+- **The leak audit** turns `odin test`'s tracking-allocator report into a gate.
+  Every leak site must be on an allowlist naming exactly one deliberate, bounded
+  entry, or the run fails — because a suite that always reports leaks cannot
+  report a *new* one.
+- **The documentation gate** ([`tools/doccheck`](tools/doccheck/run.sh)) extracts
+  and compiles every Odin block in this README and in [`docs/API.md`](docs/API.md),
+  builds all 27 `main` packages, and runs the quickstart under a **real pty**
+  with real keystrokes, asserting on the frames it painted. A sample that stops
   compiling fails the suite.
+- **`./tools/test.sh race` is the real race gate**, and `tsan` is not:
+  `odin test -sanitize:thread` does not detect data races on this toolchain —
+  verified against a deliberate 4-thread unsynchronised counter that raced
+  physically and was reported by `odin build -sanitize:thread` and *not* by
+  `odin test`. The `tsan` mode says so on every run, and is kept only because it
+  still catches allocator failures.
+- **`difftest`** replays both byte streams — the full repaint's and the diff's —
+  through [pyte](https://github.com/selectel/pyte), a third-party VT100 emulator
+  written by people who have never seen this repository, and compares the
+  resulting screens cell for cell. It is deliberately **off** the default gate,
+  because it needs python3 and a missing module inside a test would become a
+  skip, which inside a green run is indistinguishable from a pass.
 
-`./tools/test.sh race` is **the real race gate**. It builds `tools/racecheck` —
-a standalone program that hammers the mailbox, dispatcher, signal watcher,
-timer thread, both event loops and the batch/sequence coordinators under real
-concurrency — with `-sanitize:thread`, and ThreadSanitizer's own non-zero exit
-*is* the gate.
-
-`./tools/test.sh tsan` is **NOT a race gate**, and the mode says so on every
-run. `odin test -sanitize:thread` does not detect data races on this toolchain
-— verified against a deliberate 4-thread unsynchronised counter that raced
-physically (392,997 of 400,000 increments landed) and was reported by
-`odin build -sanitize:thread` and *not* by `odin test -sanitize:thread`. The
-mode is kept only because it still catches allocator and CHECK failures.
-
-`./tools/difftest/run.sh` replays both byte streams — the full repaint's and
-the diff's — through [pyte](https://github.com/selectel/pyte), a third-party
-VT100 emulator written by people who have never seen this repository, and
-compares the resulting screens cell for cell. It is deliberately **off** the
-`test.sh` gate: it needs python3 and pyte, and a missing module inside a test
-would turn into a skip, which inside a green run is indistinguishable from a
-pass. The invariant itself is on the gate, with no external dependencies, in
-`runetea/diff_oracle_test.odin`. `./tools/difftest/run.sh measure` prints the
-byte counts quoted above.
-
----
-
-## Documentation map
+## Documentation
 
 | Where | What |
 |---|---|
 | This file | What RuneTea is, and enough to write a first program. |
-| [`docs/API.md`](docs/API.md) | The public API organised by task — "how do I make a spinner", "how do I handle a resize" — with a full symbol index. |
+| [`docs/API.md`](docs/API.md) | The public API **organised by task** — "how do I make a spinner", "how do I handle a resize" — with a symbol index. |
 | [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) | Everything it does not do. Required reading before adopting. |
-| The source | **The reasoning.** Comments in `runetea/` and `runegloss/` are unusually dense on purpose: they argue the case for each decision, name the alternatives that were rejected, and cite the measurements. `docs/API.md` points into them rather than restating them. |
-| `docs/superpowers/` | Maintainer-facing decision records: cancellation, batch/sequence, message ownership, nbio, render width, tick/every, Tier-1 coverage. |
+| `odin doc runetea` | Every public symbol with its doc comment (`-short` for signatures only). |
+| The source | **The reasoning.** Comments in `runetea/` and `runegloss/` are unusually dense on purpose: they argue each decision, name the alternatives that were rejected, and cite the measurements. |
 
-`odin doc runetea` and `odin doc runegloss` generate a complete symbol
-reference straight from those comments (`-short` for signatures only), which is
-why `docs/API.md` does not try to be one.
+## Contributing
+
+Issues and pull requests are welcome. Two things make a contribution land fast:
+
+1. **`./tools/test.sh` must pass**, including the doc gate. If you change a
+   public signature, the samples in the docs will fail to compile — that is the
+   gate working.
+2. **A test that fails before your fix.** Every bug in this repository was found
+   by something automated; the fastest way to get a fix reviewed is to hand over
+   the thing that catches it.
+
+The single most valuable contribution right now is a test run on macOS or BSD.
+
+## Acknowledgments
+
+RuneTea is a port, and the design is not mine. [Bubble Tea](https://github.com/charmbracelet/bubbletea),
+[Lipgloss](https://github.com/charmbracelet/lipgloss) and the rest of
+[Charm](https://charm.sh) are the original and remain the reference — if you
+write Go, use theirs. Thanks also to [pyte](https://github.com/selectel/pyte),
+whose independence is what makes the diff renderer's correctness checkable at
+all, and to the [Odin](https://odin-lang.org) project.
+
+## License
+
+[MIT](LICENSE)
