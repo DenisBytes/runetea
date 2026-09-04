@@ -8,7 +8,7 @@
 <p align="center">
   <a href="https://github.com/DenisBytes/runetea/blob/main/LICENSE"><img alt="MIT licence" src="https://img.shields.io/badge/licence-MIT-blue.svg"></a>
   <a href="https://odin-lang.org"><img alt="Odin dev-2026-07" src="https://img.shields.io/badge/Odin-dev--2026--07-6699cc.svg"></a>
-  <img alt="508 tests" src="https://img.shields.io/badge/tests-508%20passing-brightgreen.svg">
+  <img alt="513 tests" src="https://img.shields.io/badge/tests-513%20passing-brightgreen.svg">
   <img alt="Linux verified" src="https://img.shields.io/badge/Linux-verified-brightgreen.svg">
   <img alt="macOS and BSD unverified" src="https://img.shields.io/badge/macOS%20%7C%20BSD-unverified-orange.svg">
   <a href="docs/API.md"><img alt="API docs" src="https://img.shields.io/badge/docs-API-informational.svg"></a>
@@ -704,12 +704,12 @@ pointing at a line that has moved is a build failure.
 ## Tests and gates
 
 ```console
-$ ./tools/test.sh          # 508 tests, seven packages, + leak audit + doc gate + pyte
+$ ./tools/test.sh          # 513 tests, seven packages, + leak audit + doc gate + pyte
 $ ./tools/test.sh race     # the real race gate: ThreadSanitizer over tools/racecheck
 $ ./tools/difftest/run.sh  # the diff renderer cross-checked against pyte, on its own
 ```
 
-508 is `runetea` 387 + `examples/editor/edit` 41 + `runegloss` 66 +
+513 is `runetea` 392 + `examples/editor/edit` 41 + `runegloss` 66 +
 `examples/{quickstart,simple,spinner,http}` 3 + 3 + 4 + 4. The four single-file
 examples joined the gate last: `odin test` works on a `package main` (the
 generated runner supplies its own entry point), and until they were on it the

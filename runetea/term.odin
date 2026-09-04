@@ -309,9 +309,23 @@ kitty_push_seq :: proc "c" (kb: Kitty_Flags, buf: []u8) -> []u8 {
 // painted a wall of CUP/ED/SGR at a terminal that renders every byte of it
 // literally. term_enter_raw now gates its own opt-ins on this (see term_acquire),
 // which covers the keyboard push, bracketed paste, mouse tracking and the
-// alternate screen; the renderer's absolute addressing is not this file's to
-// gate, so an application that wants to degrade THAT should consult this and
-// pick its Render_Mode accordingly.
+// alternate screen.
+//
+// AND SO DOES THE RENDERER, which this comment used to say was out of reach.
+// guarded_render (tea.odin) reads this proc once per frame into Renderer.plain,
+// and a false verdict routes .Inline, .Full_Screen and .Diff alike through
+// render_plain (render.odin) -- no CUP, no ED, no EL, no SGR, and the view's
+// own escapes stripped on the way out. The advice that used to stand here --
+// "the renderer's absolute addressing is not this file's to gate, so an
+// application that wants to degrade THAT should consult this and pick its
+// Render_Mode accordingly" -- is now both unnecessary and actively bad: no
+// Render_Mode paints escapes at a terminal that says it has none, so choosing
+// one on this basis buys nothing and gives up whatever the mode was picked for.
+//
+// WHICH LEAVES THE APPLICATION'S OWN OUTPUT as the reason this stays public: a
+// hand-rolled SGR, a progress bar drawn with \r, anything written outside
+// view() or after term_restore. The library cannot see those, and this is how
+// an application asks the same question the library now asks itself.
 //
 // Not cached: one getenv per acquire is nothing, and a cached verdict is a
 // second source of truth for a question the environment already answers. What IS

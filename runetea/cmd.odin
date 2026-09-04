@@ -1335,10 +1335,27 @@ dispatch_ex :: proc(d: ^Dispatcher, c: Cmd, done: ^sync.Wait_Group) -> bool {
 	// c.env IS NOT FREED. It lives in the frame arena, which owns it and will
 	// reclaim it wholesale; handing it to free() with an arena allocator would
 	// at best be a no-op and at worst hand a Tracking_Allocator a pointer it
-	// never issued. Only Cmds with an env of their own are visible here --
-	// a Tick/Every's cloned fn env and a batch()'s child list are recorded on
-	// the Timer_Handle and the Compose_Spec, not on c.allocator, so those two
-	// kinds are covered by the constructor check alone.
+	// never issued.
+	//
+	// WHAT THIS BRANCH DOES NOT SEE, stated exactly, because an earlier version
+	// of this comment claimed coverage the code does not have. The gate is
+	// `c.env != nil`, and TWO Cmd kinds have a nil env by construction: a
+	// Tick/Every keeps its cloned fn env on the Timer_Handle, and a
+	// batch()/sequence() keeps its child list and Compose_Spec on c.compose. So
+	// neither is ever examined here. Note that it is the ENV test that excludes
+	// them and not the allocator test -- compose() does stamp `allocator = alloc`
+	// on the Cmd it returns, and this branch would have matched it; it simply
+	// never gets that far.
+	//
+	// For those two kinds the constructor check is therefore the ONLY coverage,
+	// not the first of two layers -- which is why batch()/sequence() acquiring
+	// their own cmd_alloc_contract_check mattered: until they had one they were
+	// caught at NEITHER end, and a two-child batch() handed update()'s `alloc`
+	// executed 0 of 20 children in silence (see compose, batch.odin, for the
+	// measurement and its control). What remains uncovered for a Tick or a
+	// compose is precisely the population this backstop exists for: one built
+	// from a smuggled frame allocator while no frame was armed, dispatched
+	// later. That gap is real and is not closed by anything here.
 	if c.env != nil && is_frame_allocator(c.allocator) {
 		deliver_report(d, box(Panicked_Msg{message = msg_text_from(
 			CMD_ALLOC_CONTRACT_PANIC + "dispatch(): this Cmd's env was allocated from update()'s frame allocator, which is reclaimed at the end of the frame -- it was NOT run, because it could only have read a zeroed env. Build it with context.allocator.")},

@@ -1,5 +1,6 @@
 package runetea
 
+import "base:runtime"
 import "core:mem"
 import "core:sync"
 
@@ -100,8 +101,16 @@ Compose_Spec :: struct {
 // explicit (this package's convention throughout, see cmd_from/tick/every)
 // -- `batch([]Cmd{a, b}, context.allocator)` is the resulting shape at a
 // call site. A small, real ergonomic cost of the port, not an oversight.
-batch :: proc(cmds: []Cmd, alloc: mem.Allocator) -> Cmd {
-	return compose(cmds, .Batch, alloc)
+//
+// `alloc` MUST OUTLIVE THE FRAME, exactly as it must for cmd_from and tick:
+// the child list and the Compose_Spec are cloned into it and read on the
+// coordinator's own thread, after the frame that built the Cmd is gone.
+// Passing update()'s own `alloc` is refused here -- see compose below for the
+// measurement, and cmd.odin's THE FRAME ALLOCATOR IS NOT A Cmd ALLOCATOR for
+// the mechanism. `loc` is defaulted and exists only so the refusal can name
+// the call site; no existing call changes.
+batch :: proc(cmds: []Cmd, alloc: mem.Allocator, loc := #caller_location) -> Cmd {
+	return compose(cmds, .Batch, alloc, loc)
 }
 
 // sequence(cmds, alloc) -> a Cmd that, once dispatched, runs every Cmd in
@@ -109,8 +118,11 @@ batch :: proc(cmds: []Cmd, alloc: mem.Allocator) -> Cmd {
 // one has entirely finished (a nested batch()/sequence() child counts as
 // "finished" only once ALL of ITS OWN children are done, see this file's own
 // top comment). Contrast batch() above, which runs them concurrently.
-sequence :: proc(cmds: []Cmd, alloc: mem.Allocator) -> Cmd {
-	return compose(cmds, .Sequence, alloc)
+//
+// `alloc` MUST OUTLIVE THE FRAME and update()'s own is refused -- see batch()
+// above, and compose below.
+sequence :: proc(cmds: []Cmd, alloc: mem.Allocator, loc := #caller_location) -> Cmd {
+	return compose(cmds, .Sequence, alloc, loc)
 }
 
 // Shared construction path for batch()/sequence() -- filters nil Cmds
@@ -123,8 +135,85 @@ sequence :: proc(cmds: []Cmd, alloc: mem.Allocator) -> Cmd {
 // overhead for what is, at that point, just an ordinary single Cmd. Only
 // n >= 2 ever allocates a Compose_Spec and therefore ever costs a
 // coordinator thread (compose_dispatch, below) at all.
+//
+// ---------------------------------------------------------------------------
+// THE FRAME ALLOCATOR IS REFUSED HERE TOO (F07), and this is the ONLY place it
+// can be refused for a batch()/sequence() -- read on, because the obvious
+// assumption ("dispatch_ex's backstop covers it") is false.
+//
+// WHAT USED TO HAPPEN. `return batch([]Cmd{a, b}, alloc)` from update() is the
+// same one-allocator-in-scope mistake cmd_from's own comment dissects, and it
+// was silent in the same way and for one extra reason. The child list AND the
+// Compose_Spec are cloned into `alloc`, and the Cmd carries the spec on
+// `c.compose`; dispatch_ex hands that pointer to compose_dispatch, which copies
+// it into a Compose_Env and spawns the coordinator thread -- all still inside
+// the frame, all still valid. Then guarded_render calls frame_reset(fa) and the
+// coordinator wakes up on a spec that virtual.Arena has zeroed. `kind` reads as
+// .Batch (enum 0), `cmds` reads as a nil slice, so compose_run_batch fans out
+// over nothing; `spec.alloc` reads as a zeroed mem.Allocator, and Odin's
+// mem_free returns early on a nil `procedure`, so even the frees are no-ops.
+// Nothing crashes and nothing complains.
+//
+// MEASURED, and measured against a CONTROL, because the obvious probe does not
+// isolate anything: drive a program with input_source_from_bytes and its EOF
+// quits the loop immediately, and quit CANCELS a coordinator's fan-out
+// (compose_run_batch's cancel_requested check), so a perfectly legal batch()
+// scores zero children there too. The isolating measurement arms a real
+// Frame_Arena, builds the batch, dispatches it, and calls frame_reset exactly
+// where guarded_render calls it -- 10 runs each: a two-child batch() built from
+// the frame allocator executed 0 of 20 children; the SAME batch built from
+// context.allocator executed 20 of 20. End to end through run(), the
+// frame-allocated version returned nil, exited 0, and printed nothing at all;
+// a tracking allocator on that run counted every child's env stranded (6 x
+// 8 bytes over 3 runs), because the fan-out that would have freed them is the
+// thing that never happened.
+//
+// WHY dispatch_ex's BACKSTOP DOES NOT COVER THIS, which is the whole reason the
+// constructor check is load-bearing rather than a second line of defence. That
+// backstop reads `if c.env != nil && is_frame_allocator(c.allocator)`. A compose
+// Cmd's `env` is nil BY CONSTRUCTION -- everything it owns hangs off `c.compose`
+// -- so the backstop skips it before it ever looks at the allocator. (The
+// allocator half would have matched: compose stamps `allocator = alloc` on the
+// Cmd it returns. It is the env test, not the allocator test, that lets a
+// compose Cmd through.) So for batch()/sequence() this constructor check is not
+// one of two halves; it is the only half there is. dispatch_ex's comment used to
+// claim otherwise and has been corrected.
+//
+// CHECKED BEFORE THE FILTER LOOP, ahead of the n == 0 and n == 1 early returns,
+// and that is deliberate. Those two paths allocate nothing from `alloc`, so
+// refusing them refuses calls that would in fact have worked. The alternative
+// is worse: a check placed after the filter makes the refusal DATA-DEPENDENT --
+// `batch([]Cmd{a, b}, alloc)` blows up while the same line with one of the two
+// Cmds currently nil sails through, and the bug appears the day a second child
+// stops being nil. A contract violation that fires on Tuesday and not on Monday
+// is the kind of check that teaches people the check is unreliable. `alloc` is
+// wrong here whether or not this particular call happens to reach the make().
+//
+// WHAT THE REFUSAL DOES NOT DO is reclaim the children the caller had already
+// built: it panics before compose takes ownership of anything, so `a` and `b`
+// in `batch({a, b}, alloc)` are left un-freed. That is accepted rather than
+// overlooked -- the panic ends the session (apply_msg turns it into
+// Panicked_Error, run() returns it, exit_code makes it status 1), so those
+// bytes outlive nothing but a process already on its way out, and cleaning
+// them up would mean this proc taking ownership of a list it is in the middle
+// of refusing.
+//
+// ONE ALLOCATOR, ONE CHECK. `alloc` is the spec's allocator, the child slice's
+// allocator, and the Cmd's `allocator` field -- compose uses the same value for
+// all three (and Compose_Spec.alloc is what every free path reads), so there is
+// nothing else here to test. A CHILD's own env is not this proc's to judge: it
+// was cloned by whoever built the child, and cmd_from/tick/every already refused
+// the frame allocator at that point -- or, for a child smuggled in from an
+// unarmed context, dispatch_ex's backstop still sees it when the coordinator
+// dispatches it (`c.env != nil` holds for a leaf Cmd), provided a frame is armed
+// at that moment. That last proviso is a real gap and it is named, not papered
+// over: a coordinator runs on its own thread, so a leaf child whose env came
+// from a frame arena can be dispatched between frames and slip past both checks.
+// ---------------------------------------------------------------------------
 @(private = "file")
-compose :: proc(cmds: []Cmd, kind: Compose_Kind, alloc: mem.Allocator) -> Cmd {
+compose :: proc(cmds: []Cmd, kind: Compose_Kind, alloc: mem.Allocator, loc: runtime.Source_Code_Location) -> Cmd {
+	cmd_alloc_contract_check(kind == .Batch ? "batch()" : "sequence()", alloc, loc)
+
 	n := 0
 	only: Cmd
 	for c in cmds {

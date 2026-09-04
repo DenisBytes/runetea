@@ -8,6 +8,7 @@ package runetea
 
 import "core:fmt"
 import "core:mem"
+import "core:mem/virtual"
 import "core:strings"
 import "core:sync"
 import "core:testing"
@@ -671,4 +672,233 @@ test_listing_the_same_cmd_twice_in_one_batch_runs_it_once :: proc(t: ^testing.T)
 
 	dispatcher_destroy(&d)
 	mailbox_destroy(&m)
+}
+
+// ============================================================================
+// F07 FOR THE COMPOSING CONSTRUCTORS. cmd_from/tick/every already refused
+// update()'s own frame allocator; batch()/sequence() did not, and the gap was
+// not cosmetic -- it was the WORST of the four, because a compose Cmd is also
+// the one kind dispatch_ex's backstop structurally cannot see (that test is
+// `c.env != nil`, and a compose Cmd's env is nil by construction; everything it
+// owns hangs off c.compose). So for batch()/sequence() there was no check at
+// either end.
+//
+// WHAT IT COST, and the number is measured against a CONTROL because the
+// obvious probe isolates nothing. Arm a real Frame_Arena, build the batch,
+// dispatch it, call frame_reset exactly where guarded_render calls it, 10 runs
+// each: a two-child batch() built from the frame allocator executed 0 of 20
+// children; the SAME batch built from context.allocator executed 20 of 20. The
+// arena zeroes reused blocks, so the coordinator woke on a Compose_Spec reading
+// kind=.Batch / cmds=nil and fanned out over an empty list. End to end through
+// run(), that program returned nil, exited 0 and printed nothing at all, with a
+// tracking allocator counting every child's env stranded (6 x 8 bytes over 3
+// runs) because the fan-out that would have freed them never happened.
+//
+// WHY THE CONTROL IS PART OF THE MEASUREMENT AND NOT DECORATION: "0 children
+// ran" is evidence against the allocator only if the same harness can be shown
+// counting children that DO run. Driving a Program with input_source_from_bytes
+// cannot show that -- EOF quits the loop on the next tick, quit cancels the
+// coordinator's fan-out (compose_run_batch's cancel_requested check), and a
+// perfectly LEGAL batch() scores 0 of 20 there as well. Measured, both ways.
+// Hence the dispatcher-level control below, where the frame_reset is explicit
+// and nothing cancels anything.
+// ============================================================================
+
+@(private = "file")
+g_frame_alloc_children: int
+
+@(private = "file")
+Frame_Alloc_Done :: struct {}
+
+// The children are env-LESS, built as Cmd literals rather than through
+// cmd_from, and that is not laziness. The refusal is raised from inside
+// update() and unwinds by longjmp, which discards the children the caller had
+// already built -- a real caller's `batch({a, b}, alloc)` strands a and b's
+// envs exactly once, on a session that is ending anyway (see compose's own
+// comment). Reproducing that strand HERE would put an 8-byte cmd_from leak in
+// front of odin test's tracking allocator on every run and hollow out
+// tools/test.sh's leak audit for everyone else. A zero ticket and a nil env
+// mean these Cmds own nothing, so the refused path and the control path are
+// both leak-clean, and the thing being counted -- whether a child's body ever
+// executes -- is untouched by the difference.
+//
+// It returns a Msg as well as bumping the counter, and that Msg is what makes
+// the control a synchronisation point rather than a sleep: dispatcher_destroy
+// CANCELS before it waits, so a coordinator that has not yet fanned out
+// abandons its whole list and the counter reads 0 for a batch that was never
+// given a chance to run. Blocking on two mailbox_recv calls waits for the
+// children themselves.
+@(private = "file")
+frame_alloc_child :: proc(env: rawptr, cancel: ^Cancel_Token) -> any {
+	sync.atomic_add(&g_frame_alloc_children, 1)
+	return box(Frame_Alloc_Done{}, context.allocator)
+}
+
+@(private = "file")
+Frame_Alloc_Model :: struct { fired: bool }
+
+@(private = "file")
+frame_alloc_view :: proc(m: Frame_Alloc_Model, alloc: mem.Allocator) -> string { return "x" }
+
+// Runs `update` over one keystroke of input and hands back whatever run()
+// returned. The refusal happens inside update() on the FIRST message, so the
+// session never reaches a second one and the input length is irrelevant.
+@(private = "file")
+run_frame_alloc_program :: proc(update: proc(m: ^Frame_Alloc_Model, msg: any, alloc: mem.Allocator) -> Cmd) -> (Run_Error, int) {
+	sync.atomic_store(&g_frame_alloc_children, 0)
+
+	src := input_source_from_bytes(transmute([]u8)string("x"))
+	defer input_close(&src)
+	b := strings.builder_make(); defer strings.builder_destroy(&b)
+
+	p: Program(Frame_Alloc_Model)
+	program_init(&p, Frame_Alloc_Model{}, update, frame_alloc_view)
+	err := run(&p, &src, &b)
+	return err, sync.atomic_load(&g_frame_alloc_children)
+}
+
+// THE CONTROL. A batch() whose allocator outlives the frame runs both of its
+// children even though the frame arena it was built DURING has been reset
+// underneath it -- which is the whole claim the refusal rests on, stated in the
+// positive so that "0 children" below cannot be an artefact of a harness that
+// never dispatches anything.
+@(test)
+test_a_batchs_children_both_run_when_its_allocator_outlives_the_frame :: proc(t: ^testing.T) {
+	sync.atomic_store(&g_frame_alloc_children, 0)
+
+	fa: Frame_Arena
+	testing.expect_value(t, frame_arena_init(&fa), nil)
+	defer frame_arena_destroy(&fa)
+
+	m: Mailbox
+	testing.expect_value(t, mailbox_init(&m, 16), nil)
+	d: Dispatcher
+	dispatcher_init(&d, &m, 4)
+
+	// A frame is armed for the construction, exactly as apply_msg arms one --
+	// so this also pins that the check keys on the allocator's IDENTITY and not
+	// on "a frame is in flight".
+	prev := frame_guard_arm(frame_allocator(&fa))
+	dispatch(&d, batch([]Cmd{
+		Cmd{procedure = frame_alloc_child},
+		Cmd{procedure = frame_alloc_child},
+	}, context.allocator))
+	frame_guard_disarm(prev)
+	frame_reset(&fa)   // end of frame, exactly where guarded_render calls it
+
+	for _ in 0 ..< 2 {
+		msg, ok := mailbox_recv(&m)
+		defer box_free(msg, context.allocator)
+		testing.expect(t, ok, "both children must deliver -- this recv is what waits for them")
+	}
+	ran := sync.atomic_load(&g_frame_alloc_children)
+
+	dispatcher_destroy(&d)
+	mailbox_destroy(&m)
+
+	testing.expectf(t, ran == 2, "a batch() given an allocator that outlives the frame must run both children, got %d of 2", ran)
+}
+
+@(test)
+test_a_batch_given_updates_own_frame_allocator_is_refused :: proc(t: ^testing.T) {
+	update :: proc(m: ^Frame_Alloc_Model, msg: any, alloc: mem.Allocator) -> Cmd {
+		if m.fired { return cmd_nil() }
+		m.fired = true
+		return batch([]Cmd{
+			Cmd{procedure = frame_alloc_child},
+			Cmd{procedure = frame_alloc_child},
+		}, alloc)
+	}
+
+	err, ran := run_frame_alloc_program(update)
+	pe, panicked := err.(Panicked_Error)
+	defer delete(pe.message, context.allocator) // the caller owns it -- see Panicked_Error's own doc comment (tea.odin)
+	if !testing.expect(t, panicked, "a batch() built from update()'s frame allocator must end the session, not coordinate over memory about to be reclaimed") { return }
+	testing.expectf(t, strings.contains(pe.message, "batch()"),
+		"the refusal must name the constructor that was misused, got %q", pe.message)
+	testing.expectf(t, strings.contains(pe.message, CMD_ALLOC_CONTRACT_PANIC),
+		"the refusal must carry the contract marker apply_msg escalates on, got %q", pe.message)
+	// The old behaviour's number, now reached by refusal instead of by
+	// silence: what changed is not that the children run, it is that nothing
+	// pretends they did.
+	testing.expectf(t, ran == 0, "no child may run after the refusal, got %d", ran)
+}
+
+// sequence() is pinned separately from batch() rather than assumed: they are
+// two exported entry points, and a check written into only one of them is
+// exactly the shape of the gap this test exists to close (cmd_from, tick,
+// tick_cancellable and every each got their own call for the same reason).
+@(test)
+test_a_sequence_given_updates_own_frame_allocator_is_refused :: proc(t: ^testing.T) {
+	update :: proc(m: ^Frame_Alloc_Model, msg: any, alloc: mem.Allocator) -> Cmd {
+		if m.fired { return cmd_nil() }
+		m.fired = true
+		return sequence([]Cmd{
+			Cmd{procedure = frame_alloc_child},
+			Cmd{procedure = frame_alloc_child},
+		}, alloc)
+	}
+
+	err, ran := run_frame_alloc_program(update)
+	pe, panicked := err.(Panicked_Error)
+	defer delete(pe.message, context.allocator)
+	if !testing.expect(t, panicked, "a sequence() built from update()'s frame allocator must end the session") { return }
+	testing.expectf(t, strings.contains(pe.message, "sequence()"),
+		"the refusal must name sequence(), not batch() -- the two share compose() and could easily have shared its label too, got %q", pe.message)
+	testing.expectf(t, ran == 0, "no child may run after the refusal, got %d", ran)
+}
+
+// THE ARITY THE CHECK DELIBERATELY DOES NOT EXEMPT, and the reason it sits
+// ahead of the nil-filter rather than after it. compose() allocates nothing at
+// all for n <= 1 -- zero non-nil children is cmd_nil(), exactly one is that
+// child returned unwrapped -- so a check placed after the filter would let
+// `batch({a, nil}, alloc)` through and then refuse the identical source line
+// the day the second child stops being nil. A contract violation that fires on
+// Tuesday and not on Monday is how a check teaches people it is unreliable.
+// `alloc` is wrong here whether or not this particular call reaches the make(),
+// so an empty batch() is refused as loudly as a two-child one.
+@(test)
+test_an_empty_batch_on_the_frame_allocator_is_refused_though_it_allocates_nothing :: proc(t: ^testing.T) {
+	update :: proc(m: ^Frame_Alloc_Model, msg: any, alloc: mem.Allocator) -> Cmd {
+		if m.fired { return cmd_nil() }
+		m.fired = true
+		return batch([]Cmd{}, alloc)   // n == 0: nothing would ever have been cloned into `alloc`
+	}
+
+	err, _ := run_frame_alloc_program(update)
+	pe, panicked := err.(Panicked_Error)
+	defer delete(pe.message, context.allocator)
+	testing.expect(t, panicked, "the refusal is about the allocator, not about whether this arity happens to allocate")
+}
+
+// THE FALSE REFUSAL THIS MUST NOT HAVE. The check is the frame arena's
+// IDENTITY, never "any allocator that is not context.allocator" -- an
+// application's own long-lived arena is a perfectly correct home for a
+// Compose_Spec and must pass at every arity. cmd_test.odin's
+// test_an_applications_own_arena_is_not_mistaken_for_the_frame_arena pins the
+// predicate itself; this pins that batch() actually calls that predicate and
+// not a coarser one of its own.
+@(test)
+test_batch_does_not_refuse_an_allocator_that_merely_looks_like_an_arena :: proc(t: ^testing.T) {
+	fa: Frame_Arena
+	testing.expect_value(t, frame_arena_init(&fa), nil)
+	defer frame_arena_destroy(&fa)
+
+	mine: virtual.Arena
+	testing.expect_value(t, virtual.arena_init_growing(&mine), nil)
+	defer virtual.arena_destroy(&mine)
+
+	prev := frame_guard_arm(frame_allocator(&fa))
+	defer frame_guard_disarm(prev)
+
+	// A live frame is armed -- the strictest moment there is -- and this batch()
+	// still has to build, because `mine` is not that frame's arena.
+	c := batch([]Cmd{
+		Cmd{procedure = frame_alloc_child},
+		Cmd{procedure = frame_alloc_child},
+	}, virtual.arena_allocator(&mine))
+	testing.expect(t, c.compose != nil,
+		"an application's own virtual.Arena outlives the frame and must not be refused")
+	// virtual.arena_destroy above reclaims the spec and its child list; the
+	// children own nothing (nil env, zero ticket), so nothing else is owed.
 }
