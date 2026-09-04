@@ -181,10 +181,44 @@ Styles :: struct {
 Model :: struct {
 	checks: [2]Check_Slot,
 	st:     Styles,
+	// F47. The window's width: a target column of TARGET_COLS plus a status is
+	// 40-odd columns, and under .Inline a line that wraps costs a physical row
+	// the renderer's rewind does not know about. Seeded in main from
+	// rt.term_size, kept live from Window_Size_Msg; 0 is "unknown" and never
+	// trips the guard.
+	term_w: int,
+	// F47's HEIGHT half. The note that used to sit above -- "this view is TWO
+	// ROWS ... so there is no minimum HEIGHT worth guarding: two rows fit any
+	// terminal anyone has" -- was false, and MIN_ROWS carries the measurement
+	// that falsified it.
+	term_h: int,
 }
 
 // Wide enough for "http://example.com:80" plus room, so the two results line up.
 TARGET_COLS :: 28
+
+// The target column, its two-space gutter, and enough room for the longest
+// thing that can follow it ("error: connection refused" and its like). Below
+// this view() drops the target column entirely -- see its own note.
+MIN_COLS :: TARGET_COLS + 2 + 26
+
+// ONE ROW PER CHECK, PLUS ONE. The +1 is not slack: render_inline
+// (runetea/render.odin) terminates EVERY line of the frame with "\r\n",
+// including the last, because the next frame's rewind counts \e[1A\e[2K pairs
+// upward from column 1 of the row below the frame. A frame of R rows therefore
+// occupies R+1 terminal rows, and painting R into exactly R scrolls the top
+// row into scrollback, where r.last_rows' clamp to term_height-1 guarantees no
+// later rewind can reach it.
+//
+// MEASURED under a real pty (pyte replay, both checks resolved, 90 columns):
+//   rows = 2  the screen shows ONE line, "http://example.org:80  200".  The
+//             example.com row was painted and then scrolled away, permanently.
+//             A two-row program, silently showing half its output, on a
+//             terminal with exactly as many rows as it has lines.
+//   rows = 3  both rows present, and every taller terminal is correct.
+// Written as len(Model{}.checks) + 1 rather than 3 so that adding a check
+// cannot silently make the minimum wrong.
+MIN_ROWS :: len(Model{}.checks) + 1
 
 // Built once, in main, so the terminal is sniffed once rather than per frame.
 // rg.new_style() -- not new_style_profile -- because this is an APPLICATION
@@ -196,6 +230,8 @@ make_styles :: proc() -> Styles {
 	st.target = rg.new_style()
 	rg.faint(&st.target, true)
 	rg.width(&st.target, TARGET_COLS)
+	rg.overflow(&st.target, .Truncate)
+	rg.ellipsis(&st.target, "…")
 
 	st.pending = rg.new_style()
 	rg.fg(&st.pending, rg.color(244))
@@ -216,7 +252,16 @@ make_styles :: proc() -> Styles {
 // rt.Program.update (runetea/tea.odin).
 update :: proc(m: ^Model, msg: any, alloc: mem.Allocator) -> rt.Cmd {
 	switch v in msg {
+	case rt.Window_Size_Msg:
+		// w == 0 / h == 0 is rt's "the ioctl failed" sentinel; ignore it rather
+		// than clobbering a known-good size.
+		if v.w > 0 { m.term_w = v.w }
+		if v.h > 0 { m.term_h = v.h }
 	case rt.Key_Msg:
+		// PASTED TEXT IS NOT KEYSTROKES (F37). main enables bracketed paste, so
+		// a paste arrives as runes with `pasted` set; without this branch a
+		// pasted 'q' would quit in the middle of two in-flight network checks.
+		if v.pasted { return rt.cmd_nil() }
 		if v.code == .Rune && (v.r == 'q' || (v.r == 'c' && .Ctrl in v.mods)) {
 			return rt.quit_cmd()
 		}
@@ -243,30 +288,57 @@ all_checks_done :: proc(m: Model) -> bool {
 }
 
 view :: proc(m: Model, alloc: mem.Allocator) -> string {
-	// Local copies: rg.render takes a ^Style and `m` is a procedure PARAMETER,
-	// which Odin makes immutable and non-addressable. See examples/spinner's view.
-	st := m.st
+	// NO LOCAL COPY ANY MORE. This used to be `st := m.st` because rg.render
+	// took a ^Style and `m` is a procedure PARAMETER, which Odin makes
+	// immutable and non-addressable. rg.render is a proc group now (runegloss's
+	// F49/F52 fix) and takes a Style by value as well as by pointer, so the
+	// fields are used where they are read.
+	// F47, the HEIGHT half. One line that fits, rather than a frame whose
+	// first rows the terminal scrolls into unreachable scrollback (MIN_ROWS
+	// carries the pty measurement). This branch is REACHED, not defensive: at
+	// two rows the unguarded view dropped the first check silently, and one
+	// row is the only height at which even this line cannot be shown -- see
+	// docs/LIMITATIONS.md 3.20 for why that one is not the example's to fix.
+	// Truncated to the width for the same reason the narrow branch below
+	// exists: a wrapped "need N rows" line costs a second physical row and
+	// re-creates the problem it is reporting.
+	if m.term_h > 0 && m.term_h < MIN_ROWS {
+		line := fmt.aprintf("need %d rows, have %d", MIN_ROWS, m.term_h, allocator = alloc)
+		if m.term_w > 0 { line = rg.truncate(line, m.term_w, alloc = alloc) }
+		return fmt.aprintf("%s\n", line, allocator = alloc)
+	}
+	// F47. Below the width one line needs, the targets are dropped and only the
+	// outcomes are printed -- a wrapped .Inline frame slides down the screen
+	// one row per repaint, so a narrow window has to be given something that
+	// FITS rather than something that is merely complete.
+	narrow := m.term_w > 0 && m.term_w < MIN_COLS
 	sb := strings.builder_make(alloc)
 	for c in m.checks {
 		// One column of fixed-width targets so the results line up whichever
-		// check finishes first -- rg.width is a FLOOR, so a host name longer than
-		// TARGET_COLS widens its own line rather than being truncated, and the
-		// column simply stops being a column. That is the honest failure mode for
-		// a layout with no wrapping in it.
-		target := fmt.aprintf("http://%s:%d", c.host, c.port, allocator = alloc)
-		fmt.sbprintf(&sb, "%s  ", rg.render(&st.target, target, alloc))
+		// check finishes first. rg.width is an EXACT clamp now (runegloss's
+		// F06/F21 fix), not the floor it was: a host name longer than
+		// TARGET_COLS is cut with an ellipsis instead of widening its own line
+		// and destroying the column. `.Truncate` and not the default `.Wrap`
+		// because this is .Inline -- a wrapped row costs a physical row the
+		// renderer's rewind does not know about, and the frame then walks down
+		// the screen. The column is set in make_styles; narrower than
+		// TARGET_COLS + a status the whole layout is dropped, below.
+		if !narrow {
+			target := fmt.aprintf("http://%s:%d", c.host, c.port, allocator = alloc)
+			fmt.sbprintf(&sb, "%s  ", rg.render(m.st.target, target, alloc))
+		}
 		switch {
 		case c.err != "":
-			fmt.sbprintfln(&sb, "%s", rg.render(&st.bad, fmt.aprintf("error: %s", c.err, allocator = alloc), alloc))
+			fmt.sbprintfln(&sb, "%s", rg.render(m.st.bad, fmt.aprintf("error: %s", c.err, allocator = alloc), alloc))
 		case c.done:
 			// 2xx and 3xx are green, everything else red. The style is picked from
 			// the STATUS, which is the one thing this program went to the network
 			// to find out -- a status list that painted a 500 the same colour as a
 			// 200 would be a list nobody reads.
-			s := c.status < 400 ? &st.ok : &st.bad
+			s := c.status < 400 ? m.st.ok : m.st.bad
 			fmt.sbprintfln(&sb, "%s", rg.render(s, fmt.aprintf("%d", c.status, allocator = alloc), alloc))
 		case:
-			fmt.sbprintfln(&sb, "%s", rg.render(&st.pending, "checking...", alloc))
+			fmt.sbprintfln(&sb, "%s", rg.render(m.st.pending, "checking...", alloc))
 		}
 	}
 	return strings.to_string(sb)
@@ -297,11 +369,20 @@ main :: proc() {
 	//
 	// The matching pop is written by rt.term_restore() below, and by the
 	// crash-signal path -- exactly once between them, whichever runs.
-	if !rt.term_enter_raw(fd, {.Disambiguate}) { fmt.eprintln("not a tty"); os.exit(1) }
+	//
+	// `paste = true` is DECSET 2004, bracketed paste -- the only thing that
+	// makes a paste DISTINGUISHABLE from typing, so update()'s `v.pasted`
+	// branch can refuse to run the quit binding on pasted text. Bubble Tea
+	// enables it by default; RuneTea makes the application own the terminal, so
+	// the opt-in belongs here.
+	if !rt.term_enter_raw(fd, {kb = {.Disambiguate}, paste = true}) { fmt.eprintln("not a tty"); os.exit(1) }
 	defer rt.term_restore()
 
 	src, ok := rt.input_source_from_fd(fd)
-	if !ok { fmt.eprintln("bad input source"); os.exit(1) }
+	// term_restore BEFORE os.exit: os.exit does not run defers, so the line
+	// above never fires on this path and the terminal is left in raw mode with
+	// one entry pushed on its Kitty keyboard stack.
+	if !ok { rt.term_restore(); fmt.eprintln("bad input source"); os.exit(1) }
 	defer rt.input_close(&src)
 
 	b := strings.builder_make(); defer strings.builder_destroy(&b)
@@ -344,6 +425,18 @@ main :: proc() {
 		},
 		st = make_styles(),
 	}, update, view, init)
+	// A Window_Size_Msg only ever arrives on a SIGWINCH, so without this seed a
+	// program that is never resized would never learn its own width.
+	if w, h, ok := rt.term_size(fd); ok { p.model.term_w, p.model.term_h = w, h }
 
-	if err := rt.run(&p, &src, &b, fd); err != nil { fmt.eprintln("error:", err) }
+	err := rt.run(&p, &src, &b, fd)
+	// term_restore FIRST, then the message, then a real exit status: printing
+	// before the restore writes the diagnostic into whatever mode the program
+	// left the terminal in, and falling off the end of main after an error
+	// exits 0, which makes a crash indistinguishable from a clean quit.
+	if err != nil {
+		rt.term_restore()
+		fmt.eprintln("error:", err)
+		os.exit(rt.exit_code(err))
+	}
 }

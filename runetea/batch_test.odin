@@ -1,3 +1,9 @@
+#+private
+// ^ Every declaration in this file is package-private, so that `odin doc
+//   runetea` / `odin doc runegloss` -- the command README.md and docs/API.md
+//   hand a newcomer for symbol discovery -- lists the library rather than the
+//   test fixtures. Pinned by tools/doccheck/run.sh's `apidoc` check, which is
+//   also where the argument for it is written out.
 package runetea
 
 import "core:fmt"
@@ -552,3 +558,117 @@ test_run_returns_promptly_with_a_nested_batch_and_sequence_both_mid_flight :: pr
 }
 
 
+
+// ---------------------------------------------------------------------------
+// A batch()/sequence() Cmd IS SINGLE-USE (cmd.odin's Cmd ledger, and this file's
+// own Compose_Spec ownership note). This kind failed the QUIETEST of the three
+// and so deserves the loudest pin: a re-dispatched compose Cmd double-freed
+// THREE blocks -- spec.cmds, spec, and every child's env -- but because the
+// recycled 40-byte Compose_Spec slot holds an allocator freelist pointer where
+// `kind` used to live, compose_procedure's `switch ce.spec.kind` read a garbage
+// enum (BAD ENUM VALUE=-7313441271067626896 in the audit's own probe) and
+// matched NEITHER case. So the second dispatch did nothing at all, trod on the
+// heap on the way, and reported nothing: the app's first symptom was a stale
+// UI, and the crash came later and somewhere else.
+@(test)
+test_redispatching_a_batch_is_refused_with_a_diagnostic :: proc(t: ^testing.T) {
+	m: Mailbox
+	testing.expect_value(t, mailbox_init(&m, 16), nil)
+	d: Dispatcher
+	dispatcher_init(&d, &m, 4)
+
+	b := batch([]Cmd{
+		cmd_from(fetch_run, Fetch_Env{url = "a"}, context.allocator),
+		cmd_from(fetch_run, Fetch_Env{url = "b"}, context.allocator),
+	}, context.allocator)
+	dispatch(&d, b)
+	dispatch(&d, b)
+
+	results, refusals := 0, 0
+	for _ in 0 ..< 3 {
+		msg, ok := mailbox_recv(&m)
+		defer box_free(msg, context.allocator)
+		testing.expect(t, ok, "expected both children's results plus one refusal")
+		if _, is := msg.(Fetch_Result); is { results += 1 }
+		if p, is := msg.(Panicked_Msg); is {
+			refusals += 1
+			text := p.message
+			testing.expectf(t, strings.contains(msg_text_string(&text), "batch()/sequence()"),
+				"the refusal must name the Cmd kind, got %q", msg_text_string(&text))
+		}
+	}
+	testing.expect_value(t, results, 2)
+	testing.expect_value(t, refusals, 1)
+
+	dispatcher_destroy(&d)
+	mailbox_destroy(&m)
+}
+
+// Same contract for sequence(), separately pinned because the two coordinators
+// are separate procs with separate cleanup paths (compose_run_sequence reuses
+// one Wait_Group across steps where compose_run_batch fans out once), and a
+// refused child has to signal `done` on BOTH of them or the coordinator's
+// wait_group_wait blocks forever on its own detached thread.
+@(test)
+test_redispatching_a_sequence_is_refused_with_a_diagnostic :: proc(t: ^testing.T) {
+	m: Mailbox
+	testing.expect_value(t, mailbox_init(&m, 16), nil)
+	d: Dispatcher
+	dispatcher_init(&d, &m, 4)
+
+	s := sequence([]Cmd{
+		cmd_from(fetch_run, Fetch_Env{url = "first"}, context.allocator),
+		cmd_from(fetch_run, Fetch_Env{url = "second"}, context.allocator),
+	}, context.allocator)
+	dispatch(&d, s)
+	dispatch(&d, s)
+
+	results, refusals := 0, 0
+	for _ in 0 ..< 3 {
+		msg, ok := mailbox_recv(&m)
+		defer box_free(msg, context.allocator)
+		testing.expect(t, ok, "expected both steps' results plus one refusal")
+		if _, is := msg.(Fetch_Result); is { results += 1 }
+		if _, is := msg.(Panicked_Msg); is { refusals += 1 }
+	}
+	testing.expect_value(t, results, 2)
+	testing.expect_value(t, refusals, 1)
+
+	dispatcher_destroy(&d)
+	mailbox_destroy(&m)
+}
+
+// The footgun in its smallest form, and the reason "just don't store a Cmd in
+// your model" was never an adequate answer: no stored state is required at
+// all. One update() call, one expression, the same Cmd value listed twice in
+// one batch(), and the second child ran against env the first child had
+// already freed -- SIGSEGV rc=139, 6/6 runs on this toolchain. The children
+// are dispatched by compose_run_batch on the coordinator's own thread, so the
+// refusal is raised from THERE rather than from apply()'s thread; this pins
+// that the ledger is genuinely shared across threads and not a per-thread
+// accident.
+@(test)
+test_listing_the_same_cmd_twice_in_one_batch_runs_it_once :: proc(t: ^testing.T) {
+	m: Mailbox
+	testing.expect_value(t, mailbox_init(&m, 16), nil)
+	d: Dispatcher
+	dispatcher_init(&d, &m, 4)
+
+	c := cmd_from(fetch_run, Fetch_Env{url = "dup"}, context.allocator)
+	cs := [2]Cmd{c, c}
+	dispatch(&d, batch(cs[:], context.allocator))
+
+	results, refusals := 0, 0
+	for _ in 0 ..< 2 {
+		msg, ok := mailbox_recv(&m)
+		defer box_free(msg, context.allocator)
+		testing.expect(t, ok, "expected one result and one refusal")
+		if _, is := msg.(Fetch_Result); is { results += 1 }
+		if _, is := msg.(Panicked_Msg); is { refusals += 1 }
+	}
+	testing.expect_value(t, results, 1)
+	testing.expect_value(t, refusals, 1)
+
+	dispatcher_destroy(&d)
+	mailbox_destroy(&m)
+}

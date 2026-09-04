@@ -1,3 +1,9 @@
+#+private
+// ^ Every declaration in this file is package-private, so that `odin doc
+//   runetea` / `odin doc runegloss` -- the command README.md and docs/API.md
+//   hand a newcomer for symbol discovery -- lists the library rather than the
+//   test fixtures. Pinned by tools/doccheck/run.sh's `apidoc` check, which is
+//   also where the argument for it is written out.
 package runegloss
 
 import "core:strings"
@@ -109,6 +115,29 @@ VARIANTS := []Variant{
 		align(s, .Center); valign(s, .Middle)
 		border(s, ROUNDED); border_fg(s, color("#04B575"))
 	}},
+
+	// THE CLAMPING VARIANTS. Everything above this line describes a block big
+	// enough for its content; these five are the ones where the content does NOT
+	// fit, which is the case the box model used to answer by widening the block
+	// and shearing the frame. Every input in the table is pushed through wrap,
+	// truncate, the vertical clamp and the degenerate zero-content-column case
+	// under every profile -- which is what makes "the block is exactly `width`
+	// columns wide, whatever you feed it" an assertion rather than a hope.
+	//
+	// width 4 is deliberately narrower than the CJK, mixed and already-ansi
+	// inputs, so wrap and truncate both do real work rather than passing the
+	// line through.
+	{"w4-wrap",      proc(s: ^Style) { width(s, 4) }},
+	{"w4-truncate",  proc(s: ^Style) { width(s, 4); overflow(s, .Truncate); ellipsis(s, "…") }},
+	{"w4-border",    proc(s: ^Style) { width(s, 4); border(s, ROUNDED) }},
+	{"w4-grow",      proc(s: ^Style) { width(s, 4); overflow(s, .Grow) }},
+	// Frame wider than `width`: 2 border columns plus 4 padding columns against a
+	// width of 4 leaves NEGATIVE room for content. The block must still come out
+	// exactly 4 columns and never ask the builder for a negative run of spaces.
+	{"w4-overfull",  proc(s: ^Style) { width(s, 4); padding(s, 0, 2); border(s, NORMAL) }},
+	// Vertical clamp: 2 border rows out of 3 leaves ONE content row, so every
+	// multi-line input loses rows.
+	{"w6-h3",        proc(s: ^Style) { width(s, 6); height(s, 3); border(s, NORMAL) }},
 }
 
 @(test)
@@ -187,11 +216,22 @@ line_count :: proc(text: string) -> int {
 // own arithmetic. Both agree on the formula (they must -- it is the definition
 // of the box model), but this one never touches a single character of content,
 // so a render that mismeasures content comes out unequal here.
+//
+// THE CONSTRAINED BRANCH IS THE WHOLE POINT AND IT IS A ONE-LINER: a block with
+// a `width` is exactly `width` columns wide plus its margins, WHATEVER THE
+// CONTENT IS. That single line is the property the old box model did not have --
+// it computed max(content, width - padding), so one long string moved the answer
+// and there was no width you could rely on downstream. Deriving it from the
+// content here would be re-implementing render rather than checking it.
+//
+// The old formula also excluded the border from `width` and this one includes
+// it; that is the lipgloss-v2 alignment (F48), and it is why "everything" is now
+// a 30-column block where it used to be 32.
+//
+// UNCONSTRAINED (`width == 0`) AND .Grow still derive from the content, because
+// there the content genuinely is what decides.
 @(private = "file")
 expected_block_width :: proc(s: ^Style, text: string) -> int {
-	inner := max_line_width(text)
-	if s.width > 0 { inner = max(inner, s.width - s.pad[.Left] - s.pad[.Right]) }
-	box := s.pad[.Left] + inner + s.pad[.Right]
 	lw, rw := 0, 0
 	if s.bordered {
 		// Every border this package ships is one column per side (box-drawing
@@ -200,18 +240,69 @@ expected_block_width :: proc(s: ^Style, text: string) -> int {
 		if .Left  in s.border_sides { lw = 1 }
 		if .Right in s.border_sides { rw = 1 }
 	}
-	return s.mar[.Left] + lw + box + rw + s.mar[.Right]
+	frame := lw + rw + s.pad[.Left] + s.pad[.Right]
+	if s.width > 0 && s.overflow != .Grow {
+		// max() with the frame, not plain `width`: a width too small to hold its
+		// own border and padding cannot be honoured, and the documented answer is
+		// that the frame wins and the content area goes to zero (Style.width).
+		// The "w4-overfull" variant exists to keep that case asserted rather than
+		// discovered by an app that set width(4) on a padding(0,2)+border Style.
+		return s.mar[.Left] + max(s.width, frame) + s.mar[.Right]
+	}
+	inner := max_line_width(text)
+	if s.width > 0 { inner = max(inner, s.width - frame) }
+	return s.mar[.Left] + frame + inner + s.mar[.Right]
 }
 
+// Same shape: a `height` is exact, everything else is the content's row count
+// plus the frame. Note that a wrapped block's row count is NOT line_count(text)
+// -- wrapping adds rows -- which is another reason the constrained branch cannot
+// be derived from the input text and must be the flat answer.
 @(private = "file")
 expected_block_height :: proc(s: ^Style, text: string) -> int {
-	rows := s.pad[.Top] + line_count(text) + s.pad[.Bottom]
+	frame := s.pad[.Top] + s.pad[.Bottom]
+	if s.bordered {
+		if .Top    in s.border_sides { frame += 1 }
+		if .Bottom in s.border_sides { frame += 1 }
+	}
+	if s.height > 0 && s.overflow != .Grow {
+		return s.mar[.Top] + max(s.height, frame) + s.mar[.Bottom]
+	}
+	rows := s.pad[.Top] + wrapped_line_count(s, text) + s.pad[.Bottom]
 	if s.height > rows { rows = s.height }
 	if s.bordered {
 		if .Top    in s.border_sides { rows += 1 }
 		if .Bottom in s.border_sides { rows += 1 }
 	}
 	return s.mar[.Top] + rows + s.mar[.Bottom]
+}
+
+// How many rows the content occupies once wrapping has run.
+//
+// THE ONE PLACE THIS FILE IS NOT INDEPENDENT OF THE IMPLEMENTATION, stated
+// outright rather than hidden: for a width-constrained .Wrap block with no
+// explicit `height`, the row count is whatever the wrap algorithm decided, and
+// re-deriving it here would be re-implementing greedy word wrap with hard breaks
+// at cluster boundaries -- a second implementation that would drift from the
+// first and then be "fixed" to match it, which is worse than delegating.
+//
+// WHAT STAYS INDEPENDENT is the assertion that actually matters, and it is the
+// one this table exists for: EVERY row measures the same, and measures exactly
+// the width the Style asked for. That is derived from the Style fields alone
+// (expected_block_width) and is not weakened by taking the row count from wrap.
+// A wrap that produced the wrong number of rows but rectangular ones would slip
+// through here; a wrap that produced a ragged block could not.
+//
+// Truncation never adds a row, and a zero-width content area is rendered by the
+// truncate path, so both answer line_count directly.
+@(private = "file")
+wrapped_line_count :: proc(s: ^Style, text: string) -> int {
+	if s.width <= 0 || s.overflow != .Wrap { return line_count(text) }
+	inner := s.width - (horizontal_frame_size(s^) - s.mar[.Left] - s.mar[.Right])
+	if inner <= 0 { return line_count(text) }
+	w := wrap(text, inner, s.wopts, context.allocator)
+	defer delete(w, context.allocator)
+	return line_count(w)
 }
 
 @(private = "file")

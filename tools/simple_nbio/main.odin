@@ -45,5 +45,21 @@ main :: proc() {
 	p: rt.Program(Model)
 	rt.program_init(&p, Model{}, update, view)
 
-	if err := rt.run_nbio(&p, fd, &b, fd); err != nil { fmt.eprintln("error:", err) }
+	// F31/F12/F10, and these are verification binaries precisely BECAUSE a
+	// harness reads their exit status. The old line was
+	// `if err := rt.run_nbio(...); err != nil { fmt.eprintln(...) }` followed
+	// by falling off the end of main, which exits 0 -- so a Terminal_Error or
+	// a Panicked_Error here was indistinguishable from a clean quit to every
+	// script that runs this, and the diagnostic was printed into whatever mode
+	// run_nbio left the terminal in. term_restore FIRST (os.exit does not run
+	// defers, so the `defer` above never fires on this path), then the
+	// message, then rt.exit_code: nil -> 0, Interrupted_Error -> 130 (the
+	// shell's 128+SIGINT, deliberately not 1 -- an external interrupt is a
+	// request, not a fault), everything else -> 1.
+	err := rt.run_nbio(&p, fd, &b, fd)
+	if err != nil {
+		rt.term_restore()
+		fmt.eprintln("error:", err)
+		os.exit(rt.exit_code(err))
+	}
 }

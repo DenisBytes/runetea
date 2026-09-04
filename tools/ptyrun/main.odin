@@ -1,15 +1,46 @@
 package main
 
-// Runs a RuneTea binary under a REAL pty, types at it, and prints back
+// Runs a RuneTea binary under a REAL pty, drives it, and prints back
 // everything the program wrote to the terminal.
 //
-//   ptyrun <binary> <hex-keystrokes> [cols] [rows] [timeout_ms]
+//   ptyrun <binary> <script> [cols] [rows] [timeout_ms]
 //
-// The keystrokes are hex so that escape sequences (arrows, Ctrl bytes) go
-// through a shell argument without any quoting question: "1b5b41" is Up,
-// "71" is 'q'. They are written ONE AT A TIME with a short pause, which is
-// what makes this a keyboard rather than a paste -- a whole sequence arriving
-// in a single read() would exercise a decoder path a human never produces.
+// THE SCRIPT is a comma-separated list of STEPS, each optionally named
+// `label=`. Two kinds of step exist:
+//
+//   <hex>            ONE KEYPRESS, written in ONE write(). Hex so that escape
+//                    sequences (arrows, Ctrl bytes) go through a shell
+//                    argument without any quoting question: "1b5b41" is Up,
+//                    "71" is 'q'.
+//
+//                    A write() PER STEP, not per byte, and that is a
+//                    correction rather than a detail. This harness used to
+//                    write every byte separately with an 80ms pause, on the
+//                    theory that it made the input "a keyboard rather than a
+//                    paste". It made it neither: a terminal emulator delivers
+//                    a keypress in a single write, so 1b,5b,42 spaced 80ms
+//                    apart is not Down -- it is Escape, then '[', then 'B'.
+//                    Measured: driving examples/quickstart with 1b5b42 that
+//                    way QUIT the program on the lone ESC (it binds .Escape),
+//                    and the remaining steps were echoed back by the line
+//                    discipline of a pty whose child was already gone. The
+//                    old gate could not notice because it typed only 'j', ' '
+//                    and 'q' -- three bytes with no sequence among them.
+//                    A deliberately split delivery is still expressible, and
+//                    now says so out loud: spell it `esc=1b,rest=5b42`.
+//   r<cols>x<rows>   a RESIZE: TIOCSWINSZ on the master, which is what a real
+//                    terminal emulator does when its window changes. The tty
+//                    driver then raises SIGWINCH in the slave's foreground
+//                    process group by itself -- no kill() here, deliberately,
+//                    because a hand-delivered signal would test the signal
+//                    path while skipping the ioctl that a real resize starts
+//                    with, and term_size() reads that ioctl's result.
+//
+// A bare hex string with no commas is ONE step, i.e. one write -- which for
+// more than one keypress means a paste. Three separate keypresses are three
+// steps: `6a,20,71`.
+//
+//   ptyrun ./app 'down=1b5b42,tog=20,grow=r100x30,quit=71' 80 24 8000
 //
 // WHY A REAL pty AND NOT A PIPE. tools/ttycheck's own comment makes the
 // general case; the specific one here is that a pipe answers `term_size` with
@@ -19,15 +50,41 @@ package main
 // checker that drove its samples over a pipe would be verifying output no
 // reader will ever see.
 //
-// The captured bytes are printed to stdout with escapes made visible
-// ("\e[2A" rather than a real CSI), because this output is meant to be read,
-// grepped and pasted into a report -- writing raw control bytes into the
-// parent's own terminal would mean the checker's output rearranges the
-// terminal it is being read on.
+// TWO OUTPUTS, and the split is the point:
+//
+//   stdout          the captured bytes with escapes made VISIBLE ("\e[2A"
+//                   rather than a real CSI), because this stream is meant to
+//                   be read, grepped and pasted into a report -- writing raw
+//                   control bytes into the parent's own terminal would mean
+//                   the checker's output rearranges the terminal it is being
+//                   read on.
+//   $PTYRUN_STEPS   (optional) a machine-readable transcript, one line per
+//                   step, in the same `<tag> <n> <hex>` shape tools/difftest
+//                   dumps:
+//
+//                       SIZE <cols> <rows>      (only where the size changed)
+//                       STEP <index> <label> <hex of the bytes THAT STEP drew>
+//
+//                   Raw hex, not escape-visible, and split at step boundaries,
+//                   because the consumer is a terminal emulator: tools/doccheck
+//                   replays it through pyte and asserts on the resulting CELL
+//                   GRID. Grepping the stdout form cannot do that -- it is a
+//                   concatenation of every frame in the session, so a renderer
+//                   that painted the right text in the wrong PLACE (stale rows
+//                   left above the frame, a rewind two rows short) passes every
+//                   grep while showing the reader a broken screen. That is not
+//                   hypothetical: it is exactly the hole this gate had, and
+//                   `render.odin`'s `reachable` arithmetic is the line that
+//                   walked through it.
+//
+//                   Step 0 is always `boot` (what the program painted before
+//                   any input) and the last step is always `exit` (what it
+//                   wrote from the final input to process exit, i.e. the
+//                   teardown). Unnamed steps are `s1`, `s2`, ...
 //
 // Exit status: 0 if the child exited 0 within the timeout, 1 otherwise. That
 // is what makes this usable as a gate rather than only as a probe -- see
-// tools/doccheck/run.sh, which asserts on both the status and the text.
+// tools/doccheck/run.sh, which asserts on the status, the text and the grid.
 
 import "core:fmt"
 import "core:os"
@@ -46,18 +103,34 @@ Winsize :: struct {
 	ws_row, ws_col, ws_xpixel, ws_ypixel: u16,
 }
 
+Step_Kind :: enum {
+	Keys,
+	Resize,
+}
+
+Step :: struct {
+	kind:       Step_Kind,
+	label:      string,
+	keys:       []u8, // .Keys
+	cols, rows: int,  // .Resize
+}
+
 main :: proc() {
 	if len(os.args) < 3 {
-		fmt.eprintln("usage: ptyrun <binary> <hex-keystrokes> [cols] [rows] [timeout_ms]")
+		fmt.eprintln("usage: ptyrun <binary> <script> [cols] [rows] [timeout_ms]")
+		fmt.eprintln("  script: comma-separated steps, each `[label=]<hex>` or `[label=]r<cols>x<rows>`")
 		os.exit(2)
 	}
-	bin  := os.args[1]
-	keys, keys_ok := unhex(os.args[2])
-	if !keys_ok {
-		fmt.eprintfln("ptyrun: keystrokes must be an even-length hex string, got %q", os.args[2])
+	bin := os.args[1]
+	steps, steps_err := parse_script(os.args[2])
+	if steps_err != "" {
+		fmt.eprintfln("ptyrun: %s", steps_err)
 		os.exit(2)
 	}
-	defer delete(keys)
+	defer {
+		for s in steps { delete(s.keys) }
+		delete(steps)
+	}
 
 	cols       := arg_int(3, 80)
 	rows       := arg_int(4, 24)
@@ -83,8 +156,7 @@ main :: proc() {
 	// term_size() -- which runs inside run(), before any frame is painted --
 	// already has an answer. A size delivered later would only reach the
 	// program as a Window_Size_Msg on SIGWINCH.
-	ws := Winsize{ws_row = u16(rows), ws_col = u16(cols)}
-	if res := linux.ioctl(linux.Fd(master), TIOCSWINSZ, uintptr(rawptr(&ws))); int(res) < 0 {
+	if !set_winsize(master, cols, rows) {
 		fmt.eprintln("ptyrun: ioctl(TIOCSWINSZ) failed")
 		os.exit(1)
 	}
@@ -97,7 +169,10 @@ main :: proc() {
 	if child == 0 {
 		// setsid() first: the slave becomes this process's controlling
 		// terminal only in a fresh session, and without one a program that
-		// reads its own tty is reading the harness's instead.
+		// reads its own tty is reading the harness's instead. It is also what
+		// makes a `r<cols>x<rows>` step work at all -- SIGWINCH goes to the
+		// controlling terminal's foreground process group, and without setsid
+		// this child is not in one.
 		posix.setsid()
 		slave := posix.open(name, {.RDWR})
 		if slave < 0 { posix._exit(127) }
@@ -122,13 +197,44 @@ main :: proc() {
 	captured := strings.builder_make()
 	defer strings.builder_destroy(&captured)
 
+	// One `<label, end offset>` per step, so the transcript can be cut at step
+	// boundaries afterwards. Offsets rather than copies: the builder is the one
+	// buffer everything lands in, and slicing it at the end costs nothing.
+	// `cols`/`rows` are set only on a mark whose step CHANGED the size (and on
+	// `boot`, which carries the starting size): the transcript's consumer is a
+	// terminal emulator that has to resize its own model at the same point in
+	// the stream, and inferring where from the bytes alone is impossible --
+	// nothing in the output says the window grew.
+	Mark :: struct { label: string, end: int, cols, rows: int }
+	marks := make([dynamic]Mark)
+	defer delete(marks)
+
 	// Let the child install its handlers, enter raw mode and paint frame 0.
 	settle(master, &captured, 300 * time.Millisecond)
+	append(&marks, Mark{"boot", strings.builder_len(captured), cols, rows})
 
-	for k in keys {
-		b := [1]u8{k}
-		posix.write(master, raw_data(b[:]), 1)
-		settle(master, &captured, 80 * time.Millisecond)
+	for s in steps {
+		switch s.kind {
+		case .Keys:
+			// One write for the whole step -- see the header on why a
+			// per-byte write is not a keyboard.
+			posix.write(master, raw_data(s.keys), uint(len(s.keys)))
+			settle(master, &captured, 120 * time.Millisecond)
+		case .Resize:
+			if !set_winsize(master, s.cols, s.rows) {
+				fmt.eprintfln("ptyrun: ioctl(TIOCSWINSZ) failed for step %q", s.label)
+				posix.kill(child, .SIGKILL)
+				os.exit(1)
+			}
+			// Longer than a keystroke's settle on purpose: a resize is not a
+			// read() the program is already parked on. SIGWINCH has to reach
+			// the signal thread, become a Window_Size_Msg, cross the mailbox
+			// and only then repaint -- three hops a keystroke does not make.
+			settle(master, &captured, 250 * time.Millisecond)
+		}
+		m := Mark{s.label, strings.builder_len(captured), 0, 0}
+		if s.kind == .Resize { m.cols, m.rows = s.cols, s.rows }
+		append(&marks, m)
 	}
 
 	deadline := time.Duration(timeout_ms) * time.Millisecond
@@ -141,8 +247,30 @@ main :: proc() {
 		time.sleep(10 * time.Millisecond)
 	}
 	drain(master, &captured)
+	append(&marks, Mark{"exit", strings.builder_len(captured), 0, 0})
 
-	fmt.println(escape_visible(strings.to_string(captured)))
+	all := strings.to_string(captured)
+	fmt.println(escape_visible(all))
+
+	// The transcript is written even when the child failed: a step file for a
+	// run that died is exactly what you want to look at, and doccheck prints
+	// the grid from it when an assertion fails.
+	if path := os.get_env_alloc("PTYRUN_STEPS", context.temp_allocator); path != "" {
+		b := strings.builder_make()
+		defer strings.builder_destroy(&b)
+		prev := 0
+		for m, i in marks {
+			if m.cols > 0 { fmt.sbprintf(&b, "SIZE %d %d\n", m.cols, m.rows) }
+			fmt.sbprintf(&b, "STEP %d %s ", i, m.label)
+			write_hex(&b, all[prev:m.end])
+			strings.write_byte(&b, '\n')
+			prev = m.end
+		}
+		if werr := os.write_entire_file(path, transmute([]u8)strings.to_string(b)); werr != nil {
+			fmt.eprintfln("ptyrun: could not write PTYRUN_STEPS=%q", path)
+			os.exit(1)
+		}
+	}
 
 	if !exited {
 		fmt.eprintfln("ptyrun: child did not exit within %dms -- killing", timeout_ms)
@@ -162,6 +290,50 @@ main :: proc() {
 		fmt.eprintfln("ptyrun: child exited %d", code)
 		os.exit(1)
 	}
+}
+
+// Returns the parsed steps, or a non-empty error string. Errors are strings
+// rather than a bool so the caller can say WHICH step is malformed -- a hex
+// script is already hard enough to read without "invalid argument".
+@(private = "file")
+parse_script :: proc(script: string) -> (steps: [dynamic]Step, err: string) {
+	for field, i in strings.split(script, ",", context.temp_allocator) {
+		label := fmt.aprintf("s%d", i + 1)
+		body  := field
+		if eq := strings.index_byte(field, '='); eq >= 0 {
+			label = strings.clone(field[:eq])
+			body  = field[eq + 1:]
+		}
+		if len(body) > 0 && (body[0] == 'r' || body[0] == 'R') {
+			cols, rows, ok := parse_size(body[1:])
+			if !ok {
+				return steps, fmt.aprintf("step %q: resize wants r<cols>x<rows>, got %q", label, body)
+			}
+			append(&steps, Step{kind = .Resize, label = label, cols = cols, rows = rows})
+			continue
+		}
+		keys, keys_ok := unhex(body)
+		if !keys_ok {
+			return steps, fmt.aprintf("step %q: keystrokes must be an even-length hex string, got %q", label, body)
+		}
+		append(&steps, Step{kind = .Keys, label = label, keys = keys})
+	}
+	return steps, ""
+}
+
+@(private = "file")
+parse_size :: proc(s: string) -> (cols, rows: int, ok: bool) {
+	x := strings.index_byte(s, 'x')
+	if x < 0 { return 0, 0, false }
+	cols = strconv.parse_int(s[:x]) or_return
+	rows = strconv.parse_int(s[x + 1:]) or_return
+	return cols, rows, cols > 0 && rows > 0
+}
+
+@(private = "file")
+set_winsize :: proc(master: posix.FD, cols, rows: int) -> bool {
+	ws := Winsize{ws_row = u16(rows), ws_col = u16(cols)}
+	return int(linux.ioctl(linux.Fd(master), TIOCSWINSZ, uintptr(rawptr(&ws)))) >= 0
 }
 
 @(private = "file")
@@ -213,6 +385,15 @@ nybble :: proc(c: u8) -> int {
 	case c >= 'A' && c <= 'F': return int(c - 'A') + 10
 	}
 	return -1
+}
+
+@(private = "file")
+write_hex :: proc(b: ^strings.Builder, s: string) {
+	HEX := "0123456789abcdef"
+	for i in 0 ..< len(s) {
+		strings.write_byte(b, HEX[s[i] >> 4])
+		strings.write_byte(b, HEX[s[i] & 0xF])
+	}
 }
 
 // ESC as a literal "\e", every other C0 byte as "\xNN", everything else

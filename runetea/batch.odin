@@ -163,7 +163,14 @@ compose :: proc(cmds: []Cmd, kind: Compose_Kind, alloc: mem.Allocator) -> Cmd {
 		return cmd_nil()
 	}
 	spec^ = Compose_Spec{kind = kind, cmds = owned, alloc = alloc}
-	return Cmd{compose = spec, allocator = alloc}
+	// SINGLE-USE, same as every other heap-owning Cmd constructor -- see
+	// cmd.odin's Cmd ledger. This one mattered most and showed least: a
+	// re-dispatched batch()/sequence() double-freed THREE blocks (spec.cmds,
+	// spec, and each child's env) and, because the recycled 40-byte spec slot
+	// holds an allocator freelist pointer where `kind` used to be,
+	// compose_procedure's switch matched neither case and the second dispatch
+	// simply did nothing -- silent, not loud.
+	return Cmd{compose = spec, allocator = alloc, ticket = cmd_ticket_issue()}
 }
 
 // Frees every CHILD Cmd in `cmds` that will never be dispatched --
@@ -196,9 +203,20 @@ compose :: proc(cmds: []Cmd, kind: Compose_Kind, alloc: mem.Allocator) -> Cmd {
 // handle "leaks nothing MORE than the bytes of the handle itself". That claim
 // was wrong (see timer.odin, where it is now corrected), so the leak it
 // licensed here was real, not accepted.
+//
+// CLAIMS EACH CHILD'S TICKET FIRST (cmd.odin's Cmd ledger). This proc is the
+// second consumer of a Cmd, alongside dispatch_ex, so it has to go through
+// the same one-shot gate: without it, a child abandoned here and then
+// separately dispatched by the application (the same Cmd value listed both in
+// a batch and returned directly from update) would be freed here and freed
+// AGAIN by run_cmd_guarded. A refused claim means someone else already owns
+// this child, so the only correct action is to touch nothing it points at.
+// Silent, not reported: unlike a re-dispatch there is no result the app was
+// waiting for, and the dispatch that DID happen is the one that reports.
 @(private = "file")
 compose_free_unrun :: proc(cmds: []Cmd) {
 	for c in cmds {
+		if !cmd_ticket_claim(c.ticket) { continue }
 		if c.compose != nil {
 			compose_free_unrun(c.compose.cmds)
 			delete(c.compose.cmds, c.compose.alloc)
@@ -283,7 +301,10 @@ compose_run_batch :: proc(d: ^Dispatcher, spec: ^Compose_Spec, cancel: ^Cancel_T
 		if cancel_requested(cancel) { break }
 		sync.wait_group_add(wg, 1)
 		started += 1
-		dispatch_ex(d, c, wg)
+		// Return value discarded: a child that could not be started has
+		// already freed its own env and signaled wg inside dispatch_ex, which
+		// is everything this coordinator needed from it.
+		_ = dispatch_ex(d, c, wg)
 	}
 	// Anything past `started` never got dispatched -- cancellation fired
 	// mid-fan-out. Free those children's envs now; nothing else ever will.
@@ -336,7 +357,7 @@ compose_run_sequence :: proc(d: ^Dispatcher, spec: ^Compose_Spec, cancel: ^Cance
 		if cancel_requested(cancel) { break }
 		c := spec.cmds[i]
 		sync.wait_group_add(wg, 1)
-		dispatch_ex(d, c, wg)
+		_ = dispatch_ex(d, c, wg)   // see compose_run_batch for why the result is discarded
 		sync.wait_group_wait(wg)   // exactly what makes this a SEQUENCE: the next iteration cannot start until this one's child has fully signaled done
 		i += 1
 	}
@@ -361,7 +382,7 @@ compose_run_sequence :: proc(d: ^Dispatcher, spec: ^Compose_Spec, cancel: ^Cance
 // dispatch_ex's own contract already covers signaling it exactly once no
 // matter which branch handles the synthetic Cmd.
 @(private = "package")
-compose_dispatch :: proc(d: ^Dispatcher, spec: ^Compose_Spec, done: ^sync.Wait_Group) {
+compose_dispatch :: proc(d: ^Dispatcher, spec: ^Compose_Spec, done: ^sync.Wait_Group) -> bool {
 	ce, err := new(Compose_Env, context.allocator)
 	if err != nil {
 		// Can't even start the coordinator -- abandon every child now rather
@@ -370,9 +391,25 @@ compose_dispatch :: proc(d: ^Dispatcher, spec: ^Compose_Spec, done: ^sync.Wait_G
 		delete(spec.cmds, spec.alloc)
 		free(spec, spec.alloc)
 		if done != nil { sync.wait_group_done(done) }
-		return
+		return false
 	}
 	ce^ = Compose_Env{d = d, spec = spec}
+	// NO TICKET on the synthetic Cmd, deliberately: it is built here, handed
+	// straight to dispatch_ex, and never seen by anyone who could dispatch it
+	// twice. The ticket that guards this whole compose was already claimed by
+	// the outer dispatch_ex call that routed us here.
 	synthetic := Cmd{procedure = compose_procedure, env = rawptr(ce), allocator = context.allocator, detached = true}
-	dispatch_ex(d, synthetic, done)
+	if !dispatch_ex(d, synthetic, done) {
+		// The coordinator thread could not be started (see dispatch_ex's
+		// detached branch: pthread_create returns nil under RLIMIT_NPROC).
+		// dispatch_ex has already freed `ce` and signaled `done`; the spec and
+		// its children are ours, and nothing else will ever reach them --
+		// before this check they simply leaked, and every child's env with
+		// them.
+		compose_free_unrun(spec.cmds)
+		delete(spec.cmds, spec.alloc)
+		free(spec, spec.alloc)
+		return false
+	}
+	return true
 }

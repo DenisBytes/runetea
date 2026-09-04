@@ -1,3 +1,9 @@
+#+private
+// ^ Every declaration in this file is package-private, so that `odin doc
+//   runetea` / `odin doc runegloss` -- the command README.md and docs/API.md
+//   hand a newcomer for symbol discovery -- lists the library rather than the
+//   test fixtures. Pinned by tools/doccheck/run.sh's `apidoc` check, which is
+//   also where the argument for it is written out.
 package runetea
 
 import "core:strings"
@@ -77,5 +83,64 @@ test_msg_text_truncation_keeps_the_prefix_and_both_accessors_agree :: proc(t: ^t
 	testing.expect(t, strings.has_prefix(borrowed, "HEAD"), "truncation must keep the PREFIX")
 	testing.expect(t, msg_text_truncated(m), "and must say that it truncated")
 
+	free_all(context.temp_allocator)
+}
+
+// A Msg with BOTH shapes an application will actually put in one: a Msg_Text and
+// a plain fixed array with its own length. POD, per box()'s MESSAGE OWNERSHIP
+// CONTRACT -- neither field is a pointer.
+@(private = "file")
+Reads_Msg :: struct {
+	reason: Msg_Text,
+	path:   [16]u8,
+	n:      int,
+}
+
+// THE TYPE-SWITCH SPELLINGS, pinned.
+//
+// `switch v in msg` is the control structure every `update` is built out of, and
+// its binding is NOT addressable: `msg_text_string(&v.reason)` fails to compile
+// with "Cannot take the pointer address of 'v.reason'", and `v.path[:v.n]` fails
+// with "value is not addressable". Neither error mentions the fix, so the two
+// spellings that DO work are pinned here rather than left to a doc paragraph --
+// if a future signature change breaks them, this test stops compiling and the
+// suite says so, instead of the next application author discovering it.
+//
+// This is a COMPILE-SHAPE test as much as a value test: what it asserts is that
+// these four lines can be written at all. See Msg_Text's doc comment for why the
+// borrowing accessor still takes a pointer, and for the three alternative
+// signatures that were measured and rejected.
+@(test)
+test_msg_text_reads_out_of_a_type_switch_binding :: proc(t: ^testing.T) {
+	msg: any = Reads_Msg{
+		reason = msg_text_from("dial tcp: connection refused"),
+		path   = {'/', 't', 'm', 'p', '/', 'x', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+		n      = 6,
+	}
+	hit := false
+	switch v in msg {
+	case Reads_Msg:
+		hit = true
+
+		// (1) The allocating read, straight off the binding, in one expression.
+		// This is what examples/http and tools/http_nbio both use.
+		cloned := msg_text_clone(v.reason, context.temp_allocator)
+		testing.expect_value(t, cloned, "dial tcp: connection refused")
+
+		// (2) The non-allocating borrow, via a named copy of the field. The
+		// copy is what gives the returned string somewhere to point that
+		// outlives the call.
+		r := v.reason
+		testing.expect_value(t, msg_text_string(&r), "dial tcp: connection refused")
+
+		// (3) Any OTHER fixed-array field: one `vv := v` unblocks the whole
+		// struct, not just the Msg_Text in it.
+		vv := v
+		testing.expect_value(t, string(vv.path[:vv.n]), "/tmp/x")
+
+		// (4) The by-value accessors need no copy at all and never did.
+		testing.expect(t, !msg_text_truncated(v.reason), "short text is not truncated")
+	}
+	testing.expect(t, hit, "the type switch must have matched")
 	free_all(context.temp_allocator)
 }

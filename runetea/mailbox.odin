@@ -40,10 +40,55 @@ mailbox_init :: proc(m: ^Mailbox, cap: int, allocator := context.allocator) -> m
 // call, which catches the common case of destroying while a send/recv is
 // in flight. It cannot catch a producer that is about to call mailbox_send
 // but hasn't reached the lock yet -- that ordering is still on the caller.
+//
+// DRAINS AND FREES WHATEVER IS STILL QUEUED, and that is not tidiness -- it
+// closes a leak on the ordinary exit path, not an exotic one. apply()
+// (tea.odin) is the single place a boxed Msg is box_free'd, and it only ever
+// sees messages it actually dequeued; anything sitting behind the Quit_Msg
+// that ended the session -- or behind a Panicked_Error / Interrupted_Error /
+// Terminal_Error early return -- was boxed by a producer and then simply
+// abandoned here. loop_nbio.odin:129 already box_frees leftover BACKLOG
+// entries with a comment explaining that boxed-but-never-applied messages
+// have no other owner; the ring 74 lines above it was the same case with the
+// reasoning missing rather than a stated tradeoff.
+//
+// context.allocator, not `allocator`: the parameter names the allocator that
+// made the RING (m.buf), which is not necessarily the one that boxed the
+// messages inside it. Every producer in this package boxes with its own
+// context.allocator, and every producer thread inherits the dispatching
+// thread's context (init_context = context, cmd.odin/timer.odin), so
+// context.allocator here is the same instance -- the identical convention
+// apply()'s own box_free call already relies on. A caller that boxes through
+// some other allocator and destroys the mailbox under a different context is
+// outside that convention and always was.
+//
+// box_free is safe on a nil-data `any` (arena.odin), which is exactly what a
+// queued zero-sized Msg such as Quit_Msg is, so no entry needs special-casing.
+//
+// ONE PRECONDITION THIS MAKES ENFORCEABLE RATHER THAN NEW: every `any` handed
+// to mailbox_send must be a box() allocation, never a bare `any` pointing at a
+// stack local, a literal or a struct field. That was ALWAYS the contract --
+// apply() (tea.odin) box_free's every message it dequeues, so a non-boxed
+// entry was already a free() of a pointer no allocator issued -- but until the
+// drain below existed, a message that was never dequeued escaped the
+// consequence. It no longer does, and the failure is loud (odin test's
+// Tracking_Allocator reports `bad free @ arena.odin:box_free()`) rather than
+// silent. mailbox_test.odin's test_mailbox_reports_full is the one call site
+// in the repo that was relying on the escape hatch; it now boxes.
 mailbox_destroy :: proc(m: ^Mailbox, allocator := context.allocator) {
 	assert(sync.mutex_try_lock(&m.mutex),
 		"mailbox_destroy: called while another thread holds the mailbox lock " +
 		"(a send/recv is in flight) -- stop and join all producers first")
+	// Under the lock the assert just took, so the drain observes exactly the
+	// state the assert proved was quiescent. m.items is deliberately NOT
+	// rebalanced as messages come off: nothing may be waiting on it by this
+	// point (the precondition above), and the whole struct is zeroed two
+	// lines below anyway.
+	for {
+		msg, ok := mailbox_pop(m)
+		if !ok { break }
+		box_free(msg, context.allocator)
+	}
 	sync.mutex_unlock(&m.mutex)
 	delete(m.buf, allocator)
 	m^ = {}

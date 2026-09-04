@@ -477,6 +477,14 @@ Keyboard_Enhancements_Msg :: struct {
 // reports length 1 -- it can never become valid no matter how many more
 // bytes arrive, so there is nothing to hold back for; decode_rune will emit
 // RUNE_ERROR for it and we move on.
+//
+// NARROWED SINCE: 0x80-0x9F NO LONGER REACHES THIS PROC. Treating that band as
+// stray continuation bytes was the conflation behind the 8-bit C1 leak -- 0x9B
+// is CSI, not a broken rune, and answering U+FFFD for it left the whole
+// sequence body to be typed in as keystrokes. decode_keys' introducer gate now
+// claims 0x80-0x9F before the UTF-8 path is reached. The sentence above still
+// describes 0xA0-0xBF exactly, which is the part of the range that really is
+// nothing but a continuation byte out of place.
 utf8_lead_len :: proc(b: u8) -> int {
 	switch {
 	case b < 0x80:              return 1
@@ -1090,10 +1098,74 @@ csi_decode :: proc(p: []u8, has_intermed: bool, final: u8, legacy: Legacy_Key_En
 	params, count := csi_params(head) or_return
 
 	if final == '~' {
+		// XTERM'S modifyOtherKeys REPORT: CSI 27 ; <mod> ; <codepoint> ~.
+		//
+		// This is a THREE-parameter tilde sequence, and it used to be rejected
+		// twice over: by the `count > 2` gate immediately below, and -- had that
+		// been widened alone -- by csi_tilde_code, whose table lists 27 as
+		// unassigned and returns ok = false for it. Hence the special case HERE,
+		// ahead of both, rather than a new row in that table: 27 is not a tilde
+		// key id at all, it is a marker saying "the real key is in parameter 3".
+		//
+		// WHY IT MATTERS DESPITE BEING NON-DEFAULT. Alongside the Kitty protocol
+		// this is the only legacy mechanism that resolves the Ctrl+I/Tab and
+		// Ctrl+M/Enter collisions Legacy_Key documents, and the only one that
+		// delivers Ctrl+digit and Ctrl+punctuation at all -- input.odin's
+		// Legacy_Key comment already names it as such. It is NOT common: xterm's
+		// modifyOtherKeys resource defaults to 0 and tmux's
+		// extended-keys-format defaults to `csi-u` (the Kitty shape decoded
+		// above), so these bytes arrive only where a user has explicitly turned
+		// modifyOtherKeys on, or set extended-keys-format=xterm, on a terminal
+		// with no Kitty support. Decoding it costs five lines and turns a
+		// deliberately-configured terminal from "silently drops the key" into
+		// "reports it", which is worth those lines.
+		//
+		// kitty_key_code is reused rather than re-tabulated because the payload
+		// IS a Unicode key code in exactly Kitty's sense -- 9 is Tab, 13 Enter,
+		// 49 is '1' -- so a second table could only drift from the first. The
+		// modifier field is xterm's (1 + bitmask), NOT Kitty's, hence
+		// xterm_mods; see its comment for why the two must not be shared.
+		if count == 3 && params[0] == 27 {
+			mods := xterm_mods(params[1]) or_return
+			key  := kitty_key_code(params[2]) or_return
+			key.kind  = kind
+			key.mods += mods
+			return key, true
+		}
 		if count == 0 || count > 2 { return {}, false }
 		code := csi_tilde_code(params[0], legacy) or_return
 		if count == 1 { return Key_Msg{kind = kind, code = code}, true }
 		mods := xterm_mods(params[1]) or_return
+		return Key_Msg{kind = kind, code = code, mods = mods}, true
+	}
+
+	// URXVT'S MODIFIED TILDE KEYS: the modifier rides in the FINAL BYTE, not in
+	// a parameter. `CSI 3 $` is Shift+Delete, `CSI 3 ^` is Ctrl+Delete, `CSI 3 @`
+	// is Ctrl+Shift+Delete -- the parameter is the same tilde key id csi_tilde_code
+	// already knows, which is why this is three lines and not a table.
+	//
+	// rxvt-unicode is the second of the two terminals whose key table the xterm
+	// defaults measurably do NOT cover (25/71 capabilities; see the terminfo
+	// note in decode_keys' comment), and this is the larger half of that miss:
+	// kDC/kIC/kHOM/kEND/kNXT/kPRV and their Ctrl forms, i.e. Shift+Delete,
+	// Shift+Insert, Shift+Home, Shift+End, Shift+PgDn, Shift+PgUp and the same
+	// six with Ctrl. All twelve used to be cleanly ignored at best -- and the
+	// '$' six were worse than ignored, see decode_keys' '$' arm.
+	//
+	// '^' (0x5E) and '@' (0x40) are ordinary CSI final bytes and reach here by
+	// the normal route. '$' (0x24) is an INTERMEDIATE byte under the ECMA-48
+	// grammar and cannot; decode_keys claims it before the intermediate scan and
+	// calls in here with has_intermed = false, which is why this arm sits below
+	// the `has_intermed` rejection at the top rather than being exempted from it.
+	if final == '$' || final == '^' || final == '@' {
+		if count != 1 { return {}, false }
+		code := csi_tilde_code(params[0], legacy) or_return
+		mods: Modifiers
+		switch final {
+		case '$': mods = {.Shift}
+		case '^': mods = {.Ctrl}
+		case '@': mods = {.Ctrl, .Shift}
+		}
 		return Key_Msg{kind = kind, code = code, mods = mods}, true
 	}
 
@@ -1145,15 +1217,106 @@ ss3_decode :: proc(mod_digits: []u8, gl: u8) -> (key: Key_Msg, ok: bool) {
 	return Key_Msg{code = code, mods = mods}, true
 }
 
+// Is this parameter run a bare decimal number -- no private prefix, no ';', no
+// ':', not empty? Used by decode_keys' urxvt '$' arm and by nothing else.
+//
+// It exists to keep that arm from stealing DECRPM. A DECRQM reply is
+// `CSI ? <mode> ; <value> $ y`: its '$' is a genuine ECMA-48 intermediate byte
+// followed by the final 'y', and terminating the sequence AT the '$' would drop
+// the 'y' back into the stream as a literal rune -- reintroducing, on a
+// different sequence, exactly the leak the '$' arm exists to remove. Every real
+// DECRPM reply carries a '?' prefix and two parameters, so requiring a bare
+// number excludes all of them; urxvt's forms are always a single bare digit.
+@(private = "file")
+csi_bare_number :: proc(p: []u8) -> bool {
+	if len(p) == 0 { return false }
+	for c in p {
+		if c < '0' || c > '9' { return false }
+	}
+	return true
+}
+
+// Where a STRING ESCAPE (OSC, DCS, APC, PM, SOS) ends, given the index of the
+// first byte of its payload. ok = false means "the terminator has not arrived
+// yet" -- hold back, exactly as a half-arrived CSI does.
+//
+// THIS EXISTS BECAUSE THE ABSENCE OF IT WAS THE WORST INPUT BUG IN THE FILE.
+// decode_keys used to dispatch on '[' (CSI), 'O' (SS3) and a second ESC, and
+// send everything else down the Alt+key path. So an OSC arriving on the input
+// stream -- a `CSI 11 t`-style background-colour reply, an OSC 52 clipboard
+// read, a DCS/XTVERSION reply, a Kitty graphics APC ack, any of which the shell
+// or a previous program can leave in flight -- was not "a sequence we do not
+// understand, cleanly ignored". It was TYPED INTO THE APPLICATION: the
+// introducer became Alt+']' / Alt+'P' / Alt+'_', the payload became one Key_Msg
+// per byte, a BEL terminator became Ctrl+G and an ST terminator became Alt+'\'.
+// MEASURED against the pre-fix decoder: one xterm OSC 11 reply
+// (`\e]11;rgb:2e2e/3434/3a3a\e\\`) produced 23 spurious Key_Msgs -- Alt+']', then
+// the 21 payload characters one at a time, then Alt+'\\'. The BEL-terminated
+// spelling of the same reply produced 23 too, ending in Ctrl+G. So two
+// modifier-bearing keypresses per reply, i.e. two chances to fire a keybinding,
+// plus 21 characters inserted into whatever had focus.
+//
+// TERMINATORS, and why each is here:
+//   - ST in both spellings, ESC '\' (7-bit) and 0x9C (8-bit). The defined
+//     terminator for all five string types;
+//   - BEL, for OSC ONLY. xterm has accepted BEL as an OSC terminator since
+//     forever and most terminals still emit it, but nothing terminates a DCS or
+//     an APC with BEL, and accepting it everywhere would cut a DCS payload short
+//     at the first 0x07 byte in it -- which for a binary DCS/APC payload (Kitty
+//     graphics) is a realistic byte, and cutting short is how the tail becomes
+//     keystrokes again;
+//   - CAN (0x18) and SUB (0x1A), ECMA-48's cancel-the-control-string bytes.
+//     Cheap, standard, and the only bounded way out of a string a terminal began
+//     and then abandoned;
+//   - an ESC that is NOT followed by '\'. Per xterm's parser an ESC inside a
+//     string aborts it, and the abort is the useful reading here: it hands the
+//     ESC back to the main loop so a real key sequence arriving after a
+//     malformed string still decodes, instead of being eaten as payload.
+//
+// AN UNTERMINATED STRING STALLS THE DECODER, and that is accepted rather than
+// bounded. The alternative -- cap the payload at N bytes, then consume and drop
+// -- was rejected: past the cap the REST of the payload lands back in the stream
+// as keystrokes, which is the precise failure this proc removes, and no cap can
+// be right for both an 8-byte OSC 11 reply and a multi-kilobyte OSC 52 clipboard
+// read. So it holds back, bounded only by the terminal's own good behaviour, on
+// the same terms `CSI M` already stalls on three missing payload bytes (see the
+// X10 mouse block in decode_keys). The four cancel bytes above mean a terminal
+// that abandons a string mid-flight -- as opposed to one that never terminates
+// it at all -- costs nothing.
+@(private = "file")
+string_escape_end :: proc(data: []u8, from: int, bel_terminates: bool) -> (end: int, ok: bool) {
+	k := from
+	for k < len(data) {
+		switch data[k] {
+		case 0x07:
+			if bel_terminates { return k + 1, true }
+		case 0x9c:
+			return k + 1, true                          // 8-bit ST
+		case 0x18, 0x1a:
+			return k + 1, true                          // CAN / SUB: cancelled
+		case 0x1b:
+			if k + 1 >= len(data) { return 0, false }   // ESC '\'? not enough bytes to say
+			if data[k + 1] == '\\' { return k + 2, true }
+			return k, true                              // aborts the string, ESC stays
+		}
+		k += 1
+	}
+	return 0, false
+}
+
 // Decodes as many complete keys as `data` contains, appending to `out`.
 // Returns the number of bytes consumed; a trailing partial escape sequence
 // or a trailing partial UTF-8 rune is left unconsumed so the caller can
 // retry once more bytes arrive.
 //
 // Vocabulary: printable runes; C0 control bytes per decode_c0's policy;
-// Enter/Tab/Space/Backspace/Escape; arrows, Home, End, Page_Up, Page_Down,
+// Enter/Tab/Space/Backspace/Escape; ESC + any C0 byte or DEL as Alt + that same
+// key, through the same policy; arrows, Home, End, Page_Up, Page_Down,
 // Insert, Delete and F1-F12 in their CSI-tilde, CSI-letter and SS3 encodings;
-// xterm modifier parameters (Shift/Alt/Ctrl/Meta) on all of those; the
+// xterm modifier parameters (Shift/Alt/Ctrl/Meta) on all of those; xterm's
+// modifyOtherKeys report (CSI 27 ; <mod> ; <codepoint> ~); urxvt's modified
+// tilde keys, where the modifier is the final byte (CSI 3 $ / ^ / @); the Linux
+// virtual console's F1-F5 (CSI [ A .. CSI [ E); the
 // Kitty keyboard protocol's CSI-u key events, including press/repeat/release
 // event types and the alternate-key and text sub-parameter forms; Kitty's
 // event-type sub-parameter on the LEGACY encodings (CSI 1;5:3 A,
@@ -1164,6 +1327,20 @@ ss3_decode :: proc(mod_digits: []u8, gl: u8) -> (key: Key_Msg, ok: bool) {
 // in `st.markers` too; and the terminal's keyboard-enhancement reply
 // (CSI ? <flags> u), which is the one thing here that is not a Key_Msg and so
 // goes to `enh` instead of `out`.
+//
+// EVERY GRAMMAR ABOVE IS ACCEPTED IN BOTH ITS 7-BIT AND ITS 8-BIT SPELLING
+// (ESC [ or 0x9B, ESC O or 0x8F, ...) -- see the introducer gate inside this
+// proc -- with ONE deliberate exception: bracketed paste is matched on its full
+// 7-bit byte string, so an 8-bit `0x9B 200~` is cleanly ignored rather than
+// opening a paste. That asymmetry is on purpose. Recognising the 8-bit START
+// without also recognising the 8-bit END would wedge the decoder in paste mode
+// for the rest of the session -- the worst failure in this file -- and the END
+// is matched inside the paste branch, against a byte string, precisely so a
+// still-arriving terminator can be compared to a prefix of itself.
+//
+// The five STRING ESCAPES (OSC ']', DCS 'P', SOS 'X', PM '^', APC '_') are
+// parsed but not decoded: consumed whole to their terminator, emitting nothing.
+// See string_escape_end for why they cannot simply be left to the Alt+key path.
 //
 // `enh` is OPTIONAL and defaults to nil, which drops the reply on the
 // cleanly-ignored path exactly as this decoder did before it understood it.
@@ -1212,7 +1389,20 @@ ss3_decode :: proc(mod_digits: []u8, gl: u8) -> (key: Key_Msg, ok: bool) {
 //
 // DOCUMENTED LIMITATIONS -- each of these is a separate future unit, and each
 // is CLEANLY IGNORED here (consumed whole, nothing emitted) rather than
-// leaking bytes as garbage runes:
+// leaking bytes as garbage runes.
+//
+// THAT SECOND CLAUSE WAS FALSE FOR TWO OF THE ENTRIES THAT USED TO BE ON THIS
+// LIST, and the list said so about one of them three lines into its own bullet
+// ("the '[' is a final byte and the letter is left over"). The Linux console's
+// F1-F5 leaked a capital letter per keypress; rxvt's '$'-final keys leaked
+// their parameter and their '$' as two runes, or ate the following keystroke.
+// Both are decoded outright now rather than merely swallowed, so the header is
+// true as stated -- and there is a test for it, which there was not before:
+// test_linux_console_function_keys_decode,
+// test_urxvt_dollar_keys_do_not_eat_the_next_keystroke and
+// test_a_csi_ending_on_an_intermediate_is_consumed_not_leaked. The claim is
+// worth stating carefully because a decoder's promise not to type at the user
+// is only as good as the population it was checked over:
 //   - the urxvt (CSI 1015) and SGR-PIXEL (CSI 1016) mouse encodings.
 //     term_enter_raw never asks for either, so a terminal never sends one
 //     unbidden; urxvt's `CSI <Cb> ; <Cx> ; <Cy> M` has no private prefix and
@@ -1238,11 +1428,11 @@ ss3_decode :: proc(mod_digits: []u8, gl: u8) -> (key: Key_Msg, ok: bool) {
 //     keypad block, the media keys, and the lone modifier keypresses;
 //   - keypad/DECKPAM keys (ESC O M/X/j-y, ESC O w/x/y/q/s/t/u/v/r for the
 //     numeric block, ESC O M for keypad Enter) and Begin (CSI E / ESC O E);
-//   - rxvt's lowercase-letter arrow forms (CSI a/b/c/d) and its '$'-final
-//     shifted keys (CSI 3$ / CSI 7$ / CSI 8$);
-//   - the Linux console's own F1-F5 (CSI [ A .. CSI [ E), which are not CSI at
-//     all under this grammar -- the '[' is a final byte and the letter is left
-//     over. Linux console F6-F12 use the standard tilde forms and DO decode;
+//   - rxvt's lowercase-letter arrow forms (CSI a/b/c/d). Its '$'-final shifted
+//     keys USED TO BE on this list and were the reason the list's own header
+//     was false: '$' is an intermediate byte, so the scan waited for a final
+//     and ate the user's next keystroke. They are decoded now -- see the '$'
+//     arm below and csi_decode's urxvt block;
 //   - F13-F20 (CSI 25~ and up), which Key_Code does not carry;
 //   - terminfo. The tables here are the xterm/VT220 defaults, not the
 //     terminal's own key table; a terminal that reports something else is a
@@ -1254,7 +1444,9 @@ ss3_decode :: proc(mod_digits: []u8, gl: u8) -> (key: Key_Msg, ok: bool) {
 //     capability, decoded elsewhere). They decode 20/36 for the Linux console
 //     and 25/71 for rxvt-unicode. So "xterm defaults cover the common
 //     terminals" holds for the terminals people actually use, and does NOT hold
-//     for the Linux console's function keys or for rxvt's modified keys. See
+//     in general for the Linux console or for rxvt -- though the two specific
+//     misses that used to LEAK (Linux F1-F5, rxvt's '$' keys) are decoded now,
+//     so what is left on those two terminals is silence, not typing. See
 //     docs/LIMITATIONS.md.
 //   - cursor position reports. CSI <row>;<col> R and modified-F3
 //     (CSI 1;<mod> R) are the same bytes when row == 1, and this decoder
@@ -1265,7 +1457,9 @@ ss3_decode :: proc(mod_digits: []u8, gl: u8) -> (key: Key_Msg, ok: bool) {
 // HOLD-BACK CONTRACT (the subtle part): a sequence that is still arriving --
 // "\e" alone at the very end of the buffer, "\e[" with nothing after it, a
 // CSI whose final byte (0x40-0x7E) hasn't arrived yet, an SS3 whose GL byte
-// hasn't arrived yet, or a UTF-8 lead byte without all of its continuation
+// hasn't arrived yet, an OSC/DCS/APC/PM/SOS whose terminator hasn't arrived
+// yet, a bare 8-bit introducer (0x9B, 0x8F, 0x90, ...) with nothing after it,
+// or a UTF-8 lead byte without all of its continuation
 // bytes yet, or a legacy mouse report whose three RAW bytes have not all
 // landed -- must NOT be decoded yet. Emitting a spurious Escape, or a
 // spurious U+FFFD replacement rune, for any of these would be the classic bug
@@ -1319,14 +1513,24 @@ ss3_decode :: proc(mod_digits: []u8, gl: u8) -> (key: Key_Msg, ok: bool) {
 // a key binding.
 //
 // LEGACY FLAGS AND THE ESC PATH (the trap). `legacy` reaches decode_c0 at the
-// C0 gate below and csi_decode for CSI 1~/4~. Ctrl_Open_Bracket is the odd one
+// C0 gate below, at the Alt+C0 gate on the ESC path, and at the plain-C1 gate;
+// it reaches csi_decode for CSI 1~/4~. Ctrl_Open_Bracket is the odd one
 // out: ESC is intercepted HERE, above the C0 gate, because it also introduces
 // sequences. So the flag applies at exactly the two points where an Escape is
 // RESOLVED -- the lone-ESC-at-end-of-buffer case and the double-ESC case, both
 // of which call decode_c0(0x1b, legacy) instead of building a Key_Msg inline,
-// so there is one answer, not three. It must NOT touch the hold-back decisions,
-// the ESC [ / ESC O grammars, or the Alt+key path: where a sequence ends is
+// so there is one answer, not three. It must NOT touch the hold-back decisions
+// or the ESC [ / ESC O grammars: where a sequence ends is
 // decided by the BYTES, and renaming a resolved Escape cannot change that.
+//
+// THIS USED TO SAY "or the Alt+key path", and that was a description of a bug,
+// not a rule. The Alt path never called decode_c0 at all, so ESC + 0x0D came
+// out as a raw CR rune rather than as Enter+{.Alt} and no legacy flag could
+// reach it. It calls decode_c0 now, so Alt+Enter with .Ctrl_M set is
+// Ctrl+Alt+m, exactly as bare Enter with .Ctrl_M set is Ctrl+m. Ctrl_Open_
+// Bracket is still excluded from it -- and structurally, not by a special case:
+// a second ESC is claimed by the double-Escape arm before the Alt+C0 gate can
+// see it, so the byte handed to decode_c0 there is never 0x1b.
 // Getting this wrong silently breaks every escape sequence, so
 // test_ctrl_open_bracket_leaves_sequences_alone pins it specifically.
 //
@@ -1416,7 +1620,45 @@ decode_keys :: proc(
 			continue
 		}
 
-		if b == 0x1b {
+		// THE INTRODUCER GATE, 7-bit and 8-bit resolved into one pair of values.
+		//
+		// Every grammar below is introduced either by "ESC <c>" (7-bit) or by a
+		// single C1 byte in 0x80-0x9F (8-bit): 0x9B is CSI, 0x8F is SS3, 0x90 is
+		// DCS, 0x9D/0x9E/0x9F are OSC/PM/APC, 0x98 is SOS. The two spellings
+		// differ ONLY in how many bytes the introducer costs, so they are
+		// normalised here into (`intro`, the 7-bit introducer character; `body`,
+		// the index of the first byte after it) and every arm is written against
+		// that pair. The C1 byte maps to its 7-bit character by subtracting 0x40,
+		// which is what "C1 equivalent" means: 0x9B - 0x40 == '['.
+		//
+		// BEFORE THIS, 0x80-0x9F HAD NO CASE AT ALL. The dispatch went ESC, then
+		// the C0 gate, then straight to the UTF-8 path -- where utf8_lead_len
+		// reports 1 for every byte in 0x80-0xBF and decode_rune substitutes
+		// U+FFFD. So `0x9B A` (8-bit CSI Up, what a terminal in S8C1T mode sends)
+		// came out as U+FFFD followed by a literal 'A', and a whole 8-bit OSC
+		// leaked its entire payload as runes. The comment on utf8_lead_len still
+		// stands for 0xA0-0xBF -- those really are stray continuation bytes with
+		// nothing to hold back for -- but conflating C1 with them was the bug.
+		//
+		// A C1 BYTE THAT IS NOT AN INTRODUCER is xterm's eightBitInput meta
+		// encoding: with that resource on and UTF-8 off, Alt+Ctrl+A arrives as
+		// 0x81 rather than as `ESC 0x01`. It is decoded at the bottom of this
+		// block as Alt + whatever decode_c0 makes of `b - 0x80`, which gives
+		// Ctrl+Alt+a for 0x81 and is byte-for-byte the same Key_Msg the 7-bit
+		// spelling now produces. ultraviolet (decoder.go) reaches the same answer
+		// by a different route -- rune(b)-0x40 with ModCtrl|ModAlt, i.e. an
+		// UPPERCASE 'A' -- which would be inconsistent with this decoder's own C0
+		// policy, where every Ctrl+letter is lowercase; decode_c0 is reused
+		// precisely so there is one answer to "what is Ctrl+A" and not two.
+		//
+		// THE COST, stated plainly: a terminal that is not speaking UTF-8 and
+		// sends Latin-1 text now reports 0x80-0x9F as keypresses instead of as
+		// U+FFFD. Both readings are wrong for that terminal; the C1 one is at
+		// least the standard one, and the range is unassigned in Latin-1 anyway.
+		intro: u8 = 0
+		body := 0
+		switch {
+		case b == 0x1b:
 			if i + 1 >= len(data) {
 				// Lone ESC at the very end of the buffer. Ambiguous: it may be a
 				// real Escape or the start of a sequence still in flight. The
@@ -1425,7 +1667,18 @@ decode_keys :: proc(
 				append(out, decode_c0(0x1b, legacy))
 				return i + 1
 			}
-			if data[i + 1] == '[' {
+			intro, body = data[i + 1], i + 2
+		case b >= 0x80 && b <= 0x9f:
+			intro, body = b - 0x40, i + 1
+		}
+
+		// `body != 0` is the "an introducer was resolved" test, and it is exact:
+		// the switch above leaves body at 0 for every other byte, and sets it to
+		// i+1 or i+2 -- never 0 -- for the two that introduce something. Testing
+		// `intro != 0` instead would be WRONG: `ESC NUL` is a real (if silly)
+		// keypress whose intro byte IS 0, and it belongs on the Alt path below.
+		if body != 0 {
+			if intro == '[' {
 				// CSI grammar: ESC [ <parameter bytes 0x30-0x3F>*
 				//                    <intermediate bytes 0x20-0x2F>*
 				//                    <final byte 0x40-0x7E>
@@ -1435,20 +1688,105 @@ decode_keys :: proc(
 				// whole sequence is in hand does csi_decode get to say what it
 				// means -- so "not a key we know" and "not here yet" can never
 				// be confused for each other.
-				ps := i + 2
+				ps := body
+				// THE LINUX VIRTUAL CONSOLE'S F1-F5: `ESC [ [ A` .. `ESC [ [ E`.
+				//
+				// Claimed here, ahead of the parameter scan, because under the
+				// CSI grammar it is not one sequence but one-and-a-bit: '[' is
+				// 0x5B, a perfectly legal FINAL byte, so the scan below used to
+				// stop on it, hand `ESC [ [` to csi_decode (which knows no key
+				// with a '[' final), consume three bytes -- and leave the letter
+				// behind, where the plain-rune path at the bottom of this loop
+				// typed it into the application. Pressing F1 on a bare TTY
+				// inserted a capital 'A'. That made this decoder's standing
+				// promise ("an unsupported sequence is consumed whole and emits
+				// nothing, never leaked as garbage runes") false for one of the
+				// exact two populations the limitation list itself named.
+				//
+				// Decoding them outright rather than merely swallowing them costs
+				// two lines more and removes a documented gap: the Linux console
+				// is the terminal the xterm defaults cover worst (20/36 terminfo
+				// capabilities), and F6-F12 there already decode via the standard
+				// tilde forms, so F1-F5 were the hole.
+				//
+				// A letter outside A-E is consumed and ignored -- there is no
+				// such Linux-console key, and the point of the arm is that
+				// nothing after `ESC [ [` ever reaches the rune path again.
+				if ps < len(data) && data[ps] == '[' {
+					if ps + 1 >= len(data) { return i }   // the letter has not arrived: hold back
+					if c := data[ps + 1]; c >= 'A' && c <= 'E' {
+						// Contiguous by construction -- see Key_Code's comment on
+						// why the F-block's order is load-bearing.
+						append(out, Key_Msg{code = Key_Code(int(Key_Code.F1) + int(c - 'A'))})
+					}
+					i = ps + 2
+					continue
+				}
 				j  := ps
 				for j < len(data) && data[j] >= 0x30 && data[j] <= 0x3F { j += 1 }
 				pe := j
+				// URXVT'S '$'-FINAL MODIFIED KEYS, claimed before the
+				// intermediate scan because that scan is what used to eat them.
+				//
+				// '$' is 0x24, inside the intermediate range 0x20-0x2F, so under
+				// the ECMA-48 grammar `\e[3$` is an INCOMPLETE sequence still
+				// waiting for its final byte -- and the scan duly waited, then
+				// took whatever byte arrived next as that final. Two outcomes,
+				// both demonstrated against the shipped editor over a pty:
+				// pressing Shift+Delete then typing 'X' DESTROYED the 'X' (a
+				// letter is a valid final, so the whole thing was consumed as one
+				// unknown sequence); pressing Shift+Delete then Up INJECTED
+				// TEXT (ESC is not a valid final, so the old resynchronisation
+				// arm dropped `\e[` and re-decoded `3$` as the runes '3' and
+				// '$'). Splitting the two keystrokes across reads did not help --
+				// the reader accumulates into `pending` and calls back with both.
+				//
+				// rxvt terminates these sequences AT the '$', which is not
+				// ECMA-48 but is what rxvt-unicode's terminfo says (kDC=\e[3$,
+				// kIC=\e[2$, kHOM=\e[7$, kEND=\e[8$, kNXT=\e[6$, kPRV=\e[5$), so
+				// the fix is to read it that way and hand it to csi_decode as a
+				// final. csi_bare_number is what keeps that from stealing DECRPM,
+				// whose '$' really is an intermediate; read its comment.
+				if j < len(data) && data[j] == '$' && csi_bare_number(data[ps:pe]) {
+					if key, ok := csi_decode(data[ps:pe], false, '$', legacy); ok {
+						append(out, key)
+					}
+					i = j + 1
+					continue
+				}
+				// The intermediate run is UNBOUNDED here, deliberately. Capping
+				// it at ECMA-48's practical two was considered and rejected: the
+				// third byte would then be left in the stream, and 0x20-0x2F is
+				// printable ASCII, so the cap would REINTRODUCE the leak one byte
+				// further along. The parameter scan above is unbounded for the
+				// same reason, and the residual cost is identical for both -- a
+				// terminal that emits an endless run of parameter or intermediate
+				// bytes stalls the reader, which is the `CSI M` trade-off again.
+				ims := j
 				for j < len(data) && data[j] >= 0x20 && data[j] <= 0x2F { j += 1 }
 				if j >= len(data) { return i }   // final byte not arrived yet: hold back
 				final := data[j]
 				if final < 0x40 || final > 0x7E {
-					// Malformed CSI (e.g. a stray C0/high byte where a
-					// parameter/intermediate/final byte was expected): not a
-					// sequence in flight, nothing to hold back for. Drop just
-					// the introducer so we resynchronise instead of getting
-					// stuck.
-					i += 2
+					if j > ims {
+						// The intermediate run ended on a byte that CANNOT be a
+						// final (a C0, an ESC, a high byte). ECMA-48 says the
+						// sequence is malformed; the question is what to do with
+						// the bytes, and the old answer -- drop `\e[` and
+						// resynchronise -- left every parameter and intermediate
+						// byte behind to be typed as runes. They are printable
+						// ASCII, so that is silent text injection, not visible
+						// garbage. Ending the sequence at the last intermediate
+						// instead consumes them and emits nothing, which is the
+						// contract every other unrecognised sequence here obeys,
+						// and it can never eat the byte that follows.
+						i = j
+						continue
+					}
+					// Malformed CSI with no intermediates (e.g. a stray C0/high
+					// byte straight after the parameter run): not a sequence in
+					// flight, nothing to hold back for. Drop just the introducer
+					// so we resynchronise instead of getting stuck.
+					i = body
 					continue
 				}
 				// `CSI ? <flags> u` is not a key and never was; before this
@@ -1585,23 +1923,28 @@ decode_keys :: proc(
 				i = j + 1
 				continue
 			}
-			if data[i + 1] == 'O' {
-				if i + 2 >= len(data) {
-					// ESC O with no third byte: resolve as Alt+O. See the ESC O
-					// discussion in this proc's doc comment -- this is the lone-ESC
-					// exception again, not a new one.
+			if intro == 'O' {
+				if body >= len(data) {
+					// THE AMBIGUITY IS 7-BIT ONLY. `ESC O` with no third byte
+					// resolves as Alt+O, because those two bytes are a complete,
+					// plausible keypress on their own -- see the ESC O discussion
+					// in this proc's doc comment; this is the lone-ESC exception
+					// again, not a new one. The 8-bit spelling (0x8F) is NOT
+					// ambiguous: SS3 is the only thing that byte can be, so it
+					// holds back like any other half-arrived sequence.
+					if b != 0x1b { return i }
 					append(out, Key_Msg{code = .Rune, r = 'O', mods = {.Alt}})
-					return i + 2
+					return body
 				}
 				// SS3 grammar: ESC O <digits>* <GL byte 0x21-0x7E>.
-				ds := i + 2
+				ds := body
 				j  := ds
 				for j < len(data) && data[j] >= '0' && data[j] <= '9' { j += 1 }
 				if j >= len(data) { return i }   // GL byte not arrived yet: hold back
 				gl := data[j]
 				if gl < 0x21 || gl > 0x7E {
 					// Same resynchronisation rule as a malformed CSI above.
-					i += 2
+					i = body
 					continue
 				}
 				if key, ok := ss3_decode(data[ds:j], gl); ok {
@@ -1610,19 +1953,83 @@ decode_keys :: proc(
 				i = j + 1
 				continue
 			}
-			if data[i + 1] == 0x1b {
-				// Double Escape: resolve the first as a real Escape keypress
-				// and leave the second ESC byte for the next iteration.
-				append(out, decode_c0(0x1b, legacy))
-				i += 1
+			// THE STRING ESCAPES: OSC (']'), DCS ('P'), SOS ('X'), PM ('^') and
+			// APC ('_'). Consumed whole to their terminator, emitting nothing --
+			// the same "cleanly ignored" contract the CSI and SS3 arms honour,
+			// and the same hold-back discipline. Before this arm existed these
+			// five introducers fell through to the Alt+key path below and the
+			// entire payload was typed into the application; string_escape_end's
+			// comment has the measurement and the terminator rules.
+			//
+			// Nothing here is DECODED yet -- not OSC 8 hyperlinks, not the OSC
+			// 10/11 colour replies, not XTVERSION -- because none of them has a
+			// Msg to become. Surfacing them is a separate unit; making them stop
+			// being keystrokes is not, and is what this arm does.
+			if intro == ']' || intro == 'P' || intro == 'X' || intro == '^' || intro == '_' {
+				end, ok := string_escape_end(data, body, intro == ']')
+				if !ok { return i }   // terminator not arrived yet: hold back
+				i = end
 				continue
 			}
-			// ESC followed by a printable byte == Alt+key
-			need := utf8_lead_len(data[i + 1])
-			if i + 1 + need > len(data) { return i }   // incomplete UTF-8: hold back
-			r, w := utf8.decode_rune(data[i + 1:])
-			append(out, Key_Msg{code = .Rune, r = r, mods = {.Alt}})
-			i += 1 + w
+			if b == 0x1b {
+				if intro == 0x1b {
+					// Double Escape: resolve the first as a real Escape keypress
+					// and leave the second ESC byte for the next iteration.
+					append(out, decode_c0(0x1b, legacy))
+					i += 1
+					continue
+				}
+				// ESC + A C0 BYTE OR DEL == Alt + that KEY, not Alt + that raw
+				// rune. This gate is new, and its absence made the comment below
+				// it a lie for years: there was no printability test, so ANY byte
+				// after ESC went down the rune path. Alt+Enter came out as
+				// Key_Msg{code = .Rune, r = '\r', mods = {.Alt}} instead of
+				// Enter+{.Alt}; Alt+Backspace as a raw U+007F rune; Alt+Tab as
+				// '\t'; and Ctrl+Alt+A as U+0001 with mods = {.Alt} and NO .Ctrl
+				// BIT AT ALL, so `k.mods == {.Ctrl, .Alt}` never matched anything.
+				//
+				// The cost was not a missed binding. examples/editor's
+				// `case .Rune: insert_rune(m, k.r)` has no control filter, so one
+				// Alt+Enter inserted a raw CR into the document; the .Diff
+				// renderer then wrote that control byte to the terminal, which
+				// the framework's own view contract declares illegal (a debug
+				// build traps on it, a release build silently diverges the cell
+				// model from the screen by one column).
+				//
+				// Routing through decode_c0 rather than hand-building a Key_Msg
+				// is the same rule the C0 gate at the bottom of this loop follows:
+				// there is ONE C0 policy and it lives in one proc. That does mean
+				// `legacy` now reaches the Alt path -- Alt+Enter with .Ctrl_M set
+				// is Ctrl+Alt+m, as it should be -- which is a deliberate widening
+				// of the note in this proc's doc comment. Ctrl_Open_Bracket is
+				// still untouched by it: 0x1b after 0x1b is claimed by the
+				// double-Escape arm immediately above, so the byte reaching
+				// decode_c0 here is never ESC.
+				if intro <= 0x20 || intro == 0x7f {
+					k := decode_c0(intro, legacy)
+					k.mods += {.Alt}
+					append(out, k)
+					i = body
+					continue
+				}
+				// ESC followed by a printable byte == Alt+key. Indexed off i+1,
+				// not off `body`: `body` is the index PAST the introducer, and
+				// here the introducer byte IS the first byte of the rune.
+				need := utf8_lead_len(intro)
+				if i + 1 + need > len(data) { return i }   // incomplete UTF-8: hold back
+				r, w := utf8.decode_rune(data[i + 1:])
+				append(out, Key_Msg{code = .Rune, r = r, mods = {.Alt}})
+				i += 1 + w
+				continue
+			}
+			// A C1 byte that introduces nothing: xterm's eightBitInput meta
+			// encoding, i.e. Alt + the C0 key at `b - 0x80`. See the introducer
+			// gate's comment for why this reuses decode_c0 rather than
+			// ultraviolet's uppercase-rune arithmetic.
+			k := decode_c0(b - 0x80, legacy)
+			k.mods += {.Alt}
+			append(out, k)
+			i += 1
 			continue
 		}
 

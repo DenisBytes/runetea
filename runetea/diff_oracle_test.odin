@@ -1,3 +1,9 @@
+#+private
+// ^ Every declaration in this file is package-private, so that `odin doc
+//   runetea` / `odin doc runegloss` -- the command README.md and docs/API.md
+//   hand a newcomer for symbol discovery -- lists the library rather than the
+//   test fixtures. Pinned by tools/doccheck/run.sh's `apidoc` check, which is
+//   also where the argument for it is written out.
 package runetea
 
 import "core:fmt"
@@ -173,6 +179,36 @@ vt_params :: proc(body: string) -> (p1, p2, n: int) {
 // The equivalence assertion.
 // ---------------------------------------------------------------------------
 
+// The glyph the absolute oracle paints every cell with before a repaint, chosen
+// so it cannot collide with anything the generator emits: TOK_ASCII, TOK_WIDE,
+// TOK_COMBINING, TOK_PRECOMPOSED and TOK_EMOJI contain no U+00A7. One byte
+// short of two, i.e. narrow, so painting it everywhere is a legal screen state
+// rather than a grid of half-clusters the replay would then have to survive.
+@(private = "file")
+ORACLE_MARKER :: "§"
+
+@(private = "file")
+mark_every_cell :: proc(s: ^Screen) {
+	// Appended once per frame and left in `text` as garbage; this Screen is
+	// never screen_copy'd, so nothing compacts it -- bounded by frames x cells x
+	// 2 bytes for the life of one case, which is kilobytes.
+	off := u32(len(s.text))
+	append(&s.text, ORACLE_MARKER)
+	for i in 0 ..< len(s.cells) {
+		s.cells[i] = Cell{off = off, len = u16(len(ORACLE_MARKER)), width = 1, style = 0, link = 0}
+	}
+}
+
+@(private = "file")
+first_marked_cell :: proc(s: ^Screen) -> (x, y: int, found: bool) {
+	for i in 0 ..< len(s.cells) {
+		if cell_bytes(s, s.cells[i]) == ORACLE_MARKER {
+			return i % s.cols, i / s.cols, true
+		}
+	}
+	return 0, 0, false
+}
+
 @(private = "file")
 Oracle_Fail :: struct {
 	seed:  u64,
@@ -190,9 +226,14 @@ Oracle_Fail :: struct {
 // because a divergence that a later full repaint happens to heal is still a
 // frame the user saw wrong.
 @(private = "file")
-oracle_case :: proc(seed: u64, pyte_safe := false) -> (ok: bool, fail: Oracle_Fail) {
+oracle_case :: proc(seed: u64, pyte_safe := false, resizes := true) -> (ok: bool, fail: Oracle_Fail) {
 	f: Diff_Fuzz
-	diff_fuzz_init(&f, seed, pyte_safe)
+	// resizes: THIS harness opts in (see Diff_Fuzz.resizes for the contract).
+	// It is the reason the loop below re-sizes both renderers and all three
+	// replay screens on every frame. tools/difftest does not opt in, because
+	// check.py has no RESIZE record and would compare against a pyte screen
+	// still at the old size.
+	diff_fuzz_init(&f, seed, pyte_safe, resizes)
 	defer diff_fuzz_destroy(&f)
 
 	vb := strings.builder_make();  defer strings.builder_destroy(&vb)
@@ -229,11 +270,47 @@ oracle_case :: proc(seed: u64, pyte_safe := false) -> (ok: bool, fail: Oracle_Fa
 	defer screen_destroy(&s_ref)
 	defer screen_destroy(&s_dif)
 
+	// THE ABSOLUTE ORACLE, and the only one here that is not a comparison
+	// between two renderers.
+	//
+	// Everything else in this file checks that .Diff reproduces .Full_Screen.
+	// That is the invariant worth having, but it is blind by construction to any
+	// defect in the frame's SHAPE -- which lines fit, where the \r\n goes,
+	// whether the trailing \e[K is emitted -- because both modes get that shape
+	// from the SAME paint_frame call and would be wrong together. F14 lived
+	// exactly there: a line whose last cluster was wide and straddled the right
+	// margin measured as flush with it, the \e[K was skipped, and the tail of
+	// that row kept the previous frame's characters. Both oracles were green.
+	//
+	// So: a third screen, fed ONLY the repaint stream, whose every cell is
+	// overwritten with a marker glyph before each frame. .Full_Screen writes or
+	// erases every cell of every row it owns, every frame -- that is what
+	// "absolute repaint" means -- so no marker may survive. One that does is a
+	// cell the repaint believes it covered and did not.
+	s_abs: Screen
+	screen_init(&s_abs, f.cols, f.rows, &st, &lt)
+	defer screen_destroy(&s_abs)
+
 	scratch: [dynamic]u8
 	defer delete(scratch)
 
 	for frame in 0 ..< f.frames {
 		view, cur := diff_fuzz_frame(&f, &vb)
+
+		// The harness half of the resize contract. renderer_set_width/height are
+		// no-ops when the value is unchanged, so this is unconditional rather
+		// than gated on f.resized. The replay screens are re-created, which
+		// blanks them -- sound because a resized frame is fully determined by
+		// its own bytes in BOTH modes: .Diff forces a repaint (\e[0m\e[H\e[2J
+		// then every cell), and .Full_Screen homes, writes every painted row and
+		// \e[J's everything below.
+		renderer_set_width(&r_ref, f.cols);  renderer_set_height(&r_ref, f.rows)
+		renderer_set_width(&r_dif, f.cols);  renderer_set_height(&r_dif, f.rows)
+		if s_ref.cols != f.cols || s_ref.rows != f.rows {
+			screen_init(&s_ref, f.cols, f.rows, &st, &lt)
+			screen_init(&s_dif, f.cols, f.rows, &st, &lt)
+			screen_init(&s_abs, f.cols, f.rows, &st, &lt)
+		}
 
 		strings.builder_reset(&rb)
 		strings.builder_reset(&db)
@@ -242,6 +319,17 @@ oracle_case :: proc(seed: u64, pyte_safe := false) -> (ok: bool, fail: Oracle_Fa
 
 		vt_replay(&s_ref, strings.to_string(rb), &scratch)
 		vt_replay(&s_dif, strings.to_string(db), &scratch)
+
+		mark_every_cell(&s_abs)
+		vt_replay(&s_abs, strings.to_string(rb), &scratch)
+		if mx, my, marked := first_marked_cell(&s_abs); marked {
+			return false, Oracle_Fail{
+				seed = seed, frame = frame, row = my, col = mx,
+				what = "stale cell (the repaint did not cover it)",
+				ref  = fmt.aprintf("%q", ORACLE_MARKER),
+				got  = fmt.aprintf("%dx%d view=%q", f.cols, f.rows, view),
+			}
+		}
 
 		for y in 0 ..< f.rows {
 			for x in 0 ..< f.cols {
@@ -485,9 +573,14 @@ test_diff_full_screen_change_costs_about_one_repaint :: proc(t: ^testing.T) {
 test_diff_first_frame_paints_from_a_known_blank_screen :: proc(t: ^testing.T) {
 	h := harness_make(10, 3); defer harness_free(h)
 	got := frame(h, "hi")
-	// \e[0m first: \e[2J erases with the ACTIVE background, and on the very
+	// \e[?25l first: this mode owns the viewport and hides the caret for as long
+	// as it does -- see render_test.odin's test_full_screen_hides_the_caret_it
+	// _owns, whose rule this is deliberately identical to (the oracle compares
+	// cursor VISIBILITY between the two modes, so a difference here would be a
+	// divergence of this file's own invention).
+	// Then \e[0m: \e[2J erases with the ACTIVE background, and on the very
 	// first frame this process has no idea what that is.
-	testing.expect_value(t, got, "\e[0m\e[H\e[2J" + "hi" + "\e[2;1H")
+	testing.expect_value(t, got, "\e[?25l" + "\e[0m\e[H\e[2J" + "hi" + "\e[2;1H")
 }
 
 @(test)
@@ -634,23 +727,36 @@ test_diff_style_is_not_re_emitted_between_cells_that_share_it :: proc(t: ^testin
 @(test)
 test_diff_el_is_not_used_to_clear_a_styled_tail :: proc(t: ^testing.T) {
 	h := harness_make(12, 2); defer harness_free(h)
-	// The first frame's \e[K runs with red still active, so the erased tail is
-	// RED blanks. The second frame's tail is DEFAULT blanks. Those are different
-	// cells, and \e[K cannot be used to produce the red ones -- whether an erase
-	// records anything but the background is terminal-dependent.
-	// Note the FIRST frame is the plain one: SGR state carries across frames on a
-	// real terminal (the repaint stream never resets between frames either), so
-	// "\e[41mab" followed by "ab" would leave the second frame red too -- and
-	// correctly produce no diff at all.
+	// The line's own \e[K runs with red still active, so the erased tail of THAT
+	// ROW is RED blanks. \e[K cannot be used to produce them -- whether an erase
+	// records anything but the background is terminal-dependent -- so they are
+	// written as real spaces.
 	frame(h, "abcdefgh")
 	got := frame(h, "\e[41mab")
-	// Row 0's ten-cell tail AND all of row 1 (the repaint's trailing \e[J also
-	// runs with red active) become RED blanks, written as real spaces. Not one
-	// \e[K anywhere in the frame.
+	// ROW 1 IS NOT TOUCHED, and that is the behaviour change worth reading.
+	//
+	// It used to be twelve red spaces plus a \r, because the trailing \e[J ran
+	// with the view's leftover red still active and the model recorded a screen
+	// whose every unwritten row was red. That is the whole of finding F03/F05/
+	// F33 in one frame: one unclosed SGR at the end of a view flooded every row
+	// BELOW the frame, .Diff wrote the flood out as literal spaces (so it needed
+	// no BCE support and happened on every terminal), the leaked style was baked
+	// into the cell model and carried into the next frame by screen_copy, and
+	// screen_sgr then re-accumulated onto it -- +16 emitted bytes per frame,
+	// forever, until the 1 MiB style budget blew and forced a full repaint.
+	//
+	// paint_frame now closes the pen before the trailing ED, in the byte stream
+	// and in the model together (frame_state_reset), so the rows below a frame are
+	// erased at the DEFAULT background. Row 1 was already default blanks, so it
+	// costs nothing at all here. The per-line \e[K deliberately still carries the
+	// view's pen -- that is how a view paints a bar out to the margin, and both
+	// modes model it identically.
+	//
 	// The trailing \e[0m is the frame-closing reset: this frame ends with red
-	// still active, and leaving it set would tint whatever is written next.
+	// still active on the wire, and leaving it set would tint whatever is
+	// written next.
 	testing.expect_value(t, got,
-		"\e[1;1H\e[41mab" + "          " + "\e[2;1H" + "            " + "\e[0m" + "\r")
+		"\e[1;1H\e[41mab" + "          " + "\e[0m" + "\e[2;1H")
 	testing.expect(t, !strings.contains(got, "\e[K"), "a styled tail must not be cleared with EL")
 }
 
@@ -833,14 +939,14 @@ test_diff_repaint_prologue_closes_a_link_only_once_links_are_in_play :: proc(t: 
 	// emitted before T3-C -- that is the entire compatibility guarantee, and
 	// diff_links_in_play is what delivers it.
 	h := harness_make(10, 3); defer harness_free(h)
-	testing.expect_value(t, frame(h, "hi"), "\e[0m\e[H\e[2J" + "hi" + "\e[2;1H")
+	testing.expect_value(t, frame(h, "hi"), "\e[?25l" + "\e[0m\e[H\e[2J" + "hi" + "\e[2;1H")
 
 	// Once a link HAS been seen, a forced repaint closes any link the previous
 	// occupant of the terminal may have left open -- \e[0m does not do it (SGR
 	// and OSC 8 are independent attribute planes) and \e[2J does not either.
 	h2 := harness_make(10, 3); defer harness_free(h2)
 	got := frame(h2, LINK_A + "hi" + LINK_OFF)
-	testing.expect_value(t, got, "\e[0m" + LINK_OFF + "\e[H\e[2J" + LINK_A + "hi" + LINK_OFF + "\e[2;1H")
+	testing.expect_value(t, got, "\e[?25l" + "\e[0m" + LINK_OFF + "\e[H\e[2J" + LINK_A + "hi" + LINK_OFF + "\e[2;1H")
 }
 
 @(test)
@@ -853,7 +959,9 @@ test_diff_renderer_clear_closes_an_open_link :: proc(t: ^testing.T) {
 	frame(h, LINK_A + "ab" + LINK_OFF)
 	strings.builder_reset(&h.b)
 	renderer_clear(&h.r)
-	testing.expect_value(t, strings.to_string(h.b), "\e[H\e[J")
+	// \e[?25h: the frame above hid the caret (this mode owns the viewport) and
+	// renderer_clear is where that ownership ends.
+	testing.expect_value(t, strings.to_string(h.b), "\e[?25h" + "\e[H\e[J")
 }
 
 // A TRUNCATED ESCAPE IS A CONTRACT VIOLATION, so this test asserts what a
@@ -941,13 +1049,14 @@ test_diff_clear_blanks_the_screen_and_resyncs_the_model :: proc(t: ^testing.T) {
 	frame(h, "abc")
 	strings.builder_reset(&h.b)
 	renderer_clear(&h.r)
-	testing.expect_value(t, strings.to_string(h.b), "\e[H\e[J")
+	testing.expect_value(t, strings.to_string(h.b), "\e[?25h" + "\e[H\e[J")
 	// The model now says "blank", so the next frame repaints its content --
 	// without a \e[2J prologue, because renderer_clear already did the erasing.
 	got := frame(h, "abc")
 	// No leading move: renderer_clear left the cursor at home and the model
-	// knows it, so the first cell needs no positioning at all.
-	testing.expect_value(t, got, "abc\e[2;1H")
+	// knows it, so the first cell needs no positioning at all. The \e[?25l is
+	// back because renderer_clear showed the caret again.
+	testing.expect_value(t, got, "\e[?25l" + "abc\e[2;1H")
 }
 
 @(test)
@@ -976,7 +1085,7 @@ test_diff_content_taller_than_the_viewport_is_truncated_like_full_screen :: proc
 	got := frame(h, "one\ntwo\nthree")
 	// Two rows of viewport: "three" never appears. Same policy render_full_screen
 	// documents -- scrolling is the application's job.
-	testing.expect_value(t, got, "\e[0m\e[H\e[2J" + "one" + "\e[2;1Htwo")
+	testing.expect_value(t, got, "\e[?25l" + "\e[0m\e[H\e[2J" + "one" + "\e[2;1Htwo")
 	testing.expect_value(t, len(frame(h, "one\ntwo\nthree")), 0)
 	testing.expect_value(t, frame(h, "one\ntwo\nfour"), "")
 }
@@ -1018,7 +1127,7 @@ test_diff_leaves_the_other_two_modes_untouched :: proc(t: ^testing.T) {
 	rf: Renderer
 	renderer_init(&rf, &bf, 0, 0, .Full_Screen)
 	renderer_render(&rf, "hello\nworld")
-	testing.expect_value(t, strings.to_string(bf), "\e[H" + "hello" + "\e[K" + "\r\n" + "world" + "\e[K" + "\r\n" + "\e[J")
+	testing.expect_value(t, strings.to_string(bf), "\e[?25l" + "\e[H" + "hello" + "\e[K" + "\r\n" + "world" + "\e[K" + "\r\n" + "\e[J")
 }
 
 // A whole Program driven through run() in .Diff mode. The point is not the
@@ -1051,4 +1160,263 @@ test_diff_mode_runs_a_whole_program_through_run :: proc(t: ^testing.T) {
 	}
 
 	testing.expect_value(t, strings.to_string(bd), strings.to_string(bf))
+}
+
+// ---------------------------------------------------------------------------
+// F05 / F13 / F24 / F33: what a frame leaves behind, what it costs, and what
+// happens when the model cannot represent it.
+// ---------------------------------------------------------------------------
+
+// F05. AN UNCLOSED SGR MUST NOT MAKE AN IDENTICAL FRAME COST ANYTHING.
+//
+// The mechanism was a loop between two pieces of carried state. Screen.style
+// crossed frames (screen_copy copies it) and paint_frame never reset it, so
+// screen_sgr re-accumulated the view's own escape onto the style it had already
+// accumulated last frame: "\e[41m", then "\e[41m\e[41m", then three, and so on.
+// Every one of those interned as a DIFFERENT style, so every cell of the bar
+// compared unequal to itself and was repainted -- +16 bytes per frame, measured,
+// growing without bound until the 1 MiB byte budget blew, at which point the
+// table was dropped and the whole screen force-repainted. A sawtooth, forever,
+// on a screen that never changed: ~4.1 KB/frame average against 0, and 43x the
+// cost of the .Full_Screen repaint this mode exists to beat.
+//
+// paint_frame now starts every frame at the default pen in the model as well as
+// on the wire, so the accumulation has nowhere to grow from.
+@(test)
+test_diff_cost_does_not_grow_when_a_view_leaves_a_style_open :: proc(t: ^testing.T) {
+	h := harness_make(20, 4); defer harness_free(h)
+	leaky :: "\e[41mstatus bar"
+
+	frame(h, leaky)                      // the initial paint
+	first := len(frame(h, leaky))
+	testing.expect_value(t, first, 0)
+	// Ten more, because "it grew by 16 bytes a frame" is only visible over
+	// several: one repeat could be a constant, ten cannot.
+	total := 0
+	for _ in 0 ..< 10 { total += len(frame(h, leaky)) }
+	testing.expectf(t, total == 0,
+		"ten identical frames of a style-leaking view cost %d bytes; the contract is 0", total)
+
+	// And the intern table has stopped growing, which is the cause rather than
+	// the symptom. Two entries: the default at index 0, and "\e[41m".
+	testing.expect_value(t, len(h.r.styles.spans), 2)
+}
+
+// F33. .Diff AND .Full_Screen MUST RENDER THE SAME VIEW THE SAME WAY ACROSS A
+// RESIZE.
+//
+// They did not, for any view that left an SGR open past its last cell. .Diff's
+// forced repaint blanked its model (style 0) and emitted \e[0m before \e[2J;
+// .Full_Screen re-homed onto the previous frame's still-active pen and painted
+// the frame's unstyled leading text in it. One frame -- the forced-repaint one
+// -- rendered differently in the two modes, and under .Diff the application's
+// colours visibly CHANGED at the moment the user dragged the window.
+//
+// Neither oracle could see it, because no case in either ever resized. That is
+// F34, and the fuzz corpus now does resize; this is the minimal repro stated
+// once, so a failure here says what broke instead of printing a seed.
+@(test)
+test_diff_and_full_screen_agree_across_a_resize_with_an_open_style :: proc(t: ^testing.T) {
+	bd := strings.builder_make(); defer strings.builder_destroy(&bd)
+	bf := strings.builder_make(); defer strings.builder_destroy(&bf)
+
+	rd: Renderer; renderer_init(&rd, &bd, 10, 3, .Diff);        defer renderer_destroy(&rd)
+	rf: Renderer; renderer_init(&rf, &bf, 10, 3, .Full_Screen)
+
+	st, lt: Style_Table
+	style_table_init(&st); defer style_table_destroy(&st)
+	style_table_init(&lt); defer style_table_destroy(&lt)
+	sd, sf: Screen
+	screen_init(&sd, 10, 3, &st, &lt); defer screen_destroy(&sd)
+	screen_init(&sf, 10, 3, &st, &lt); defer screen_destroy(&sf)
+	scratch: [dynamic]u8; defer delete(scratch)
+
+	step :: proc(rd, rf: ^Renderer, bd, bf: ^strings.Builder, sd, sf: ^Screen, scratch: ^[dynamic]u8, view: string) {
+		strings.builder_reset(bd); strings.builder_reset(bf)
+		renderer_render(rd, view)
+		renderer_render(rf, view)
+		vt_replay(sd, strings.to_string(bd^), scratch)
+		vt_replay(sf, strings.to_string(bf^), scratch)
+	}
+
+	// The audit's own minimal case: frame 1 leaves \e[31m open, frame 2 is
+	// plain, and the height changes between them.
+	step(&rd, &rf, &bd, &bf, &sd, &sf, &scratch, "\e[31mabc")
+	renderer_set_width(&rd, 10); renderer_set_height(&rd, 4)
+	renderer_set_width(&rf, 10); renderer_set_height(&rf, 4)
+	screen_init(&sd, 10, 4, &st, &lt)
+	screen_init(&sf, 10, 4, &st, &lt)
+	step(&rd, &rf, &bd, &bf, &sd, &sf, &scratch, "xyz")
+
+	for y in 0 ..< 4 {
+		for x in 0 ..< 10 {
+			cf := screen_at(&sf, x, y)
+			cd := screen_at(&sd, x, y)
+			testing.expectf(t, cell_eq(&sf, cf, &sd, cd),
+				"the two modes rendered (row %d, col %d) differently after a resize: repaint=%q sgr=%q  diff=%q sgr=%q",
+				y, x, cell_bytes(&sf, cf), style_bytes(&st, cf.style), cell_bytes(&sd, cd), style_bytes(&st, cd.style))
+		}
+	}
+	// And the specific cell the finding named: the frame's first character, on
+	// the DEFAULT background in both modes rather than red in one of them.
+	testing.expect_value(t, style_bytes(&st, screen_at(&sf, 0, 0).style), "")
+}
+
+// F13. A FRAME WHOSE STYLES CANNOT FIT AN EMPTY INTERN TABLE FALLS BACK TO THE
+// REPAINT, INSTEAD OF PAINTING A WRONG SCREEN IN SILENCE.
+//
+// When paint_frame reported overflow, render_diff dropped the table, forced a
+// repaint and retried once. If the retry overflowed too -- a single frame with
+// more distinct accumulated SGR strings than an EMPTY table can hold -- the
+// second `ok` was discarded. The frame was then emitted from a model in which
+// screen_sgr had silently kept the PREVIOUS style for every cell past the cap
+// (it returns false without assigning s.style, and screen_write keeps writing),
+// so the user saw a screen that differs from the .Full_Screen repaint, with no
+// diagnostic anywhere. docs/LIMITATIONS.md 3.7 already claimed this degraded to
+// a repaint; it does now.
+//
+// THE CAP THIS REACHES IS THE BYTE BUDGET, NOT THE 4096-ENTRY ONE, and either
+// is the same code path. A style is interned as the bytes ACCUMULATED since the
+// last reset, so N distinct escapes with no reset between them intern
+// 19+38+57+... bytes; that crosses STYLE_BYTES_MAX at N = 333. Reaching the
+// entry cap instead would need 4096 escapes each preceded by \e[0m, which costs
+// two orders of magnitude more to intern and proves the same thing.
+@(test)
+test_diff_falls_back_to_a_repaint_when_one_frame_overflows_the_style_table :: proc(t: ^testing.T) {
+	sb := strings.builder_make(); defer strings.builder_destroy(&sb)
+	// 500 distinct truecolour escapes, accumulating, then one glyph. Every
+	// escape is ZERO WIDTH, so this is one physical row: a line the height
+	// budget dropped would never be modelled and would prove nothing.
+	for i in 0 ..< 500 {
+		strings.write_string(&sb, "\e[38;2;")
+		strings.write_int(&sb, i / 256)
+		strings.write_string(&sb, ";")
+		strings.write_int(&sb, i % 256)
+		strings.write_string(&sb, ";0m")
+	}
+	strings.write_string(&sb, "Z\e[0m")
+	storm := strings.clone(strings.to_string(sb)); defer delete(storm)
+
+	bd := strings.builder_make(); defer strings.builder_destroy(&bd)
+	bf := strings.builder_make(); defer strings.builder_destroy(&bf)
+	rd: Renderer; renderer_init(&rd, &bd, 12, 3, .Diff);        defer renderer_destroy(&rd)
+	rf: Renderer; renderer_init(&rf, &bf, 12, 3, .Full_Screen)
+
+	run :: proc(rd, rf: ^Renderer, bd, bf: ^strings.Builder, view: string) -> (dif, ref: string) {
+		strings.builder_reset(bd); strings.builder_reset(bf)
+		renderer_render(rd, view)
+		renderer_render(rf, view)
+		return strings.to_string(bd^), strings.to_string(bf^)
+	}
+
+	// Frame 1: an ordinary frame, so the overflow is not confused with a first
+	// paint (which is a repaint in both modes anyway).
+	run(&rd, &rf, &bd, &bf, "plain first frame")
+
+	dif, ref := run(&rd, &rf, &bd, &bf, storm)
+	// THE ASSERTION, and it is the strongest one available: the user is shown
+	// the repaint, byte for byte, rather than a diff computed from a model that
+	// could not represent the frame.
+	testing.expect_value(t, dif, ref)
+	testing.expect(t, strings.contains(dif, "Z"), "the frame's only glyph must be painted")
+	testing.expect(t, rd.force_repaint,
+		"a frame the model could not represent must invalidate the model")
+	// The tables were dropped, so the next frame starts from an empty one rather
+	// than from 4096 entries nothing points at.
+	testing.expect_value(t, len(rd.styles.spans), 1)
+
+	// And the mode recovers: the next ordinary frame repaints from a real \e[2J
+	// and the one after it is free again.
+	dif2, _ := run(&rd, &rf, &bd, &bf, "plain again")
+	testing.expect(t, strings.contains(dif2, "\e[2J"), "the frame after a fallback must resync")
+	dif3, _ := run(&rd, &rf, &bd, &bf, "plain again")
+	testing.expect_value(t, len(dif3), 0)
+}
+
+// F24, .Diff's half. The rule has to be the SAME rule .Full_Screen uses, not
+// merely a similar one: the oracle compares cursor VISIBILITY between the two
+// modes on every frame of every case, so a difference here is a divergence this
+// package invented for itself.
+@(test)
+test_diff_hides_the_caret_it_owns :: proc(t: ^testing.T) {
+	h := harness_make(10, 3); defer harness_free(h)
+
+	got := frame(h, "hi")
+	testing.expect(t, strings.has_prefix(got, "\e[?25l"),
+		"the first .Diff frame must hide the caret it is about to park on top of content")
+	testing.expect(t, !strings.contains(got, "\e[?25h"),
+		"a frame that declared no cursor must not show the caret again")
+
+	// THE 0-BYTE CONTRACT SURVIVES IT. This is the whole reason the hide is
+	// conditioned on "not already hidden" rather than emitted per frame.
+	testing.expect_value(t, len(frame(h, "hi")), 0)
+	testing.expect_value(t, len(frame(h, "hi")), 0)
+
+	// A changed frame still costs only the change -- no DECTCEM pair.
+	// (the trailing park is the frame's cursor move, not a DECTCEM byte -- see
+	// test_diff_one_changed_cell_costs_a_move_and_that_cell)
+	testing.expect_value(t, frame(h, "ho"), "\e[1;2Ho\e[2;1H")
+
+	// renderer_clear hands the caret back.
+	strings.builder_reset(&h.b)
+	renderer_clear(&h.r)
+	testing.expect(t, strings.has_prefix(strings.to_string(h.b), "\e[?25h"),
+		"renderer_clear must give the caret back")
+}
+
+// F34. THE COVERAGE ASSERTION: the generator actually reaches the three states
+// the corpus used to be structurally unable to produce.
+//
+// A fuzz corpus that has been extended but does not in fact reach the new
+// states is worse than one that was never extended, because it looks like
+// coverage. So this counts, over the same 500 seeds the oracle runs, and fails
+// if any of the three prongs is empty. The thresholds are loose (they are
+// "clearly non-zero", not tuned percentages) precisely so that they pin the
+// property rather than the current PRNG stream.
+@(test)
+test_the_fuzz_corpus_reaches_resizes_style_overflow_and_margin_clusters :: proc(t: ^testing.T) {
+	CASES  :: 500
+	vb := strings.builder_make(); defer strings.builder_destroy(&vb)
+
+	resized_frames := 0
+	storm_cases    := 0
+	overflow_cases := 0
+	leaky_frames   := 0
+
+	for seed in u64(0) ..< u64(CASES) {
+		f: Diff_Fuzz
+		diff_fuzz_init(&f, seed, false, true)
+		defer diff_fuzz_destroy(&f)
+		if f.style_storm { storm_cases += 1 }
+
+		db := strings.builder_make(); defer strings.builder_destroy(&db)
+		r: Renderer
+		renderer_init(&r, &db, f.cols, f.rows, .Diff)
+		defer renderer_destroy(&r)
+
+		saw_overflow := false
+		for _ in 0 ..< f.frames {
+			view, cur := diff_fuzz_frame(&f, &vb)
+			if f.resized { resized_frames += 1 }
+			renderer_set_width(&r, f.cols); renderer_set_height(&r, f.rows)
+			strings.builder_reset(&db)
+			renderer_render(&r, view, cur)
+			// The model reports the pen it was left in; a frame that ends with
+			// one open is the state F03/F05/F33 all live in.
+			if r.pen_open || r.link_open { leaky_frames += 1 }
+			// A frame that had to drop the intern tables is one that overflowed:
+			// diff_styles_reset is the only thing that empties them mid-case.
+			if len(r.styles.spans) <= 1 && len(view) > 64 { saw_overflow = true }
+		}
+		if saw_overflow { overflow_cases += 1 }
+	}
+
+	testing.expectf(t, resized_frames > 100,
+		"the corpus resized on only %d frames -- F33 lives in the frame AFTER a resize and nothing else reaches it", resized_frames)
+	testing.expectf(t, storm_cases > 20,
+		"only %d seeds manufacture unbounded distinct styles", storm_cases)
+	testing.expectf(t, overflow_cases > 10,
+		"only %d cases actually overflowed an intern table -- the retry and fallback paths are untested without them", overflow_cases)
+	testing.expectf(t, leaky_frames > 200,
+		"only %d frames ended with an SGR or hyperlink still open", leaky_frames)
 }

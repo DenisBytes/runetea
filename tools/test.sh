@@ -7,8 +7,10 @@
 # default. Prepending a shim that resolves `clang` to clang-18 fixes it with no
 # system changes and no sudo.
 #
-#   ./tools/test.sh          plain test run, plus the leak audit and the
-#                            documentation gate (tools/doccheck/run.sh)
+#   ./tools/test.sh          plain test run, plus the leak audit, the
+#                            documentation gate (tools/doccheck/run.sh) and the
+#                            diff renderer's pyte cross-check
+#                            (tools/difftest/run.sh)
 #   ./tools/test.sh tsan     + thread sanitizer, but see the WARNING below --
 #                              it does NOT detect races on this toolchain
 #   ./tools/test.sh race     the real race gate -- USE THIS for concurrent code
@@ -72,6 +74,15 @@ fi
 #     stack/TCB ARE reclaimed; what leaks is a fixed-size struct, once per
 #     session, reclaimed by the OS at process exit. Not proportional to
 #     session length, message count, or anything else that grows.
+#
+# NOT AN ENTRY, but the question comes up: the per-process Cmd ledger that makes
+# a double-dispatch loud (see cmd.odin) is two [dynamic]u32 allocated through
+# runtime.heap_allocator(), NOT context.allocator, precisely so that `odin
+# test`'s per-test Tracking_Allocator never sees a process-lifetime table grown
+# under test A and read under test B. The audit below reads odin test's
+# `+++ leak` lines, so the ledger emits none and this allowlist stays a
+# one-entry list. Its cost is 8 bytes per slot on the raw heap, reclaimed at
+# process exit -- recorded here so the absence is a decision rather than a gap.
 ALLOWED_LEAK_SITES='thread_unix\.odin:[0-9]+:_create'
 
 # Runs `odin test`, streams its output unchanged, then audits the leak lines.
@@ -116,11 +127,22 @@ run_with_leak_audit() {
 }
 
 mode=${1:-plain}
+
+# Where the per-package test binaries go. Without `-out:`, `odin test .` writes
+# its executable NEXT TO THE SOURCE, named after the directory: that is how an
+# untracked 2.4 MB `edit` ELF came to be sitting in examples/editor/edit (and,
+# earlier, at the repository root, from an invocation made from there). Not
+# .gitignore'd, indistinguishable from a deliberate artifact, and one more thing
+# for a reviewer to have to identify. A temp directory costs nothing and the
+# binaries are throwaway by construction.
+TESTBIN=$(mktemp -d)
+trap 'rm -rf "$TESTBIN"' EXIT
+
 cd "$PKG"
 
 case "$mode" in
 plain)
-	run_with_leak_audit "$ODIN" test . -define:ODIN_TEST_THREADS=1
+	run_with_leak_audit "$ODIN" test . -define:ODIN_TEST_THREADS=1 -out:"$TESTBIN/runetea"
 
 	# examples/editor's model/update/view live in their own package
 	# (examples/editor/edit) precisely so they can be driven through the real
@@ -136,7 +158,7 @@ plain)
 	echo
 	echo "=== examples/editor/edit ==="
 	cd "$ROOT/examples/editor/edit"
-	run_with_leak_audit "$ODIN" test . -define:ODIN_TEST_THREADS=1
+	run_with_leak_audit "$ODIN" test . -define:ODIN_TEST_THREADS=1 -out:"$TESTBIN/edit"
 
 	# runegloss is a SIBLING PACKAGE that imports runetea (for display_width --
 	# there is exactly one implementation of it in this repo, in
@@ -153,7 +175,46 @@ plain)
 	echo
 	echo "=== runegloss ==="
 	cd "$ROOT/runegloss"
-	run_with_leak_audit "$ODIN" test . -define:ODIN_TEST_THREADS=1
+	run_with_leak_audit "$ODIN" test . -define:ODIN_TEST_THREADS=1 -out:"$TESTBIN/runegloss"
+
+	# The four single-file examples. `odin test` on a `package main` works --
+	# the generated runner supplies its own entry point and main() is simply
+	# never called (verified on this toolchain before the files were written) --
+	# so an example does not have to be split into a library package the way
+	# examples/editor/edit was in order to be checked.
+	#
+	# WHY AN EXAMPLE IS ON THE GATE AT ALL. These are the files people copy, and
+	# until 2026-09-04 the only one anybody tested was the editor. F47's
+	# minimum-size work is the case in point: the guards that landed first were
+	# REASONED about -- "a one-row frame fits any terminal that exists", "two
+	# rows fit any terminal anyone has" -- and were wrong by exactly one row in
+	# all four, because .Inline terminates its LAST line with "\r\n" too and a
+	# frame of R rows therefore needs R+1. Nothing could disagree with the
+	# reasoning, because there was nothing to disagree with it. Measured on a
+	# real pty afterwards: at exactly its own advertised minimum, `simple` lost
+	# the line telling the user how to quit and the quickstart lost the question
+	# it exists to ask.
+	#
+	# Each package is its own `odin test` invocation for the same reason edit
+	# and runegloss are: they are separate packages, and Odin has no notion of a
+	# multi-package test run.
+	#
+	# Same leak audit, same allowlist. None of these tests calls run(), so the
+	# allowlist should be entirely unused and a green run prints "no leaks
+	# reported at all" for each of them.
+	# `-out:` into $TESTBIN, not the default. `odin test .` writes its binary
+	# next to the source, named after the directory -- which is how an untracked
+	# 2.4 MB `edit` ELF came to be sitting in the repository, and how a
+	# `spinner` would come to sit next to examples/spinner/main.odin. `local` is
+	# not usable here: this `case` is at script top level, not inside a
+	# function.
+	for ex in quickstart simple spinner http; do
+		echo
+		echo "=== examples/$ex ==="
+		cd "$ROOT/examples/$ex"
+		run_with_leak_audit "$ODIN" test . -define:ODIN_TEST_THREADS=1 -out:"$TESTBIN/$ex"
+	done
+	cd "$ROOT"
 
 	# --- documentation gate --------------------------------------------------
 	#
@@ -162,15 +223,27 @@ plain)
 	# examples/quickstart -- the program README.md quotes verbatim -- is run
 	# under a real pty and asserted on. See tools/doccheck/run.sh.
 	#
-	# ON THE GATE, unlike tools/difftest/run.sh, and the difference is the
-	# dependency. difftest needs python3 plus a third-party module (pyte), and
-	# the day that module is missing a shelled-out checker degrades into a skip
-	# -- and a skip inside a green run is indistinguishable from a pass. This
-	# needs awk and the Odin compiler, both of which `odin test` already
-	# required a line ago, so there is no configuration in which it can quietly
-	# not run. It also fails loudly on a block it does not understand rather
-	# than ignoring it, for the same reason the leak audit above fails on an
-	# unallowlisted site.
+	# IT NEEDS python3 AND pyte, and that is a change of position rather than
+	# an oversight. This comment used to argue that difftest was kept off the
+	# gate because "a missing module turns a shelled-out checker into a skip,
+	# and a skip inside a green run is indistinguishable from a pass" -- while
+	# doccheck, needing only awk and the Odin compiler, could not quietly not
+	# run. The argument was right about skips and wrong about dependencies, and
+	# the doc gate is where it broke: its pty check greppped ptyrun's raw byte
+	# dump for three strings, which models no terminal, so a renderer emitting
+	# the wrong cursor motions passed it. Measured: with `reachable` in
+	# render.odin changed to `reachable - 2`, the old check printed "pty OK ...
+	# with the expected frames" and exited 0 while the screen those bytes
+	# produce carries four stacked copies of the quickstart's header. Asserting
+	# on a SCREEN means replaying the bytes through a terminal emulator, and the
+	# only one in reach that shares no code with this repository is pyte.
+	#
+	# So the dependency is taken and the skip is refused: doccheck's preflight()
+	# exits non-zero when python3 or pyte is missing, and every script it shells
+	# out to does the same. There is still no configuration in which a check can
+	# quietly not run -- which was always the property that mattered. It also
+	# fails loudly on a block it does not understand rather than ignoring it,
+	# for the same reason the leak audit above fails on an unallowlisted site.
 	#
 	# WHY IT IS A TEST AND NOT A README CHORE: the samples in those documents
 	# are the first RuneTea code anybody reads, and a sample that no longer
@@ -183,6 +256,20 @@ plain)
 	echo "=== documentation ==="
 	cd "$ROOT"
 	./tools/doccheck/run.sh
+
+	# --- the diff renderer's independent second opinion ----------------------
+	#
+	# Both renderers' byte streams, replayed through pyte and compared cell for
+	# cell over a 200-case seeded corpus. runetea/diff_oracle_test.odin asserts
+	# the same invariant a line above this, with no external dependency -- but
+	# it shares runetea/screen.odin's model of what \e[K erases and where a wide
+	# cluster lands with the renderer it is checking, so a misconception there
+	# is baked into both sides of that comparison and invisible to it. This one
+	# shares nothing with either. See tools/difftest/run.sh for why it moved
+	# onto the gate on 2026-09-03 after a year of deliberately staying off it.
+	echo
+	echo "=== diff renderer (pyte cross-check) ==="
+	./tools/difftest/run.sh
 	;;
 tsan)
 	# WARNING (verified 2026-07-26): `odin test -sanitize:thread` does NOT

@@ -4,14 +4,24 @@
 #   ./tools/difftest/run.sh            replay both byte streams through pyte
 #   ./tools/difftest/run.sh measure    print the byte counts
 #
-# NOT part of ./tools/test.sh, deliberately. This needs python3 + pyte, and
-# making a third-party Python module a hard dependency of `odin test` trades one
-# risk for a worse one: the day it is missing, a shelled-out checker becomes a
-# skip, and a skip inside a green run is indistinguishable from a pass. The
-# equivalence invariant itself IS on the gate -- see
-# runetea/diff_oracle_test.odin, which asserts it with no external deps -- and
-# this is the independent second opinion on top. Same split tools/racecheck
-# follows for the sanitizer.
+# ON ./tools/test.sh SINCE 2026-09-03, and this comment used to say the
+# opposite. The old argument was that python3 + pyte must not become a hard
+# dependency of the suite, "because the day it is missing, a shelled-out checker
+# becomes a skip, and a skip inside a green run is indistinguishable from a
+# pass". That was an argument against the SKIP, not against the dependency --
+# and it was answered when the documentation gate started replaying the
+# quickstart's frames through pyte (tools/doccheck/screen.py) and refusing to
+# run at all without it. With one checker already failing loudly on a missing
+# module, keeping a second one off the gate bought nothing and cost the whole
+# independent opinion. The measured price of adding it is ~3s wall clock for
+# 200 cases and 1639 frames.
+#
+# The equivalence invariant is ALSO asserted with no external dependency at all,
+# by runetea/diff_oracle_test.odin. That one shares this package's terminal
+# primitives with the renderer it checks; this one shares nothing with it. Both
+# run. Contrast tools/racecheck, which stays a separate mode for a different
+# reason entirely: ThreadSanitizer needs its own build of the binary, not merely
+# another tool on the machine.
 set -euo pipefail
 
 ODIN=${ODIN:-/home/denisbytes/odin/odin}

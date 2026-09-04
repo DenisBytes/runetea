@@ -20,6 +20,12 @@ FRAMES := []rune{'⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', 
 
 FRAME_INTERVAL :: 100 * time.Millisecond
 
+// The hint, and the width it needs: one column of spinner, one space, and the
+// hint itself. A named constant so view()'s guard cannot drift from the string
+// it is guarding.
+HINT      :: "Loading forever... press 'q' to quit"
+HINT_COLS :: 2 + len(HINT)
+
 // Go: `type spinTickMsg time.Time` -- a closure-friendly single-field wrapper.
 // RuneTea: time.Tick, per spec §9 (CLOCK_MONOTONIC_RAW, not CLOCK_REALTIME --
 // never time.Time/time.now here), and POD by construction (arena.odin's
@@ -62,18 +68,95 @@ Model :: struct {
 	frame: int,
 	spin:  rg.Style,   // the braille glyph
 	hint:  rg.Style,   // "press 'q' to quit"
+	// F47. The window's width, so view() can drop the hint rather than let a
+	// 37-column line wrap onto a second row on a narrow terminal -- which under
+	// .Inline means the renderer's rewind and the terminal's row count disagree
+	// and the frame walks down the screen. Seeded in main from rt.term_size,
+	// kept live from Window_Size_Msg; 0 is "unknown" and never trips the guard.
+	term_w: int,
+
+	// F47's HEIGHT half, and the note that used to sit here -- "this program's
+	// view is ONE ROW, so there is no minimum HEIGHT to guard: a one-row frame
+	// fits any terminal that exists" -- was FALSE, measured rather than
+	// reasoned about. See MIN_ROWS.
+	term_h: int,
+
+	// Whether the 100 ms animation Tick is still being reissued. See MIN_ROWS
+	// for why a height that can show nothing stops it: false is the state a
+	// one-row terminal puts this program into, and a resize back up is the
+	// only thing that clears it.
+	animating: bool,
 }
+
+// THE MINIMUM HEIGHT IS TWO ROWS FOR A ONE-ROW VIEW, and the extra row is not
+// slack -- it is where .Inline's line terminator lands.
+//
+// render_inline (runetea/render.odin) writes every line of the frame followed
+// by "\r\n", INCLUDING the last one, because the next frame's rewind counts
+// \e[1A\e[2K pairs from a cursor it needs at column 1 of the row below the
+// frame. So a frame of R logical rows needs R+1 terminal rows: the R it paints
+// plus the one the terminal's cursor sits on afterwards. Paint R rows into
+// exactly R and the terminal scrolls, the top row goes to scrollback, and
+// r.last_rows clamps to term_height-1 so the rewind can never reach it again.
+//
+// MEASURED, under a real pty at 60 columns (pyte replay, three animation
+// frames each):
+//   rows = 1  the screen is BLANK for the whole session -- the spinner line is
+//             written, scrolled off, and the erase lands on the empty row that
+//             replaced it. This is exactly F47's "at one terminal row every
+//             example paints a blank screen", and it is unfixable HERE: at one
+//             row there is no .Inline frame of any shape that survives its own
+//             terminator. See docs/LIMITATIONS.md 3.20.
+//   rows = 2  correct, and every taller terminal is correct too.
+//
+// So the guard cannot make the screen better at one row; what it can do is
+// stop this program from writing 44 bytes and burning a timer wakeup ten times
+// a second into a window that shows none of it. That is what `animating` is.
+MIN_ROWS :: 2
 
 // `m` is a POINTER: mutate it in place, return only the Cmd. See
 // rt.Program.update (runetea/tea.odin).
 update :: proc(m: ^Model, msg: any, alloc: mem.Allocator) -> rt.Cmd {
 	switch v in msg {
+	case rt.Window_Size_Msg:
+		// w == 0 / h == 0 is rt's "the ioctl failed" sentinel; ignore it rather
+		// than clobbering a known-good size.
+		if v.w > 0 { m.term_w = v.w }
+		if v.h > 0 { m.term_h = v.h }
+		// THE ONLY WAY OUT OF THE PAUSED STATE. A paused program has no timer
+		// in flight, so nothing else will ever call update() except a keypress
+		// -- and a user whose window is one row tall cannot see the prompt to
+		// press anything. The resize is the wake-up, and it must issue EXACTLY
+		// ONE Tick: the animation's invariant is one Spin_Tick_Msg outstanding
+		// at a time (each firing reissues its own successor), so an unguarded
+		// restart here would double the frame rate on every SIGWINCH.
+		if !m.animating && m.term_h >= MIN_ROWS {
+			m.animating = true
+			return spin_tick_cmd()
+		}
 	case rt.Key_Msg:
+		// PASTED TEXT IS NOT KEYSTROKES (F37). main enables bracketed paste, so
+		// a paste arrives as runes with `pasted` set; without this branch a
+		// pasted 'q' would quit a program the user only meant to paste into.
+		if v.pasted { return rt.cmd_nil() }
 		if v.code == .Rune && (v.r == 'q' || (v.r == 'c' && .Ctrl in v.mods)) {
 			return rt.quit_cmd()
 		}
 		if v.code == .Escape { return rt.quit_cmd() }
 	case Spin_Tick_Msg:
+		// F47's height half. Stop reissuing rather than animate into a window
+		// that provably shows nothing (MIN_ROWS). Checked HERE and not in
+		// view(), because view() cannot decline to be called: the frame is
+		// what update() has already made inevitable, and the cost this saves
+		// is the timer wakeup and the write, not the string.
+		//
+		// The frame counter is deliberately NOT advanced on the way out, so a
+		// resize back up resumes the glyph where it stopped instead of
+		// jumping.
+		if m.term_h > 0 && m.term_h < MIN_ROWS {
+			m.animating = false
+			return rt.cmd_nil()
+		}
 		m.frame = (m.frame + 1) % len(FRAMES)
 		return spin_tick_cmd() // reissue -- see spin_tick_cmd's own comment
 	}
@@ -81,13 +164,13 @@ update :: proc(m: ^Model, msg: any, alloc: mem.Allocator) -> rt.Cmd {
 }
 
 view :: proc(m: Model, alloc: mem.Allocator) -> string {
-	// LOCAL COPIES because rg.render takes a ^Style and `m` is a procedure
-	// PARAMETER -- Odin parameters are immutable and not addressable, so `&m.spin`
-	// does not compile. Two struct copies per frame, no allocation. (rg.render
-	// takes a pointer rather than a value for the same reason its setters do: a
-	// Style is ~200 bytes and copying it at every call site would be the one
-	// avoidable cost in an otherwise allocation-free API.)
-	spin, hint := m.spin, m.hint
+	// THE LOCAL COPIES ARE GONE. This used to be `spin, hint := m.spin, m.hint`
+	// with a six-line note explaining that rg.render took a ^Style and `m` is a
+	// procedure PARAMETER, which Odin makes immutable and non-addressable, so
+	// `&m.spin` did not compile. rg.render is a proc group now (runegloss's
+	// F49/F52 fix) and `rg.render(m.spin, ...)` takes the Style by value, so
+	// the copy happens at the one call site that needs it instead of being
+	// written out as two named locals per frame.
 	// EVERY string below comes from `alloc` -- the FRAME ARENA rt hands view() --
 	// including the ones rg.render allocates, since RuneGloss allocates from the
 	// allocator it is passed and from nothing else (runegloss/render.odin).
@@ -96,9 +179,24 @@ view :: proc(m: Model, alloc: mem.Allocator) -> string {
 	// and NOT tprintf: the temp allocator is a different, process-lifetime arena
 	// that this loop never resets.
 	glyph := fmt.aprintf("%c", FRAMES[m.frame], allocator = alloc)
+	// F47, the width half. The spinner plus the hint is 38 columns; below that
+	// the hint is dropped rather than wrapped, because under .Inline a frame
+	// that wraps costs a physical row the renderer's rewind does not know about
+	// and the frame slides down the screen one row per tick -- ten times a
+	// second here. The GLYPH always survives: it is the whole program.
+	//
+	// There is deliberately NO matching height branch. Below MIN_ROWS there is
+	// no shorter frame to fall back to -- this view is already one row, and
+	// under .Inline one row does not fit a one-row terminal (see MIN_ROWS for
+	// the measurement). A `if too short { return "need 2 rows" }` here would
+	// paint a string nobody can see and would read as a fix; the height guard
+	// that does something is in update(), where it stops the Tick.
+	if m.term_w > 0 && m.term_w < HINT_COLS {
+		return fmt.aprintf("%s\n", rg.render(m.spin, glyph, alloc), allocator = alloc)
+	}
 	return fmt.aprintf("%s %s\n",
-		rg.render(&spin, glyph, alloc),
-		rg.render(&hint, "Loading forever... press 'q' to quit", alloc),
+		rg.render(m.spin, glyph, alloc),
+		rg.render(m.hint, HINT, alloc),
 		allocator = alloc)
 }
 
@@ -127,11 +225,20 @@ main :: proc() {
 	//
 	// The matching pop is written by rt.term_restore() below, and by the
 	// crash-signal path -- exactly once between them, whichever runs.
-	if !rt.term_enter_raw(fd, {.Disambiguate}) { fmt.eprintln("not a tty"); os.exit(1) }
+	//
+	// `paste = true` is DECSET 2004, bracketed paste -- the only thing that
+	// makes a paste DISTINGUISHABLE from typing, so that update()'s `v.pasted`
+	// branch can refuse to run this program's quit binding on pasted text.
+	// Bubble Tea enables it by default; RuneTea makes the application own the
+	// terminal, so the opt-in belongs here.
+	if !rt.term_enter_raw(fd, {kb = {.Disambiguate}, paste = true}) { fmt.eprintln("not a tty"); os.exit(1) }
 	defer rt.term_restore()
 
 	src, ok := rt.input_source_from_fd(fd)
-	if !ok { fmt.eprintln("bad input source"); os.exit(1) }
+	// term_restore BEFORE os.exit: os.exit does not run defers, so the line
+	// above never fires on this path and the terminal is left in raw mode with
+	// one entry pushed on its Kitty keyboard stack.
+	if !ok { rt.term_restore(); fmt.eprintln("bad input source"); os.exit(1) }
 	defer rt.input_close(&src)
 
 	b := strings.builder_make(); defer strings.builder_destroy(&b)
@@ -139,10 +246,21 @@ main :: proc() {
 	// THE ONLY PLACE THE ENVIRONMENT IS READ. rg.default_profile() inspects
 	// $NO_COLOR/$TERM/$COLORTERM once and caches; every Style built afterwards
 	// carries a COPY of the answer, so nothing downstream can be surprised by a
-	// re-detection. On a terminal that reports nothing (or under $NO_COLOR) the
-	// profile is .None and both Styles below render their input byte for byte --
-	// this program degrades to exactly the output it had before RuneGloss, with
-	// no `if` anywhere in view().
+	// re-detection.
+	//
+	// WHAT .None ACTUALLY DOES, because this comment used to claim that under
+	// it "both Styles below render their input byte for byte" and that is true
+	// of exactly ONE of them. .None strips COLOUR; it does not strip
+	// ATTRIBUTES (docs/LIMITATIONS.md 7.11). m.spin is colour only, so under
+	// $NO_COLOR it really does come out as the bare glyph. m.hint is
+	// rg.faint(), which is SGR 2 -- an attribute, not a colour -- and it
+	// survives. Captured on a real pty with NO_COLOR=1 set, every frame:
+	//     ⠋ \e[2mLoading forever... press 'q' to quit\e[0m
+	// That is 8 bytes of SGR per frame, ~10 times a second, on a terminal that
+	// was asked for no styling. It is the documented behaviour rather than a
+	// bug -- an app that wants genuinely plain text must not set attributes --
+	// but the previous claim would have had a reader believe $NO_COLOR is a
+	// plain-text switch, and it is not.
 	m: Model
 	m.spin = rg.new_style()
 	rg.fg(&m.spin, rg.color("#7D56F4"))
@@ -155,8 +273,24 @@ main :: proc() {
 	// immediately" property init_cmd exists for (examples/http's own
 	// comment), here animating from frame 0 the instant the program starts
 	// rather than waiting for a keypress to kick off the first frame.
+	// `animating` is set to match: the init Cmd IS the first outstanding Tick,
+	// so a Model that said false here would let the very first
+	// Window_Size_Msg issue a second one and double the frame rate.
+	m.animating = true
 	rt.program_init(&p, m, update, view, spin_tick_cmd())
+	// A Window_Size_Msg only ever arrives on a SIGWINCH, so without this seed a
+	// program that is never resized would never learn its own size.
+	if w, h, ok := rt.term_size(fd); ok { p.model.term_w, p.model.term_h = w, h }
 
 	// flush_fd = the tty, so each frame reaches the screen as it is rendered.
-	if err := rt.run(&p, &src, &b, fd); err != nil { fmt.eprintln("error:", err) }
+	err := rt.run(&p, &src, &b, fd)
+	// term_restore FIRST, then the message, then a real exit status: printing
+	// before the restore writes the diagnostic into whatever mode the program
+	// left the terminal in, and falling off the end of main after an error
+	// exits 0, which makes a crash indistinguishable from a clean quit.
+	if err != nil {
+		rt.term_restore()
+		fmt.eprintln("error:", err)
+		os.exit(rt.exit_code(err))
+	}
 }

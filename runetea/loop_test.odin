@@ -1,3 +1,9 @@
+#+private
+// ^ Every declaration in this file is package-private, so that `odin doc
+//   runetea` / `odin doc runegloss` -- the command README.md and docs/API.md
+//   hand a newcomer for symbol discovery -- lists the library rather than the
+//   test fixtures. Pinned by tools/doccheck/run.sh's `apidoc` check, which is
+//   also where the argument for it is written out.
 package runetea
 
 import "core:sync"

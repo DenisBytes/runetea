@@ -26,14 +26,36 @@ package runetea
 //     Collapsing that into "x = 0, y += 1" eagerly is the classic off-by-one:
 //     it turns a trailing \e[K into an erase of the WRONG row.
 //   * A WIDE CLUSTER AT THE LAST COLUMN IS WRITTEN THERE, with no continuation
-//     cell (there is no column left to hold one). This is what pyte does and
-//     what rows_for_line/line_fills_its_rows in width.odin already assume (see
-//     line_fills_its_rows' own "one cell optimistic" note): a line's row count
-//     is ceil(display_width / cols) with no allowance for a straddling wide
-//     cluster. xterm-family terminals instead leave the last cell blank and
-//     wrap the whole cluster. THIS IS A KNOWN, PRE-EXISTING DIVERGENCE, not one
-//     T3-A introduces -- but the diff renderer now depends on it, so it is
-//     written down here rather than left implicit in a width comment.
+//     cell (there is no column left to hold one), and the cursor clamps to
+//     `cols` rather than spilling onto the next row. This is what pyte does,
+//     and width.odin's measure_line now MEASURES it -- it walks the placement
+//     with this exact rule.
+//
+//     THAT IS A CORRECTION TO WHAT THIS PARAGRAPH USED TO SAY, and the
+//     correction is the point. It used to claim width.odin "already assumes"
+//     this, when in fact rows_for_line divided display_width by cols and
+//     render.odin's line_fills_its_rows took display_width modulo cols --
+//     neither of which knows a wide cluster straddled the margin. The three
+//     were therefore NOT consistent, only consistently derived from the wrong
+//     quantity: the modulo could call a row flush with the right margin when
+//     placement had left it a column short, the trailing \e[K was skipped, and
+//     the tail of that row kept the previous frame's characters forever under
+//     .Diff (the model agreed with the omission, so nothing repainted it).
+//     line_fills_its_rows is gone; measure_line answers all three questions
+//     from one placement walk.
+//
+//     xterm-family terminals instead leave the last cell blank and wrap the
+//     whole cluster (alacritty inserts a leading-wide-char spacer and wraps;
+//     foot pads with spacers and forces a line wrap). THIS IS A KNOWN,
+//     DELIBERATE DIVERGENCE from real hardware, kept because pyte -- the
+//     independent oracle tools/difftest scores this package against -- takes
+//     this side, and because the divergence is invisible to .Diff and
+//     .Full_Screen: both address every row absolutely, so a model that agrees
+//     with itself paints a correct screen either way. It is NOT invisible to
+//     .Inline, which has no cell model and is painted by the real terminal:
+//     there a line whose last cluster is wide and starts on the last column
+//     occupies two rows on real hardware and one here, so the rewind is one row
+//     short. See docs/LIMITATIONS.md 3.8.
 //   * ERASE PAINTS THE CURRENT SGR. \e[K and \e[J fill with the ACTIVE
 //     background, not with "default blank". A cell erased under a background
 //     colour is a coloured cell. Modelling erase as "style 0" would make the
@@ -229,8 +251,21 @@ Screen :: struct {
 	x, y:   int,
 	style:  u16,
 	// The hyperlink currently OPEN, i.e. the one every cell written from here on
-	// belongs to. Carries across frames exactly as `style` does, because the
-	// repaint stream this models never resets it between frames either.
+	// belongs to. Structurally identical to `style` above, and reset alongside
+	// it at the top of every frame.
+	//
+	// BOTH USED TO CARRY ACROSS FRAMES, on the reasoning that "the repaint
+	// stream this models never resets them between frames either". That was
+	// true of the stream and it was the bug: a view leaving either open made
+	// screen_ed0 blank the rows below the frame with the leaked state, made
+	// screen_sgr re-accumulate the view's own escape onto last frame's copy of
+	// it (so an idle screen's diff grew by 16 bytes a frame until the 1 MiB
+	// style budget blew), and made .Diff and .Full_Screen render the same view
+	// differently for the first frame after any resize -- .Diff's forced
+	// repaint reset both planes, .Full_Screen carried them. render.odin's
+	// paint_frame now resets both in the model AND emits the matching bytes,
+	// together, so the stream and the model still agree; see its frame-head
+	// reset and Renderer.pen_open.
 	link:   u16,
 	hidden: bool,
 }
@@ -347,11 +382,18 @@ put_cell :: proc(s: ^Screen, x, y: int, span: string, width: u8, style: u16, lin
 //     record one. The model does not have to be right about a debatable case,
 //     because the emitter never puts the terminal in it.
 //
-// The .Full_Screen repaint, which blasts the view's own bytes, CAN put the
-// terminal in it -- a view whose line opens a hyperlink and never closes it
-// before the renderer's trailing \e[K. That is a documented view-side contract
-// (close your hyperlinks), not something a cell model can fix; see
-// docs/LIMITATIONS.md.
+// The .Full_Screen repaint, which blasts the view's own bytes, can still put
+// the terminal in it for a PER-LINE \e[K -- a view whose line opens a hyperlink
+// and never closes it before the end of that line. That much remains a
+// view-side contract (close your hyperlinks), because closing the link there
+// would break a link that legitimately spans a wrapped line.
+//
+// The TRAILING \e[J is no longer in that category: render.odin's paint_frame
+// closes the link before it (and before the frame-head paint), in the byte
+// stream and in the model together, so the rows below a frame are erased with
+// nothing open on any terminal. That used to be the case where "the repaint
+// cannot" was said flatly, and it was the case that mattered most -- it is the
+// erase that covers the whole rest of the screen.
 @(private = "file")
 blank_cell :: proc(s: ^Screen, x, y: int, style: u16) {
 	s.cells[y * s.cols + x] = Cell{off = 0, len = 0, width = 1, style = style, link = 0}
@@ -647,13 +689,87 @@ screen_escape :: proc(s: ^Screen, seq: string, scratch: ^[dynamic]u8) -> (ok: bo
 	return screen_sgr(s, seq, scratch)
 }
 
+// THE CLUSTER LOOP, with the iterator's column kept in step with the CURSOR.
+//
+// WHAT THIS USED TO DO AND WHAT IT COST. It made one Cluster_Iter per plain
+// SEGMENT and never touched ci.col, so the iterator measured every cluster from
+// the segment's own start (0, since screen_write passes no start_col) while
+// screen_put placed it at s.x. For every cluster but one that is harmless --
+// widths are position-independent -- but a TAB's width is defined as
+// next_tab_stop(col) - col, so a tab arriving at s.x = 3 in the second segment
+// of a styled line was measured from 0 and came back 8. screen_put would then
+// have written ONE cell claiming width 8: not memory-unsafe (put_cell writes a
+// single cell), but a cell grid that says a glyph occupies eight columns is a
+// model that no longer describes any terminal, and .Diff emits from the model.
+//
+// ci.col is assigned per cluster rather than once at iterator construction
+// because screen_put MOVES the cursor in ways the iterator cannot see: it
+// resolves a pending wrap to column 0 of the next row, and it clamps a wide
+// cluster written in the last column to `cols`. Seeding start_col once would
+// have been right only until the first wrap. The assignment is what
+// Cluster_Iter.col's own comment ("WRITABLE ON PURPOSE ... a caller that DOES
+// wrap assigns col = 0 after each wrap") exists for.
+//
+// A TAB IS A MOVE, NOT A CELL, which is why it does not reach screen_put at
+// all. HT advances the cursor to the next tab stop and paints nothing; the
+// cells it passes over keep whatever this frame had already put in them. That
+// is what a VT100 does, what pyte does, and -- since the emitter paints from
+// the model rather than forwarding the tab byte -- it is also self-consistent
+// for .Diff: cells this frame skipped are cells this frame did not write.
+//
+// STILL UNREACHABLE THROUGH THE SUPPORTED PATH, and deliberately fixed anyway.
+// A tab in a .Diff view is a Control_Byte violation of the view contract, and
+// DIFF_STRICT now catches it in a plain `odin build` (contract.odin), so no
+// application that passes the checker gets here. The guard is a compile-mode
+// assertion, though, not a type: -o:speed drops it, an embedder can drive
+// Screen directly (diff_oracle_test.odin does), and "the caller was supposed to
+// have checked" is exactly the argument that leaves a model quietly describing
+// something no terminal can show. Two lines of column bookkeeping is a cheaper
+// answer than a documented divergence.
 @(private = "file")
 screen_write_plain :: proc(s: ^Screen, text: string, opts: Width_Options) {
 	if len(text) == 0 { return }
 	ci := cluster_iter_make(text, opts)
 	for {
+		// The column the NEXT cluster will be placed at -- which is what
+		// Cluster_Iter.col means, and is not always s.x: s.x == cols is the
+		// pending-wrap state, and the next printable cluster resolves it to
+		// column 0 of the following row (screen_put's DECAWM branch).
+		ci.col = s.x < s.cols ? s.x : 0
 		span, w, more := cluster_next(&ci)
 		if !more { break }
+		if is_tab_span(span) { screen_tab(s, w); continue }
 		screen_put(s, span, w)
 	}
+}
+
+// A tab is a cluster of its own by construction: HT is GCB=Control, so GB4/GB5
+// forbid it from being absorbed into a neighbour or carrying a combining mark.
+// A byte compare is therefore sufficient and there is nothing to decode.
+// (width.odin's is_tab says the same thing and is private to that file; one
+// line duplicated is cheaper here than widening that file's surface for a case
+// the view contract already forbids.)
+@(private = "file")
+is_tab_span :: proc(span: string) -> bool {
+	return len(span) == 1 && span[0] == '\t'
+}
+
+// HT: advance the cursor by the width cluster_next already computed from the
+// column this tab is at, and paint nothing.
+//
+// The pending wrap is resolved the SAME way screen_put resolves it, rather than
+// being left standing. Real terminals differ on whether a control that prints
+// nothing clears the deferred-wrap flag, and nothing in this tree can measure
+// which -- but screen_write_plain has already MEASURED this tab from column 0
+// of the next row on that assumption, so resolving here is what keeps the width
+// and the placement describing the same cell. One rule in this file beats
+// fidelity to an unobservable corner of a case the view contract forbids.
+@(private = "file")
+screen_tab :: proc(s: ^Screen, w: int) {
+	if s.cols <= 0 || s.rows <= 0 { return }
+	if s.x >= s.cols {
+		s.x = 0
+		screen_index(s)
+	}
+	s.x = min(s.x + w, s.cols)
 }

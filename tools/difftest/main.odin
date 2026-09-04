@@ -19,11 +19,12 @@ package main
 //   ./tools/difftest/run.sh              the pyte cross-check
 //   ./tools/difftest/run.sh measure      the byte-count measurements
 //
-// WHY NOT ON THE GATE: it would make python3 + pyte a hard build dependency of
-// `odin test`, and shelling out to a Python interpreter from inside a test is a
-// worse failure mode than not running it (a missing module becomes a green
-// run). Same reasoning tools/racecheck follows -- the sanitizer gate is a
-// separate invocation for the same kind of reason.
+// ON THE GATE SINCE 2026-09-03, and this header used to argue the opposite:
+// "it would make python3 + pyte a hard build dependency of `odin test`, and a
+// missing module becomes a green run". That is an argument against the SKIP,
+// not against the dependency -- and every checker that needs pyte now exits
+// non-zero without it rather than skipping. tools/difftest/run.sh carries the
+// full reversal and what it cost (~3 s of wall clock).
 
 import "core:fmt"
 import "core:os"
@@ -65,7 +66,19 @@ dump_corpus :: proc() {
 		// pyte disagree BY DESIGN (width.odin defects 2 and 3). Feeding those
 		// here would fail on a disagreement the harness was built to have and
 		// prove nothing. The in-package oracle runs the full alphabet.
-		rt.diff_fuzz_init(&f, seed, pyte_safe = true)
+		//
+		// `resizes` is F34's third prong, and the one that took longest to reach
+		// here. A resize is the ONE mutation the generator cannot perform on its
+		// own -- the size lives in this harness's Renderer and in check.py's pyte
+		// screens, not in Diff_Fuzz -- so it is opt-in, and opting in obliges this
+		// harness to do BOTH halves: push f.cols/f.rows into both renderers, and
+		// emit a SIZE record so check.py can resize both emulator screens. Until
+		// that landed the prong existed only in runetea/diff_oracle_test.odin,
+		// whose VT model IS the renderer's own screen.odin -- precisely the sharing
+		// this program exists to escape. What it reaches: .Diff's forced-repaint
+		// prologue running against .Full_Screen's carry-on-painting, which is where
+		// F33's SGR carry-over divergence lived.
+		rt.diff_fuzz_init(&f, seed, pyte_safe = true, resizes = true)
 		defer rt.diff_fuzz_destroy(&f)
 
 		vb := strings.builder_make(); defer strings.builder_destroy(&vb)
@@ -83,6 +96,27 @@ dump_corpus :: proc() {
 		fmt.printfln("CASE %d %d %d %d", seed, f.cols, f.rows, f.frames)
 		for n in 0 ..< f.frames {
 			view, cur := rt.diff_fuzz_frame(&f, &vb)
+			// THE SIZE RECORD, emitted BEFORE this frame's bytes and only when
+			// the generator actually changed the geometry. The ordering is the
+			// whole contract: check.py must resize its two screens before it
+			// feeds them a frame that was rendered for the new size, or every
+			// cell comparison after it is against a screen of the wrong shape and
+			// the divergences it reports are its own.
+			//
+			// Conditional on f.resized rather than emitted every frame, even
+			// though renderer_set_width is a documented no-op for an unchanged
+			// value: an unconditional SIZE would put a pyte Screen.resize call on
+			// every frame of every case, and pyte returns early on an equal size
+			// only by an explicit check added in its 0.7.0. Leaning on that would
+			// be leaning on a third-party implementation detail, in a harness
+			// whose entire reason to exist is not to.
+			if f.resized {
+				rt.renderer_set_width(&r_ref, f.cols)
+				rt.renderer_set_height(&r_ref, f.rows)
+				rt.renderer_set_width(&r_dif, f.cols)
+				rt.renderer_set_height(&r_dif, f.rows)
+				fmt.printfln("SIZE %d %d %d", n, f.cols, f.rows)
+			}
 			strings.builder_reset(&rb)
 			strings.builder_reset(&db)
 			rt.renderer_render(&r_ref, view, cur)
@@ -268,7 +302,14 @@ measure_editor :: proc() {
 	render_once(&m, &r_ref, &r_dif, &rb, &db)
 
 	for r in "The quick brown fox" {
-		edit.apply_key(&m, rt.Key_Msg{code = .Rune, r = r})
+		// context.allocator, not a per-frame arena: apply_key gained an
+		// allocator parameter when the editor's key handling started needing
+		// one, and what it allocates from it (if anything) outlives the call
+		// the way the Model does. Every return here is cmd_nil or quit_cmd,
+		// both of which own nothing, so discarding the Cmd is safe -- it would
+		// not be for a Cmd with an env, now that a Cmd is single-use and
+		// carries a heap ledger entry.
+		edit.apply_key(&m, rt.Key_Msg{code = .Rune, r = r}, context.allocator)
 		a, b := render_once(&m, &r_ref, &r_dif, &rb, &db)
 		total_ref += a
 		total_dif += b

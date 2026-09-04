@@ -1,7 +1,14 @@
+#+private
+// ^ Every declaration in this file is package-private, so that `odin doc
+//   runetea` / `odin doc runegloss` -- the command README.md and docs/API.md
+//   hand a newcomer for symbol discovery -- lists the library rather than the
+//   test fixtures. Pinned by tools/doccheck/run.sh's `apidoc` check, which is
+//   also where the argument for it is written out.
 package runetea
 
 import "core:c"
 import "core:strings"
+import "core:sync"
 import "core:testing"
 import "core:sys/posix"
 
@@ -296,4 +303,54 @@ test_stop_does_not_unblock_a_signal_the_caller_blocked_itself :: proc(t: ^testin
 	posix.pthread_sigmask(.SETMASK, nil, &after)
 	testing.expect(t, posix.sigismember(&after, .SIGTERM) == 1,
 		"the caller blocked SIGTERM before start; stop must not have cleared it")
+}
+
+// ============================================================================
+// F15, THE SIGNAL-WATCHER SITE. signal_watcher_start used to return nothing,
+// because the one thing that can fail in it was assumed not to:
+//
+//     sw.thread = thread.create(...)     // returns nil when pthread_create fails
+//     sw.thread.data = sw                // SIGSEGV, one line later
+//
+// and had that store survived, sync.sema_wait(&sw.ready) three lines further on
+// would have parked run() forever on a `ready` no thread would ever post. Both
+// outcomes are worse than the one this pins: a false return, an untouched
+// signal mask, and a Signal_Watcher that owns nothing.
+//
+// THE MASK IS THE PART THAT MUST NOT BE SKIPPED. start blocks
+// SIGINT/SIGTERM/SIGWINCH/SIGUSR2 on the CALLING thread BEFORE it creates the
+// thread that is supposed to sigwait for them. Bailing out without restoring
+// that leaves the caller in the worst of both worlds -- signals that can no
+// longer be delivered and no watcher to receive them -- and under
+// ODIN_TEST_THREADS=1 it would leak forward into every later test on this same
+// worker thread, which is the trap test_stop_restores_the_signal_mask_it_
+// displaced above already exists to catch.
+// ============================================================================
+@(test)
+test_a_failed_watcher_thread_reports_false_and_restores_the_mask :: proc(t: ^testing.T) {
+	before: posix.sigset_t
+	posix.pthread_sigmask(.SETMASK, nil, &before)
+
+	m: Mailbox
+	testing.expect_value(t, mailbox_init(&m, 8), nil)
+	defer mailbox_destroy(&m)
+
+	sw: Signal_Watcher
+	sync.atomic_store(&g_thread_force_create_failure, true)
+	ok := signal_watcher_start(&sw, &m, posix.FD(-1))
+	sync.atomic_store(&g_thread_force_create_failure, false)
+
+	testing.expect(t, !ok, "a watcher whose thread could not start must report false, not crash and not hang")
+
+	after: posix.sigset_t
+	posix.pthread_sigmask(.SETMASK, nil, &after)
+	for sig in ([?]posix.Signal{.SIGINT, .SIGTERM, .SIGUSR2, SIGWINCH}) {
+		testing.expectf(t, posix.sigismember(&after, sig) == posix.sigismember(&before, sig),
+			"a failed start left %v's blocked state changed: before=%d after=%d -- the caller would be deaf to it with no watcher to hear it either",
+			sig, posix.sigismember(&before, sig), posix.sigismember(&after, sig))
+	}
+
+	// And stop is a no-op on it: `running` stayed false, so this does not try
+	// to pthread_kill a null native handle or join a thread that never existed.
+	signal_watcher_stop(&sw)
 }

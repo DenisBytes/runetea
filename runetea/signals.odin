@@ -188,7 +188,29 @@ signal_unblock_for_child :: proc() {
 
 // See signal_unblock_for_child for how an application clears the mask this
 // installs before spawning a child process -- without it, $EDITOR inherits it.
-signal_watcher_start :: proc(sw: ^Signal_Watcher, m: ^Mailbox, tty: posix.FD, wake: proc(rawptr) = nil, wake_data: rawptr = nil) {
+//
+// RETURNS WHETHER THE WATCHER IS ACTUALLY RUNNING (F15). It used to return
+// nothing, because the one thing that can fail here -- thread.create -- was
+// assumed to succeed: `sw.thread = thread.create(...)` was followed
+// immediately by `sw.thread.data = sw`, and thread.create returns nil,
+// silently and without faulting, whenever pthread_create fails (core/thread/
+// thread_unix.odin:122-125). Under the RLIMIT_NPROC pressure F15 is about
+// that store was a SIGSEGV, and had it survived, `sync.sema_wait(&sw.ready)`
+// two lines further down would have parked the caller forever waiting on a
+// thread that was never created -- the same unkillable hang, on a different
+// thread class.
+//
+// A FALSE RETURN MEANS THE WATCHER OWNS NOTHING: the signal mask this call
+// displaced is put back before returning (leaving it blocked would give the
+// caller a thread on which SIGINT/SIGTERM/SIGWINCH can never be delivered AND
+// no watcher to sigwait for them -- signals silently dropped for the life of
+// that thread), sw.running stays false, and signal_watcher_stop is a no-op on
+// it. There is nothing to clean up and nothing to join.
+//
+// The bool is NOT @(require_results): every existing call site compiles
+// unchanged, and a caller that genuinely does not care (a test that only wants
+// the mask side effect) may still ignore it. run() does not ignore it.
+signal_watcher_start :: proc(sw: ^Signal_Watcher, m: ^Mailbox, tty: posix.FD, wake: proc(rawptr) = nil, wake_data: rawptr = nil) -> bool {
 	sw.mailbox = m
 	sw.tty = tty
 	sw.running = true
@@ -207,7 +229,7 @@ signal_watcher_start :: proc(sw: ^Signal_Watcher, m: ^Mailbox, tty: posix.FD, wa
 	// it the watcher thread runs under runtime.default_context(), so the
 	// messages it boxes below come from a different allocator than the main
 	// loop's. See core/thread/thread.odin:534.
-	sw.thread = thread.create(proc(th: ^thread.Thread) {
+	sw.thread = thread_create_checked(proc(th: ^thread.Thread) {
 		sw := cast(^Signal_Watcher)th.data
 
 		// Per-thread altstack (FIX 2, final fix-wave report), installed
@@ -248,11 +270,26 @@ signal_watcher_start :: proc(sw: ^Signal_Watcher, m: ^Mailbox, tty: posix.FD, wa
 			}
 		}
 	})
+	if sw.thread == nil {
+		// Unwind in the exact reverse of what was set up above, so this
+		// Signal_Watcher is indistinguishable from one that was never
+		// started: put the caller's signal mask back (see this proc's own
+		// doc comment for why leaving it blocked is worse than not having a
+		// watcher at all), and clear `running` so signal_watcher_stop's
+		// guard skips the join of a thread that does not exist.
+		if sw.mask_saved {
+			posix.pthread_sigmask(.SETMASK, &sw.saved_mask, nil)
+			sw.mask_saved = false
+		}
+		sw.running = false
+		return false
+	}
 	sw.thread.data = sw
 	sw.thread.init_context = context
 	thread.start(sw.thread)
 
 	sync.sema_wait(&sw.ready)
+	return true
 }
 
 // Signals the watcher thread to exit and joins it. Safe to call once per

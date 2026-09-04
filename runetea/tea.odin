@@ -76,7 +76,8 @@ Program :: struct($T: typeid) {
 	//
 	// WHY POINTER. The original signature was
 	//   proc(model: T, msg: any, alloc: mem.Allocator) -> (T, Cmd)
-	// called as `p.model, cmd = p.update(p.model, msg, alloc)` in apply().
+	// called as `p.model, cmd = p.update(p.model, msg, alloc)` in apply_msg
+	// (then called apply, and doing the render as well).
 	// That one by-value round-trip made LLVM codegen SUPERLINEAR in
 	// sizeof(T), which put a hard ceiling on how large a model a RuneTea app
 	// could have. Measured via .superpowers/bigprobe -- a minimal Program
@@ -101,7 +102,7 @@ Program :: struct($T: typeid) {
 	// Bisected to this exact call, not to anything around it: instantiating
 	// Program(T) + program_init with no run() compiled in 0.6 s at 32 KiB;
 	// bypassing guarded()/setjmp entirely moved 85 s to 86 s; deleting JUST
-	// the update call from apply() moved 85 s to 0.7 s. `odin check` stayed at
+	// the update call from apply_msg moved 85 s to 0.7 s. `odin check` stayed at
 	// 0.25 s throughout, so it is codegen, not the front end -- and it is not
 	// generic Odin behaviour either: a control program passing and returning
 	// the same struct by value in a hot loop compiles in 0.5 s flat at 64 KiB.
@@ -111,7 +112,7 @@ Program :: struct($T: typeid) {
 	// WHAT IT COST: TIER-1 RECOVERY NO LONGER PROTECTS MODEL STATE.
 	// With the by-value signature, a panicking update left p.model completely
 	// untouched -- guarded()'s longjmp skipped the `p.model = ...` assignment
-	// in apply(), so the model still held the LAST GOOD state and recovery
+	// in apply_msg, so the model still held the LAST GOOD state and recovery
 	// resumed from something consistent by construction. With a pointer,
 	// update mutates p.model directly, so a panic partway through leaves the
 	// model HALF-MUTATED: some fields updated, some not, invariants between
@@ -123,17 +124,64 @@ Program :: struct($T: typeid) {
 	// AN APP CANNOT ROLL THIS BACK ITSELF. The obvious mitigation --
 	// snapshotting `old := m^` at the top of update and restoring it on
 	// failure -- does not work, because longjmp skips the APP's code too: it
-	// jumps straight out of update back into apply(), so no restore line, no
+	// jumps straight out of update back into apply_msg, so no restore line, no
 	// `defer`, and no error path inside update ever executes. The only
 	// mitigation that actually holds is STRUCTURAL: do everything that can
 	// fail FIRST (compute into locals, index-check, assert), and only write
 	// into m^ once nothing further can panic. Then a panic leaves the model
 	// exactly as it was, because nothing had been written yet.
 	//
-	// See docs/superpowers/tier1-coverage-decision.md §5 and apply()'s own
+	// See docs/superpowers/tier1-coverage-decision.md §5 and apply_msg's own
 	// comment at the guarded() call.
 	update:   proc(model: ^T, msg: any, alloc: mem.Allocator) -> Cmd,
 
+	// BY VALUE, AND THAT IS DELIBERATE -- but it has a cost the reader of this
+	// struct was previously left to discover from a compiler error (F62). The
+	// pointer argument two fields up is about `update`'s ROUND TRIP through
+	// codegen and says nothing about a parameter nothing writes through; a
+	// view is read-only, and a `^T` here would say the opposite, invite a
+	// mutation the renderer would then paint from a model update() never saw,
+	// and make the "view is a pure function of the model" rule the whole
+	// coalescing design leans on a matter of convention rather than of type.
+	//
+	// WHAT IT COSTS: ODIN PROCEDURE PARAMETERS ARE NOT ADDRESSABLE. Not merely
+	// immutable -- you cannot take the address of a field of one, and you
+	// cannot slice a fixed-size array field of one:
+	//
+	//     strings.write_string(&b, string(m.rows[i].name[:m.rows[i].n]))
+	//     // Error: Cannot slice array 'm.rows[i].name[:m.rows[i].n]',
+	//     //        value is not addressable
+	//
+	// That is not an exotic shape. box()'s MESSAGE OWNERSHIP CONTRACT
+	// (arena.odin) pushes every program here toward fixed-capacity arrays and
+	// away from `string`, so the first list or table anybody writes has a
+	// `[N]u8` plus a length in it, and the error lands on the first line of the
+	// first view that draws one. examples/editor's own model is exactly that
+	// shape (`Line :: struct { r: [MAX_COLS]rune, n: int }`) and its row_text
+	// already pays the workaround -- `l := m.lines[i]` at editor.odin:1152 --
+	// without anything in this struct having told it to.
+	//
+	// THE IDIOM THAT WORKS: one local copy at the top of the view.
+	//
+	//     view :: proc(m: Model, alloc: mem.Allocator) -> string {
+	//         mm := m                                    // addressable, lives for the body
+	//         b := strings.builder_make(alloc)
+	//         for i in 0 ..< mm.n {
+	//             strings.write_string(&b, string(mm.rows[i].name[:mm.rows[i].n]))
+	//         }
+	//         return strings.to_string(b)                // owned by `alloc`, not by mm
+	//     }
+	//
+	// AND THE SHORTCUT THAT IS A USE-AFTER-RETURN: `mm := m; return
+	// string(mm.rows[0].name[:n])` compiles clean and hands back a string
+	// pointing into a dead stack frame -- measured, it comes back as
+	// "\x00\x00\x00\x00\x00". The copy is good for the BODY; anything that
+	// leaves the view must be written into storage from `alloc`. Hoist the
+	// copy out of loops (it is the whole model), and for a model measured in
+	// kilobytes reach for a smaller T holding a pointer to storage you own --
+	// legal for a MODEL, illegal for a Msg (arena.odin's POD rule).
+	//
+	// Also in docs/LIMITATIONS.md 3.18 and worked in docs/API.md section 6.
 	view:     proc(model: T, alloc: mem.Allocator) -> string,
 
 	// OPTIONAL (T2-A). nil -- the zero value, and what program_init leaves it
@@ -151,6 +199,12 @@ Program :: struct($T: typeid) {
 	// IT IS THE APP'S JOB to keep this consistent with what view actually
 	// painted; nothing can check that for it. The coordinates are the VIEW's
 	// (logical line index + DISPLAY column), not the terminal's -- see Cursor.
+	//
+	// BY VALUE for the same reason `view` is, and with the same
+	// non-addressable-parameter consequence and the same local-copy idiom --
+	// see `view` above. A cursor proc that measures a prefix of a fixed-capacity
+	// line field hits it exactly as a view does, and this one is where it hits
+	// first, because measuring a prefix is the whole job.
 	cursor:   proc(model: T, alloc: mem.Allocator) -> Cursor,
 
 	// OPTIONAL (T2-C). Which renderer this program wants. .Inline is the ZERO
@@ -171,6 +225,41 @@ Program :: struct($T: typeid) {
 
 	init_cmd: Cmd,
 	quit:     bool,
+
+	// SET BY run() ON THE WAY OUT, never read by it. True means run() gave up
+	// waiting for an in-flight Cmd and returned anyway, leaving a DETACHED
+	// reaper thread behind that is still finishing the teardown -- freeing the
+	// Dispatcher's pool, the Reap_Ctx, the mailbox buffer, the Task_Envs and
+	// the Cmd's cloned env, all of them allocations made through the
+	// context.allocator run() was called under.
+	//
+	// WHY THIS FIELD EXISTS. `defer dispatcher_reap(rc, QUIT_GRACE)` threw
+	// that bool away, so the one thing a caller needed to know -- "is my
+	// allocator still in use?" -- was structurally unobservable: run() returned
+	// nil, docs said nothing, and the ~7 KiB across ~17 live allocations stayed
+	// live for as long as the slowest in-flight Cmd took. An embedder that
+	// scopes an allocator to the run() call and reclaims it on the next line
+	// does not merely get a phantom leak report; it gets a deterministic
+	// SIGSEGV, with a clean cliff at exactly QUIT_GRACE (a Cmd sleeping 90 ms
+	// exits 0, one sleeping 150 ms exits 139) and it segfaults even for a Cmd
+	// that allocates nothing at all, because what writes into the released
+	// memory is runetea's OWN teardown running on the reaper thread.
+	//
+	// WHAT A CALLER MUST DO WITH IT. If this is true when run() returns, the
+	// allocator run() was called under must stay valid until the process exits
+	// (or at minimum well past the slowest Cmd the program can issue) -- do
+	// not free an arena, do not tear down a Tracking_Allocator, do not return
+	// from the scope that owns it. If it is false, teardown was fully
+	// synchronous and nothing of run()'s survives the return.
+	//
+	// A bool rather than a new Run_Error variant, deliberately: the session
+	// itself ENDED FINE, and a caller's `if err != nil` is the wrong place to
+	// learn about an allocator-lifetime obligation -- turning a clean quit into
+	// a non-nil error would make every correct program start reporting a
+	// failure it did not have. run_nbio() never sets it: it tears the
+	// Dispatcher down synchronously (dispatcher_destroy, not dispatcher_reap)
+	// and so has nothing outstanding when it returns.
+	reaper_pending: bool,
 	// Which side of each legacy C0 collision this program wants (see
 	// Legacy_Key in input.odin). The zero value is the sane default, so no
 	// existing program has to say anything. Bubble Tea does NOT expose this --
@@ -225,6 +314,76 @@ Step :: struct($T: typeid) {
 	cmd:   Cmd,
 }
 
+// The mailbox both hosts run on. Named rather than repeated as a literal in
+// two files because COALESCE_BUDGET below is defined in terms of it.
+@(private = "package")
+MAILBOX_CAP :: 256
+
+// The most messages either host will apply to the model before it stops and
+// paints. It is the mailbox's own capacity, and that number is not arbitrary:
+// everything that was ALREADY QUEUED when a batch started is by construction
+// at most MAILBOX_CAP messages, so this budget never truncates a batch that
+// coalescing was supposed to fold into one frame. What it bounds is the other
+// case -- a producer that refills the queue as fast as update() empties it --
+// where an unbounded drain hands producers absolute, unlimited priority over
+// everything the loop does after the drain: painting, and (in run_nbio) even
+// reading the keyboard.
+//
+// That was not hypothetical. run_nbio's drain used to run to EMPTY, and
+// nbio.tick() -- the only thing that ever completes a read -- sat below it, so
+// a program whose sustained per-message cost exceeded its message arrival rate
+// never reached tick() again and was deaf for the rest of the process's life
+// while cheerfully repainting. Measured cliff: every(16 ms) with 12 ms of work
+// per tick quits normally, every(16 ms) with 17 ms of work never sees another
+// keystroke, 3/3. The budget converts "never" into "at most one queue's worth",
+// which is the difference between a bug and a scheduling policy.
+//
+// Not a frame-rate cap and not a timer: nothing here waits for anything. A
+// batch ends the moment the queue is empty, which for the single-keystroke
+// case is after exactly one message -- so the interactive path costs one extra
+// non-blocking mailbox_try_recv per frame and nothing else.
+@(private = "package")
+COALESCE_BUDGET :: MAILBOX_CAP
+
+// Maps a finished session onto a process exit status, so that `os.exit` is one
+// call rather than a switch every program has to write (and, as every example
+// in this repository demonstrated, forgets to write).
+//
+// WHY THIS IS IN THE LIBRARY. Every shipped example ended with
+//   if err := rt.run(...); err != nil { fmt.eprintln("error:", err) }
+// and then fell off the end of main, so a session that died of Terminal_Error
+// or Panicked_Error exited 0 -- indistinguishable, to any supervisor, CI job or
+// shell, from a clean quit. Reporting a failure only on stderr is especially
+// weak here because stderr may well have gone to the alternate screen, which
+// the terminal discards on restore: the crash could be invisible to BOTH the
+// human and the script. Handing back a status is the smallest thing that makes
+// the right shape easy to write.
+//
+// THE MAPPING, and why each value:
+//   nil                 0    the session ended because the program asked it to.
+//   Interrupted_Error   130  128+SIGINT, the shell's convention for "killed by
+//                            Ctrl+C". Not 1: an external SIGINT/SIGTERM is a
+//                            request, not a fault, and a supervisor that
+//                            restarts on 1 should not restart on this.
+//   Panicked_Error      1    user code faulted; the session did not finish.
+//   Terminal_Error      1    the terminal or a syscall went away mid-session.
+//   Killed_Error        1    unreachable today (see its own comment), mapped so
+//                            it cannot silently become 0 if it ever is produced.
+//
+// Deliberately NOT called by run(): run() is a library call and must never
+// terminate its caller's process -- an embedder that runs a TUI as one phase of
+// a longer program has to be able to keep going. The caller writes
+// `os.exit(rt.exit_code(err))` when os.exit is what it wants.
+exit_code :: proc(err: Run_Error) -> int {
+	switch _ in err {
+	case Interrupted_Error: return 130
+	case Panicked_Error:    return 1
+	case Terminal_Error:    return 1
+	case Killed_Error:      return 1
+	}
+	return 0
+}
+
 // flush_fd >= 0 writes each frame to that fd and resets the builder, which is
 // what makes the display update live. Pass -1 (the default) to accumulate the
 // whole session in the builder instead -- that is what the golden harness reads.
@@ -246,7 +405,7 @@ run :: proc(p: ^Program($T), src: ^Input_Source, out: ^strings.Builder, flush_fd
 	if rc == nil {
 		return Terminal_Error{detail = "dispatcher/mailbox allocation failed"}
 	}
-	if err := mailbox_init(&rc.mbox, 256); err != nil {
+	if err := mailbox_init(&rc.mbox, MAILBOX_CAP); err != nil {
 		free(rc, context.allocator)
 		return Terminal_Error{detail = "mailbox init failed"}
 	}
@@ -278,8 +437,29 @@ run :: proc(p: ^Program($T), src: ^Input_Source, out: ^strings.Builder, flush_fd
 	// test in the run, so the mask would leak into unrelated tests -- the
 	// exact cross-test pollution signals.odin's own SIG_WAKE-vs-SIGUSR1
 	// comment already goes out of its way to avoid.
+	//
+	// THE RESULT IS CHECKED (F15). signal_watcher_start can only fail one way
+	// -- thread.create returning nil under thread-creation pressure -- and it
+	// used to report that by dereferencing the nil. A false return means the
+	// watcher owns nothing and has already put the caller's signal mask back,
+	// so the only thing left to reclaim here is what THIS proc has allocated
+	// so far: rc and its mailbox. Everything else is still un-started.
+	//
+	// WHY THIS IS FATAL RATHER THAN A DEGRADED SESSION, when the same failure
+	// for a Cmd is only a Panicked_Msg: without the watcher, the blocked-mask
+	// premise in the comment above is what breaks. run()'s stated contract is
+	// that it "returns an error rather than dying", and that holds for an
+	// external SIGINT/SIGTERM only because a watcher exists to sigwait for it.
+	// Carrying on would mean a session that dies outright on `kill -INT`,
+	// leaving the terminal raw and on the alternate screen -- and one that
+	// never learns its own size again either, since SIGWINCH is the only
+	// resize notification there is.
 	sw: Signal_Watcher
-	if flush_fd >= 0 { signal_watcher_start(&sw, &rc.mbox, flush_fd) }
+	if flush_fd >= 0 && !signal_watcher_start(&sw, &rc.mbox, flush_fd) {
+		mailbox_destroy(&rc.mbox)
+		free(rc, context.allocator)
+		return Terminal_Error{detail = "could not start the signal watcher thread (pthread_create failed)"}
+	}
 
 	dispatcher_init(&rc.disp, &rc.mbox, 4)
 	// Declared BEFORE signal_watcher_stop's defer just below -- the OPPOSITE
@@ -316,7 +496,15 @@ run :: proc(p: ^Program($T), src: ^Input_Source, out: ^strings.Builder, flush_fd
 	// per-task allocator is exactly such a caller, rotated to a different
 	// test the moment THIS test's run() call returns.
 	QUIT_GRACE :: 100 * time.Millisecond
-	defer dispatcher_reap(rc, QUIT_GRACE)
+	// The bool is RECORDED, not discarded. `defer dispatcher_reap(rc,
+	// QUIT_GRACE)` threw away the one fact a caller cannot recover any other
+	// way -- that this call is returning while a detached reaper thread still
+	// owns and is about to free ~7 KiB of allocations made through the caller's
+	// own context.allocator. See Program.reaper_pending for the measured
+	// consequence (a deterministic SIGSEGV, not a phantom leak report, for an
+	// embedder that reclaims a scoped allocator on the next line) and for what
+	// a caller is expected to do about a `true`.
+	defer { p.reaper_pending = !dispatcher_reap(rc, QUIT_GRACE) }
 	defer signal_watcher_stop(&sw)
 
 	r: Renderer
@@ -355,10 +543,10 @@ run :: proc(p: ^Program($T), src: ^Input_Source, out: ^strings.Builder, flush_fd
 	// Guarded (T1, docs/superpowers/tier1-coverage-decision.md): this is a
 	// real call to user code -- p.view -- happening before the mailbox loop,
 	// the reader thread, or the dispatcher have processed anything, and a
-	// panic here is exactly as real a crash as one from apply()'s per-frame
-	// render (guarded_render below is the SAME helper both call, so there is
-	// only one guarded-view code path to reason about, not two that could
-	// drift). Returning early on a panic here is correct, not merely
+	// panic here is exactly as real a crash as one from the loop's own
+	// per-frame paint (guarded_render below is the SAME helper both call, so
+	// there is only one guarded-view code path to reason about, not two that
+	// could drift). Returning early on a panic here is correct, not merely
 	// tolerated: nothing has been dispatched yet (dispatch(init_cmd) is the
 	// next line) and the reader thread does not exist yet (created further
 	// below), so every defer already registered above (dispatcher_reap,
@@ -375,7 +563,32 @@ run :: proc(p: ^Program($T), src: ^Input_Source, out: ^strings.Builder, flush_fd
 	// The spike reads on a thread rather than through nbio because the loop
 	// still owns rendering; Task 6's nbio path replaces this reader in T1.
 	rd := Reader_Ctx{src = src, mailbox = &rc.mbox, legacy = p.legacy}
-	reader := thread.create(reader_thread)
+	// NIL-CHECKED, and this line is where F15's first fix wave left a
+	// SIGSEGV. thread.create returns nil -- silently, no fault, no error
+	// value -- whenever pthread_create fails (core/thread/
+	// thread_unix.odin:122-125), which is the same real condition (RLIMIT_NPROC,
+	// RLIMIT_AS, a loaded box) that cmd.odin's detached spawn already handles.
+	// `reader.data = &rd` on the next line dereferenced that nil, so a machine
+	// under thread pressure did not degrade, it died: measured as a segfault
+	// right here once cmd.odin's own spawn failure stopped hanging first.
+	//
+	// A FAILED READER ENDS THE SESSION, it does not degrade it. The reader is
+	// the ONLY producer of Key_Msg in this loop -- without it the program
+	// paints its first frame and then blocks in mailbox_recv until something
+	// external (a signal, an in-flight Cmd) happens to arrive, and no keypress
+	// will ever quit it. A UI nobody can type into is not a running program, so
+	// the honest outcome is a Terminal_Error the caller can print and turn into
+	// a non-zero exit status via exit_code (F31), not a frozen screen.
+	//
+	// Returning HERE, before the teardown defer below is declared, is
+	// deliberate and safe: that defer joins and destroys `reader`, which does
+	// not exist. Everything that DOES exist by now -- the frame arena, the
+	// renderer, the Signal_Watcher, the Dispatcher (and whatever p.init_cmd
+	// dispatched into it) -- is already covered by defers declared further up.
+	reader := thread_create_checked(reader_thread)
+	if reader == nil {
+		return Terminal_Error{detail = "could not start the input reader thread (pthread_create failed)"}
+	}
 	reader.data = &rd
 	reader.init_context = context
 	thread.start(reader)
@@ -395,10 +608,53 @@ run :: proc(p: ^Program($T), src: ^Input_Source, out: ^strings.Builder, flush_fd
 		thread.destroy(reader)
 	}
 
+	// THE COALESCING LOOP. Block for one message, then apply every message
+	// that is ALREADY QUEUED behind it -- all of them, in order, to the model
+	// -- and paint ONCE at the end. See apply_msg's own comment for the
+	// measurements that forced the split, and COALESCE_BUDGET for why the inner
+	// loop is bounded at all.
+	//
+	// COALESCING IS ABOUT PAINTS, NOT MESSAGES. Every message still reaches
+	// update(), in arrival order, and every Cmd it returns is still dispatched
+	// from inside apply_msg the instant that message is applied -- so nothing
+	// about Cmd latency or message ordering changes. What disappears is the
+	// N-1 intermediate frames nobody could have seen, because they were
+	// overwritten within microseconds by the next one.
+	//
+	// `dirty` is what keeps the frame stream for an ordinary interactive
+	// session byte-for-byte identical to the pre-coalescing one. A Quit_Msg or
+	// an Interrupt_Msg is handled before update() and reports false, exactly as
+	// the old per-message apply() painted no frame for either; so a lone quit
+	// still produces no frame of its own, and a quit that arrives behind real
+	// work paints that work once before the loop ends. That is also the answer
+	// to "stay responsive on quit": the inner loop breaks the moment p.quit is
+	// set rather than draining the rest of the queue first.
+	//
+	// AN ERROR ENDS THE BATCH WITHOUT PAINTING IT, deliberately. If message 3
+	// of 5 panics, the frame that would have shown messages 1-2 is never
+	// painted -- run() is returning Panicked_Error and the session is over.
+	// Painting a batch that did not complete would be inventing a frame the
+	// program never actually reached, and the frames in question are ones the
+	// coalescing design says nobody sees anyway.
 	for !p.quit {
 		msg, ok := mailbox_recv(&rc.mbox)
 		if !ok { break }   // closed and drained
-		if e := apply(p, msg, &fa, &rc.disp, &r, out, flush_fd); e != nil { return e }
+
+		dirty := false
+		for n := 0; ; n += 1 {
+			e, updated := apply_msg(p, msg, &fa, &rc.disp, &r)
+			if updated { dirty = true }
+			if e != nil { return e }
+			if p.quit { break }
+			if n + 1 >= COALESCE_BUDGET { break }
+			next, more := mailbox_try_recv(&rc.mbox)
+			if !more { break }
+			msg = next
+		}
+
+		if dirty {
+			if e := guarded_render(p, &fa, &r, out, flush_fd); e != nil { return e }
+		}
 	}
 	return nil
 }
@@ -507,7 +763,19 @@ reader_send :: proc(mbox: ^Mailbox, msg: any) -> (closed: bool) {
 	for {
 		switch mailbox_send(mbox, msg) {
 		case .Ok:     return false
-		case .Closed: return true
+		case .Closed:
+			// NOTHING TOOK THE MESSAGE, so this proc still owns it. Dropping
+			// the `any` on the floor here leaked exactly one box() allocation
+			// per session -- 12 bytes for the Key_Msg this reader was holding
+			// when run() closed the mailbox out from under it -- which is
+			// small but unbounded in the only sense that matters to
+			// tools/test.sh's leak audit: it is a real allocation with no
+			// owner, and the audit allows exactly one site (the bounded
+			// ^Thread in dispatcher_reap). cmd.odin's run_cmd_task and
+			// run_cmd_detached already box_free on this identical outcome;
+			// this is the third consumer that owed the same thing.
+			box_free(msg, context.allocator)
+			return true
 		case .Full:   thread.yield()
 		}
 	}
@@ -608,16 +876,62 @@ write_all :: proc(fd: posix.FD, s: string) -> Run_Error {
 	return nil
 }
 
-// One Update/View cycle, guarded. Split out so `run` stays readable and so the
-// guarded region is exactly the user code, not our loop bookkeeping.
+// ONE guarded Update. No view, no render, no flush -- the caller paints, once,
+// after it has applied everything it had.
+//
+// WHY THE PAINT IS NOT IN HERE ANY MORE. This proc used to be `apply`: update
+// AND render AND write(2), and both hosts called it once per message. That made
+// the frame count a function of the MESSAGE count rather than of how much had
+// actually changed, and both hosts inherited it -- run_nbio drained the mailbox
+// in a batch but still applied-and-painted per message, so it coalesced
+// nothing either. The cost, and what the split bought, measured on a text
+// field that echoes what it is given (scratchpad/scratch-frames/amp) with the
+// payload delivered in a SINGLE write(2) exactly as a real terminal delivers a
+// paste. Both columns are the same binary, the same renderer and the same pty;
+// only this proc differs:
+//
+//     payload         before        after      write(2) calls
+//       1 B            147 B        147 B      (unchanged)
+//      10 B            806 B        167 B
+//     200 B         34,673 B        557 B
+//   1,332 B      1,045,721 B      7,389 B      1,338 -> 12
+//
+// A megabyte of escape sequences down the terminal link, over ~1,300 syscalls,
+// for a paste that fits in one packet. The 1-byte row is deliberately
+// UNCHANGED: a lone keystroke was already one frame and still is, and the
+// single-keystroke round trip measures the same before and after (median
+// 0.16 ms vs 0.17 ms, p90 0.20 vs 0.22, 60 samples each) -- coalescing what is
+// ALREADY queued adds no latency, which is exactly why this is not a
+// frame-rate cap. It is the same shape Bubble Tea's standardRenderer has:
+// apply what has arrived, paint the result.
+//
+// A SPLIT, NOT A "should I render?" PARAMETER. Only the caller knows whether
+// more messages are already waiting, so a flag would have meant each host
+// deciding that for itself -- precisely the divergence this proc is shared
+// (rather than copied into loop_nbio.odin) to make impossible. With the split
+// the two hosts share BOTH halves: apply_msg here and guarded_render below.
+//
+// THE CRASH GUARDS ARE UNCHANGED AND STILL SEPARATE. The update guard is here;
+// the view guard is in guarded_render, where it always was -- they were already
+// two sequential guarded() calls rather than one nested pair (see
+// guarded_render's STRUCTURE note), so moving the second one out to the caller
+// changes nothing about either. A panicking update still returns
+// Panicked_Error from here with the frame arena reclaimed; a panicking view
+// still paints its diagnostic frame and returns Panicked_Error from there.
+//
+// `updated` reports whether the message reached the user's update() -- i.e.
+// whether there is anything new to paint. Quit_Msg and Interrupt_Msg are
+// handled before update() and report false, which is what makes a coalesced
+// frame stream byte-for-byte identical to the old per-message one whenever
+// messages arrive one at a time.
 //
 // package-visible, not file-visible: loop_nbio.odin's run_nbio shares this
 // verbatim rather than duplicating it, so both event-loop hosts run IDENTICAL
-// Update/View/quit/panic-recovery logic and can only differ in how a message
+// Update/quit/panic-recovery logic and can only differ in how a message
 // reaches this call, not in what happens once it does.
 @(private="package")
-apply :: proc(p: ^Program($T), msg: any, fa: ^Frame_Arena, disp: ^Dispatcher, r: ^Renderer, out: ^strings.Builder, flush_fd: posix.FD) -> Run_Error {
-	// Every msg reaching apply() came off the mailbox, which means it was
+apply_msg :: proc(p: ^Program($T), msg: any, fa: ^Frame_Arena, disp: ^Dispatcher, r: ^Renderer) -> (err: Run_Error, updated: bool) {
+	// Every msg reaching apply_msg came off the mailbox, which means it was
 	// boxed with context.allocator (never frame_allocator(fa) -- see
 	// Frame_Arena's LIFETIME CONTRACT in arena.odin): tea.odin's reader
 	// thread and loop_nbio.odin's nbio_on_read both box Key_Msg that way,
@@ -634,8 +948,100 @@ apply :: proc(p: ^Program($T), msg: any, fa: ^Frame_Arena, disp: ^Dispatcher, r:
 	// for it -- see docs/superpowers/message-ownership-decision.md.
 	defer box_free(msg, context.allocator)
 
-	if _, is_quit := msg.(Quit_Msg); is_quit { p.quit = true; return nil }
-	if _, is_int := msg.(Interrupt_Msg); is_int { return Interrupted_Error{} }
+	// ARM THE FRAME-ALLOCATOR GUARD for the whole of this proc (F07). This is
+	// one of the two places in the package where a frame allocator is handed to
+	// user code, and the ONLY thing that makes "did you give us back the
+	// allocator we just gave you?" answerable -- see cmd.odin's THE FRAME
+	// ALLOCATOR IS NOT A Cmd ALLOCATOR for the two-pointer test and for why
+	// arming (rather than comparing against virtual.arena_allocator_proc alone)
+	// is what keeps an application's own long-lived arena legal.
+	//
+	// THE WHOLE PROC, not just the guarded() update call, deliberately: the
+	// dispatch of whatever update() returned happens further down, OUTSIDE the
+	// guard, and dispatch_ex's own backstop can only fire while a frame is
+	// armed. Two atomic stores per message against an update() call and a
+	// dispatch; the cost is not measurable.
+	prev_frame_guard := frame_guard_arm(frame_allocator(fa))
+	defer frame_guard_disarm(prev_frame_guard)
+
+	if _, is_quit := msg.(Quit_Msg); is_quit { p.quit = true; return nil, false }
+	if _, is_int := msg.(Interrupt_Msg); is_int { return Interrupted_Error{}, false }
+
+	// F08. A MESSAGE-CONTRACT VIOLATION ENDS THE SESSION; AN ORDINARY Cmd PANIC
+	// DOES NOT. Both arrive here as Panicked_Msg, and telling them apart is the
+	// whole of this branch (arena.odin's BOX_CONTRACT_PANIC is the marker, and
+	// carries the argument for why the two are different KINDS of event).
+	//
+	// WHAT THIS FIXES. `box()` refuses a non-POD Msg with a panic. That panic
+	// is raised on a pool worker, recovered by run_cmd_guarded, and demoted to a
+	// Panicked_Msg -- so a Cmd that returns, say, `box(Err_Msg{reason: string})`
+	// produced NO result, NO diagnostic, and no error from run(). The Cmd simply
+	// never answered. Every shipped example, and the canonical update switch in
+	// README.md and docs/API.md, either has no `case rt.Panicked_Msg` at all or
+	// has one with an empty body, so the single most likely first mistake a new
+	// user makes -- putting a string in a Msg -- was reported into a switch arm
+	// nobody had written and then dropped on the floor. Wave 1 made the text name
+	// the offending type and the box() call site; this is what makes the text
+	// arrive somewhere.
+	//
+	// WHY NOT STDERR, which is the fixlist's other suggestion. By the time a Cmd
+	// is running, the terminal is in raw mode and quite possibly on the alternate
+	// screen, so anything written to stderr is painted into a buffer that
+	// `\e[?1049l` discards on exit: the user sees nothing at all. That is the
+	// whole reason cmd.odin routes these reports through the mailbox in the first
+	// place, and printing here would repeat the mistake one layer up.
+	// Panicked_Error goes out through run()'s RETURN VALUE, which is the one
+	// channel that outlives the alternate screen -- the caller prints it after
+	// its own `defer term_restore()` has run, and exit_code turns it into a
+	// non-zero status (F31).
+	//
+	// WHY IT DOES NOT MAKE AN ORDINARY Cmd PANIC NOISIER. The prefix test is the
+	// gate. A Cmd whose body panics on its own account still delivers an
+	// ordinary Panicked_Msg to update(), the session still continues, and the app
+	// still decides -- pinned by test_program_survives_a_panicking_cmd, which
+	// asserts `err == nil` for exactly that program. Nothing about that path
+	// changes, and nothing new is printed on it.
+	//
+	// WHY BEFORE update() RATHER THAN AFTER. There is no way to observe whether
+	// an app's `switch` matched a case, so "escalate only what update() ignored"
+	// is not implementable; and handing this to update() first would mean
+	// dispatching whatever Cmd it returned and then killing the session anyway,
+	// which is a worse story than not asking. Quit_Msg and Interrupt_Msg are
+	// already handled ahead of update() for the same reason -- some messages are
+	// the loop's business, not the model's.
+	//
+	// SYMMETRY, not a special case: a panic in update() ends the session with
+	// Panicked_Error and so does a panic in view() (guarded_render). A Cmd body
+	// is user code too; what makes THIS report terminal is not that it came from
+	// a Cmd but that it says the program broke a rule the framework enforces, so
+	// the next attempt will break it identically.
+	//
+	// KNOWN GAP, and it is cmd.odin's to close, not this branch's: a report that
+	// never reaches the mailbox never reaches here. deliver_report (cmd.odin)
+	// box_frees and drops on .Closed, so a violation detected AFTER run() has
+	// begun tearing the mailbox down is still silent. Verified with two probes:
+	// the same program over a pty escalates, while one driven by
+	// input_source_from_bytes -- where EOF closes the mailbox first -- does not.
+	// It is a teardown-only window (the session is ending either way), but "fail
+	// loudly" currently means "fail loudly while the loop runs".
+	if pm, is_report := msg.(Panicked_Msg); is_report {
+		text := msg_text_string(&pm.message)
+		// TWO MARKERS, ONE POLICY. box()'s marker says "this Msg type can
+		// never be delivered"; cmd.odin's says "this Cmd's env was allocated
+		// from a frame arena and can never be read" (F07). Both are contract
+		// violations that will recur identically on the next attempt, so both
+		// end the session rather than being handed to a `case Panicked_Msg`
+		// that the canonical update switch leaves empty. dispatch_ex cannot
+		// panic its own refusal -- it runs outside guarded() -- so this is
+		// where that half of the F07 check becomes visible to a caller.
+		if is_box_contract_panic(text) || is_cmd_alloc_contract_panic(text) {
+			// Cloned because Panicked_Error's caller owns `message` and must
+			// delete() it (see the type's own doc comment), while `text` borrows
+			// the fixed buffer inside a box the deferred box_free above is about
+			// to reclaim.
+			return Panicked_Error{message = strings.clone(text, context.allocator)}, false
+		}
+	}
 
 	// Window_Size_Msg updates the renderer's width for FUTURE rewinds (see
 	// renderer_set_width's doc comment on why last_rows itself is untouched
@@ -692,12 +1098,20 @@ apply :: proc(p: ^Program($T), msg: any, fa: ^Frame_Arena, disp: ^Dispatcher, r:
 		// Memory only -- p.model's CONTENT is not restored and cannot be
 		// (see above).
 		frame_reset(fa)
-		return Panicked_Error{message = info.message}
+		return Panicked_Error{message = info.message}, false
 	}
 
 	if !cmd_is_nil(step.cmd) { dispatch(disp, step.cmd) }
 
-	return guarded_render(p, fa, r, out, flush_fd)
+	// The frame arena is NOT reset here. It was, implicitly, by the render
+	// this proc used to end with -- and that is exactly why the reset now
+	// belongs to guarded_render alone: whatever update() allocated from the
+	// frame allocator has to stay alive until the view that may read it has
+	// run, which is now one or more messages later. guarded_render still
+	// resets on every one of its own exit paths, so the arena is reclaimed
+	// once per FRAME instead of once per message, which is what the arena's
+	// LIFETIME CONTRACT (arena.odin) has always described.
+	return nil, true
 }
 
 // Shared state for the guarded View call, mirroring Step above -- longjmp
@@ -716,16 +1130,20 @@ View_Step :: struct($T: typeid) {
 }
 
 // Renders exactly one frame under guarded(): calls p.view, writes it through
-// the Renderer, flushes, and reclaims the frame arena -- the same four steps
-// apply()'s tail always performed, just now with p.view wrapped instead of
-// called bare. Two call sites share this (run()'s initial paint above, and
-// apply() just above this proc), which is the point: view has exactly one
-// guarded code path, not two hand-maintained copies that could drift.
+// the Renderer, flushes, and reclaims the frame arena. THREE call sites share
+// this -- run()'s initial paint, run()'s per-batch paint, and run_nbio's
+// per-batch paint (loop_nbio.odin) -- which is the point: view has exactly one
+// guarded code path, not three hand-maintained copies that could drift.
+//
+// These four steps used to be the tail of apply(), which ran them once per
+// MESSAGE. Splitting them out (see apply_msg above for the amplification this
+// cost) is what lets a host apply a whole batch and paint the result once; the
+// steps themselves, and their order, are unchanged.
 //
 // STRUCTURE (constraint a, tier1-coverage-decision.md): this is a SEPARATE,
-// SEQUENTIAL guarded() call, not one nested inside apply()'s update guard.
-// apply()'s own guarded(update) call above has already returned (successfully
-// or not) by the time this runs, so g_armed is back to false and this call is
+// SEQUENTIAL guarded() call, not one nested inside apply_msg's update guard.
+// apply_msg's own guarded(update) call has already returned (successfully or
+// not) by the time a caller reaches this, so g_armed is back to false and this call is
 // perfectly ordinary from guarded()'s point of view -- nesting is a same-
 // thread, same-callstack hazard (an inner guarded() call from inside an outer
 // one's still-active body), and update-then-view here are two calls in
@@ -773,6 +1191,36 @@ guarded_render :: proc(p: ^Program($T), fa: ^Frame_Arena, r: ^Renderer, out: ^st
 	// the non-nesting constraint discussed below is untouched. It runs AFTER
 	// view because that is the order the app itself reasons in -- the cursor
 	// describes a position in the frame view just produced.
+	// F53. WHETHER THE TERMINAL CAN READ ESCAPES AT ALL is read here, on the one
+	// paint path run() and run_nbio() share, and not inside renderer_init.
+	//
+	// term_enter_raw has gated its five opt-ins on term_supports_escapes() since
+	// the term-guard wave, so a TERM=dumb session already got no Kitty push, no
+	// bracketed paste, no mouse tracking, no focus reporting and no alternate
+	// screen -- and then the renderer wrote \e[H, \e[2J, \e[K, CUP and SGR at it
+	// anyway, which an Emacs comint pty answers by printing them. Renderer.plain
+	// is what closes that half; render_plain is what it degrades to.
+	//
+	// HERE RATHER THAN IN renderer_init, deliberately. renderer_init is called
+	// by every byte-exact test in this package and by tools/difftest, and making
+	// its result depend on the ambient TERM would make those tests pass or fail
+	// by shell. The environment belongs to the SESSION, so the host that owns
+	// the session reads it. Once per frame rather than once per run because
+	// term_supports_escapes is itself deliberately uncached (a copy of the
+	// environment is a second source of truth) and the read costs 82 ns --
+	// 5 us per second of wall clock at 60 frames, measured, versus the ~10 us
+	// this proc is about to spend in strings.split_lines alone.
+	r.plain = !term_supports_escapes()
+
+	// The second of the two places this package hands a frame allocator to user
+	// code, armed for the same reason apply_msg arms it (F07, cmd.odin). view()
+	// and cursor() do not return Cmds, so nothing here is expected to trip it --
+	// but "the app calls a helper from its view that builds a Cmd" is not a
+	// shape the framework can rule out, and an armed guard that never fires
+	// costs two atomic stores per frame.
+	prev_frame_guard := frame_guard_arm(frame_allocator(fa))
+	defer frame_guard_disarm(prev_frame_guard)
+
 	vs := View_Step(T){p = p, alloc = frame_allocator(fa)}
 	info := guarded(proc(ud: rawptr) {
 		s := cast(^View_Step(T))ud
@@ -784,7 +1232,7 @@ guarded_render :: proc(p: ^Program($T), fa: ^Frame_Arena, r: ^Renderer, out: ^st
 		// longjmp ran no defers: reclaim whatever the failed view() call
 		// allocated from the frame arena (a partially-built strings.Builder,
 		// etc.) before building the diagnostic from a clean arena -- same
-		// wholesale-reclaim move apply() already makes for a failed update().
+		// wholesale-reclaim move apply_msg already makes for a failed update().
 		frame_reset(fa)
 		diag := fmt.aprintf("[view panicked: %s]", info.message, allocator = frame_allocator(fa))
 		renderer_render(r, diag)

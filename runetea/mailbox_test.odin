@@ -1,5 +1,12 @@
+#+private
+// ^ Every declaration in this file is package-private, so that `odin doc
+//   runetea` / `odin doc runegloss` -- the command README.md and docs/API.md
+//   hand a newcomer for symbol discovery -- lists the library rather than the
+//   test fixtures. Pinned by tools/doccheck/run.sh's `apidoc` check, which is
+//   also where the argument for it is written out.
 package runetea
 
+import "core:mem"
 import "core:testing"
 import "core:thread"
 import "core:time"
@@ -82,14 +89,26 @@ test_mailbox_no_loss_under_4_producers :: proc(t: ^testing.T) {
 		N_PROD * PER, len(seen), N_PROD * PER - len(seen))
 }
 
+// The two survivors are box()'d, not bare `any`s pointing at literals, and
+// that is now required rather than merely tidy: this is the only test in the
+// suite that deliberately leaves messages in the ring at destroy time, and
+// mailbox_destroy free()s whatever it finds there (see its own comment). A
+// bare `1` would hand free() a pointer no allocator ever issued -- reported
+// by odin test's Tracking_Allocator as `bad free @ arena.odin:box_free()`,
+// which is exactly what this test produced the first time the drain went in.
+// The invariant is not new; apply() (tea.odin) has always box_free'd every
+// message it dequeues, so a non-boxed entry was already unsound. Only the
+// place it gets caught is new.
 @(test)
 test_mailbox_reports_full :: proc(t: ^testing.T) {
 	m: Mailbox
 	testing.expect_value(t, mailbox_init(&m, 2), nil)
 	defer mailbox_destroy(&m)
-	testing.expect_value(t, mailbox_send(&m, 1), Mailbox_Send_Result.Ok)
-	testing.expect_value(t, mailbox_send(&m, 2), Mailbox_Send_Result.Ok)
-	testing.expect_value(t, mailbox_send(&m, 3), Mailbox_Send_Result.Full)
+	testing.expect_value(t, mailbox_send(&m, box(Mail_Msg{n = 1}, context.allocator)), Mailbox_Send_Result.Ok)
+	testing.expect_value(t, mailbox_send(&m, box(Mail_Msg{n = 2}, context.allocator)), Mailbox_Send_Result.Ok)
+	// Nothing is boxed for the third: it never enters the ring, so nothing
+	// would ever free it.
+	testing.expect_value(t, mailbox_send(&m, Mail_Msg{n = 3}), Mailbox_Send_Result.Full)
 }
 
 @(test)
@@ -146,3 +165,55 @@ test_mailbox_try_recv_keeps_semaphore_in_sync :: proc(t: ^testing.T) {
 	testing.expect(t, is_int2, "recv message should be an int")
 	if is_int2 { testing.expect_value(t, v2, 222) }
 }
+
+// F55: mailbox_destroy used to `delete(m.buf)` and zero the struct without
+// ever box_free'ing the `any` entries still sitting in the ring. apply()
+// (tea.odin) is the single free point for a boxed Msg and it only ever sees
+// what it dequeued, so EVERY message still queued behind the Quit_Msg that
+// ended a session was leaked -- and likewise on every Panicked_Error /
+// Interrupted_Error / Terminal_Error early return. Not an edge case: a quit
+// keypress arriving while a batch's results are still landing is the ordinary
+// way a TUI ends.
+//
+// Asserted through a private Tracking_Allocator rather than by eyeballing the
+// suite's leak lines, because the whole point of the fix is that the count
+// returns to what it was BEFORE the messages were boxed -- a number, not an
+// absence of warnings.
+@(test)
+test_mailbox_destroy_frees_messages_still_queued :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	al := mem.tracking_allocator(&track)
+
+	// Captured BEFORE mailbox_init, so the ring buffer itself is inside the
+	// window: mailbox_destroy frees that too, and a baseline taken after init
+	// would make a correct destroy look like it had over-freed by one.
+	before := len(track.allocation_map)
+	m: Mailbox
+	testing.expect_value(t, mailbox_init(&m, 8, al), nil)
+
+	// Three POD messages of three different shapes, one of them zero-sized:
+	// box() legitimately returns a nil data pointer for Quit_Msg (arena.odin),
+	// and box_free must stay a no-op on that rather than needing a special
+	// case in the drain loop.
+	context.allocator = al
+	testing.expect_value(t, mailbox_send(&m, box(Mail_Msg{n = 1}, al)), Mailbox_Send_Result.Ok)
+	testing.expect_value(t, mailbox_send(&m, box(Mail_Msg{n = 2}, al)), Mailbox_Send_Result.Ok)
+	testing.expect_value(t, mailbox_send(&m, box(Quit_Msg{},      al)), Mailbox_Send_Result.Ok)
+	testing.expectf(t, len(track.allocation_map) > before,
+		"the three sends must actually have allocated (before %d, now %d)", before, len(track.allocation_map))
+
+	// The quit path: one message consumed, the rest abandoned in the ring.
+	consumed, ok := mailbox_try_recv(&m)
+	testing.expect(t, ok, "expected to dequeue the first message")
+	box_free(consumed, al)
+
+	mailbox_destroy(&m, al)
+	testing.expectf(t, len(track.allocation_map) == before,
+		"mailbox_destroy must free every message still queued: %d allocation(s) survived", len(track.allocation_map) - before)
+}
+
+// A POD Msg for the drain test above -- see arena.odin's MESSAGE OWNERSHIP
+// CONTRACT for why it cannot carry a bare `string`.
+Mail_Msg :: struct { n: int }

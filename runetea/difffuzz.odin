@@ -109,6 +109,35 @@ TOK_LINK := []string{
 	"\e]8;;\e\\",
 }
 
+// UNIQUE SGR ESCAPES, generated per case, for the style-table overflow prong.
+//
+// WHAT THE CORPUS COULD NOT REACH BEFORE. TOK_STYLE has six fixed spellings and
+// TOK_LINK four, so a case could intern at most ten styles and four links --
+// against caps of STYLE_TABLE_MAX = 4096 entries and STYLE_BYTES_MAX = 1 MiB.
+// Neither cap was reachable by any seed, so neither the retry path
+// (diff_styles_reset + repaint) nor what happens when the RETRY overflows too
+// had ever been executed by a test. The second of those was a silently wrong
+// screen: the frame was emitted from a model in which screen_sgr had kept the
+// previous style for every cell past the cap.
+//
+// THE CAP THAT IS REACHED HERE IS THE BYTE BUDGET, NOT THE ENTRY COUNT, and
+// that is a deliberate choice about cost. A style is interned as the bytes
+// ACCUMULATED since the last reset (Style_Table), so a run of n distinct
+// escapes with no \e[0m between them interns n strings of 19, 38, 57 ... bytes:
+// 19*n*(n+1)/2 in total, which crosses 1 MiB at n = 333. Reaching the 4096-ENTRY
+// cap instead would need 4096 escapes each preceded by a reset, and every one of
+// those is a linear scan against a table of equal-length strings -- 8M full byte
+// comparisons per frame, per pass, and a frame overflows twice (the retry). The
+// accumulating form costs almost nothing to scan, because style_intern compares
+// LENGTHS first and every accumulated string has a different one. Same code
+// path, same `ok = false`, same fallback; two orders of magnitude cheaper.
+@(private = "file")
+STORM_TOKENS :: 400
+// "\e[38;2;RRR;GGG;BBBm" with fixed three-digit components, so every token is
+// exactly this wide and the arena's capacity can be reserved exactly.
+@(private = "file")
+STORM_TOKEN_LEN :: 19
+
 // A running fuzz case: geometry, a document of tokenised lines, and the PRNG
 // state that drives the next mutation.
 Diff_Fuzz :: struct {
@@ -122,6 +151,50 @@ Diff_Fuzz :: struct {
 	// Set once the first frame has been produced; the first frame is emitted
 	// unmutated so that a case always has a baseline to diff against.
 	started:   bool,
+
+	// --- F34: the three states the corpus structurally could not reach ---
+
+	// OPT-IN, and it has to be, because a resize is the one mutation the
+	// GENERATOR cannot perform on its own: the size lives in the harness's
+	// Renderer and in the harness's emulator, not here. A harness that sets
+	// this MUST, after every diff_fuzz_frame and before rendering it:
+	//
+	//   renderer_set_width (&r, f.cols); renderer_set_height(&r, f.rows)
+	//   ...and re-size its replay screen(s) to f.cols x f.rows.
+	//
+	// A harness that leaves it false gets the old fixed-geometry corpus,
+	// unchanged frame for frame -- which is why this is a flag and not a
+	// behaviour change: tools/difftest's check.py has no RESIZE record yet, and
+	// silently resizing under it would compare two renderers against a pyte
+	// screen that is still the old size and report divergences that are the
+	// harness's own. runetea/diff_oracle_test.odin does opt in.
+	//
+	// WHAT IT CATCHES, and why it is the whole point of F34: before this, no
+	// case in either oracle ever called renderer_set_width/height, so nothing
+	// ever executed .Diff's forced-repaint prologue against .Full_Screen's
+	// carry-on-painting. Those two disagree for any view that leaves an SGR
+	// open past its last cell -- .Diff blanked its model and emitted \e[0m
+	// before \e[2J, .Full_Screen re-homed onto the previous frame's pen -- and
+	// the disagreement is invisible to a corpus that never changes size.
+	resizes:   bool,
+	// True when the frame just produced by diff_fuzz_frame changed cols/rows.
+	// Advisory: a harness may simply push f.cols/f.rows every frame, which is
+	// what diff_oracle_test does (renderer_set_width is a no-op when the value
+	// is unchanged, deliberately -- see its comment).
+	resized:   bool,
+
+	// This seed manufactures unbounded distinct SGR strings. A minority of
+	// seeds, because an overflowing frame degrades to a full repaint and a
+	// corpus made mostly of those would stop testing the diff at all.
+	style_storm: bool,
+	// The generated escapes and the arena they point into. `storm_arena` is
+	// reserved to its final size BEFORE anything is appended, and that reserve
+	// is load-bearing rather than an optimisation: every string in storm_toks
+	// is a slice OF this buffer, so a reallocation part-way through would leave
+	// the earlier ones dangling.
+	storm_arena: [dynamic]u8,
+	storm_toks:  [dynamic]string,
+	storm_next:  int,
 }
 
 @(private = "file")
@@ -148,11 +221,16 @@ fuzz_n :: proc(f: ^Diff_Fuzz, n: int) -> int {
 // exclusions, both disagreements the harnesses were built to have rather than
 // bugs being hidden -- see TOK_COMBINING and TOK_EMOJI for each one in full.
 // The in-package oracle runs the FULL alphabet.
-diff_fuzz_init :: proc(f: ^Diff_Fuzz, seed: u64, pyte_safe := false) {
+// `resizes` opts into the mid-session resize mutation -- see Diff_Fuzz.resizes
+// for the contract it places on the caller. Defaulted off so that a harness
+// written before F34 keeps producing exactly the corpus it produced before.
+diff_fuzz_init :: proc(f: ^Diff_Fuzz, seed: u64, pyte_safe := false, resizes := false) {
 	f.rng       = seed * 0x2545F4914F6CDD1D + 0x9E3779B97F4A7C15
 	f.seed      = seed
 	f.pyte_safe = pyte_safe
 	f.started   = false
+	f.resizes   = resizes
+	f.resized   = false
 
 	// Small geometries on purpose. Wrapping, truncation and the right margin
 	// are where the invariants live, and a 4-column screen reaches all three in
@@ -161,17 +239,114 @@ diff_fuzz_init :: proc(f: ^Diff_Fuzz, seed: u64, pyte_safe := false) {
 	f.rows   = 2 + fuzz_n(f, 11)    // 2 .. 12
 	f.frames = 2 + fuzz_n(f, 13)    // 2 .. 14
 
+	// One seed in eleven. See STORM_TOKENS for what it reaches and why the rest
+	// of the corpus must not.
+	f.style_storm = seed % 11 == 3
+	fuzz_storm_init(f)
+
 	clear(&f.lines)
 	// Start somewhere between "empty view" and "taller than the viewport", so
 	// growth and truncation are both reachable from the initial state.
 	n := fuzz_n(f, f.rows + 3)
 	for _ in 0 ..< n { fuzz_add_line(f, fuzz_n(f, len(f.lines) + 1)) }
+	fuzz_seed_special_lines(f)
 }
 
 diff_fuzz_destroy :: proc(f: ^Diff_Fuzz) {
 	for &l in f.lines { delete(l) }
 	delete(f.lines)
 	f.lines = nil
+	delete(f.storm_arena)
+	delete(f.storm_toks)
+	f.storm_arena = nil
+	f.storm_toks  = nil
+}
+
+// Builds this case's pool of distinct SGR escapes. Nothing at all for a
+// non-storm seed, so the common case pays two nil deletes at destroy and no
+// allocation.
+@(private = "file")
+fuzz_storm_init :: proc(f: ^Diff_Fuzz) {
+	clear(&f.storm_arena)
+	clear(&f.storm_toks)
+	f.storm_next = 0
+	if !f.style_storm { return }
+	// EXACT, and reserved before the first append: see Diff_Fuzz.storm_arena.
+	reserve(&f.storm_arena, STORM_TOKENS * STORM_TOKEN_LEN)
+	reserve(&f.storm_toks, STORM_TOKENS)
+	for i in 0 ..< STORM_TOKENS {
+		off := len(f.storm_arena)
+		append(&f.storm_arena, "\e[38;2;")
+		fuzz_write_u8_padded(f, u8((i / 256) % 256))
+		append(&f.storm_arena, ';')
+		fuzz_write_u8_padded(f, u8(i % 256))
+		append(&f.storm_arena, ";000m")
+		assert(len(f.storm_arena) - off == STORM_TOKEN_LEN,
+			"STORM_TOKEN_LEN no longer matches the escape this builds")
+		append(&f.storm_toks, string(f.storm_arena[off:][:STORM_TOKEN_LEN]))
+	}
+}
+
+// Three fixed digits, so every token is STORM_TOKEN_LEN bytes wide. Hand-rolled
+// rather than fmt'd for the reason the rest of this file is: the corpus must be
+// bit-identical between `odin test` and tools/difftest for as long as both
+// exist, and a core-library formatter is one more thing that can be revised out
+// from under either.
+@(private = "file")
+fuzz_write_u8_padded :: proc(f: ^Diff_Fuzz, v: u8) {
+	append(&f.storm_arena, u8('0' + (v / 100) % 10))
+	append(&f.storm_arena, u8('0' + (v / 10) % 10))
+	append(&f.storm_arena, u8('0' + v % 10))
+}
+
+// The lines that are CONSTRUCTED rather than sampled, because the states they
+// reach have a probability the random alphabet cannot deliver.
+@(private = "file")
+fuzz_seed_special_lines :: proc(f: ^Diff_Fuzz) {
+	// (1) A WIDE CLUSTER STARTING ON THE LAST COLUMN. Reachable by chance, but
+	// only by chance: it needs a line whose display width is exactly cols-1
+	// (mod cols) at the moment a wide token is appended, and the alphabet is 50%
+	// narrow ASCII, 20% wide, the rest zero-width. Constructing it is what makes
+	// every seed carry the case, and it is the case the frame SHAPE depends on:
+	// screen_put writes the cluster IN that column with no continuation cell and
+	// clamps the cursor, so the row ends one column short of what a width-modulo
+	// measurement claims -- which used to make the renderer skip the trailing
+	// \e[K and leave the previous frame's characters in that cell forever.
+	if f.cols >= 3 {
+		line: [dynamic]string
+		for _ in 0 ..< f.cols - 1 { append(&line, TOK_ASCII[fuzz_n(f, len(TOK_ASCII))]) }
+		append(&line, TOK_WIDE[fuzz_n(f, len(TOK_WIDE))])
+		inject_at(&f.lines, clamp(fuzz_n(f, len(f.lines) + 1), 0, len(f.lines)), line)
+	}
+
+	// (2) A LINE THAT LEAVES AN SGR OPEN PAST ITS LAST CELL, appended LAST so
+	// the frame as a whole ends inside a style run. The alphabet can produce
+	// this, but the mutator can also close it again at any time; pinning it here
+	// means every seed exercises "the terminal's pen is not the default when the
+	// next frame starts", which is the state .Diff and .Full_Screen used to
+	// disagree about after a resize (and the one that made .Diff's per-frame
+	// cost grow without bound).
+	{
+		line: [dynamic]string
+		for _ in 0 ..< 1 + fuzz_n(f, 3) { append(&line, TOK_ASCII[fuzz_n(f, len(TOK_ASCII))]) }
+		// Never TOK_STYLE's "\e[0m": the point is that it is NOT closed.
+		append(&line, "\e[41m")
+		append(&line, TOK_ASCII[fuzz_n(f, len(TOK_ASCII))])
+		append(&f.lines, line)
+	}
+
+	// (3) THE STYLE STORM -- a burst of distinct SGR escapes and one glyph.
+	// Every escape is zero width, so this is ONE physical row no matter how
+	// many of them there are, which is what lets a single PAINTED line overflow
+	// the intern budget. A line the height budget dropped would never be
+	// modelled at all and would prove nothing.
+	if f.style_storm {
+		line: [dynamic]string
+		for i in 0 ..< STORM_TOKENS { append(&line, f.storm_toks[i]) }
+		append(&line, TOK_ASCII[fuzz_n(f, len(TOK_ASCII))])
+		append(&line, "\e[0m")
+		append(&f.lines, line)
+	}
 }
 
 @(private = "file")
@@ -214,7 +389,11 @@ fuzz_add_line :: proc(f: ^Diff_Fuzz, at: int) {
 // one that must cost zero bytes) and a generator that never produced one would
 // never test it.
 diff_fuzz_frame :: proc(f: ^Diff_Fuzz, b: ^strings.Builder) -> (view: string, cur: Cursor) {
-	if f.started { fuzz_mutate(f) }
+	f.resized = false
+	if f.started {
+		fuzz_mutate(f)
+		fuzz_maybe_resize(f)
+	}
 	f.started = true
 
 	strings.builder_reset(b)
@@ -233,6 +412,33 @@ diff_fuzz_frame :: proc(f: ^Diff_Fuzz, b: ^strings.Builder) -> (view: string, cu
 		cur.col  = fuzz_n(f, f.cols + 3)
 	}
 	return
+}
+
+// A SIGWINCH, between two frames. Only for a harness that opted in (see
+// Diff_Fuzz.resizes); silently inert otherwise, which is the whole reason it is
+// a flag.
+//
+// One frame in six, and it may change either axis or both. The values stay in
+// the same 4..40 x 2..12 envelope diff_fuzz_init draws from, so a resize does
+// not smuggle in geometries the rest of the corpus never sees -- the new state
+// being exercised is the TRANSITION, not the size.
+//
+// A resize to the SAME size is left in deliberately (fuzz_n can produce it):
+// renderer_set_width forces a repaint only when the value actually changed, and
+// "a Window_Size_Msg that reports no change costs nothing" is a property worth
+// having in the corpus rather than one to engineer around.
+@(private = "file")
+fuzz_maybe_resize :: proc(f: ^Diff_Fuzz) {
+	if !f.resizes { return }
+	if fuzz_n(f, 6) != 0 { return }
+	nc, nr := f.cols, f.rows
+	switch fuzz_n(f, 3) {
+	case 0: nc = 4 + fuzz_n(f, 37)
+	case 1: nr = 2 + fuzz_n(f, 11)
+	case:   nc = 4 + fuzz_n(f, 37); nr = 2 + fuzz_n(f, 11)
+	}
+	f.resized = nc != f.cols || nr != f.rows
+	f.cols, f.rows = nc, nr
 }
 
 @(private = "file")
@@ -283,5 +489,13 @@ fuzz_mutate :: proc(f: ^Diff_Fuzz) {
 		clear(&f.lines)
 		n := fuzz_n(f, f.rows + 3)
 		for _ in 0 ..< n { fuzz_add_line(f, len(f.lines)) }
+		// And put the constructed cases back. Without this, one roll of this
+		// branch removes the margin-straddling wide cluster, the unclosed SGR
+		// and the style storm for the whole REST of the case -- which is how a
+		// generator quietly stops testing the thing it was extended to test.
+		// It also re-seeds them at the CURRENT geometry, which matters once
+		// resizes are in play: "cols-1 narrow tokens then a wide one" is a
+		// different line at 8 columns than it was at 34.
+		fuzz_seed_special_lines(f)
 	}
 }

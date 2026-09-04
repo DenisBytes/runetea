@@ -39,9 +39,9 @@ and CSI 1;5C, the xterm modifier encoding.
 Backspace deletes backwards (0x7F). Delete deletes FORWARD
 (CSI 3~). They are different sequences and different actions.
 Home and End go to the ends of this line.
-PageUp and PageDown scroll by a whole viewport, which is why
-this document is deliberately longer than the ten rows the
-view paints.
+PageUp and PageDown scroll by a whole viewport, which is as
+tall as this window minus the four rows of chrome -- resize
+and watch the line count in the status bar follow.
 Paste something multi-line: bracketed paste streams it in as
 ordinary keypresses with pasted = true, so the text lands as
 text even when it contains what looks like an escape sequence.
@@ -103,13 +103,23 @@ main :: proc() {
 	// the crash-signal path, exactly once between them -- which matters more here
 	// than for any of the other opt-ins, because a program that dies without it
 	// leaves the user unable to see their own terminal at all.
-	if !rt.term_enter_raw(fd, {.Disambiguate}, true, .Normal, false, true) {
+	if !rt.term_enter_raw(fd, {kb = {.Disambiguate}, paste = true, mouse = .Normal, alt = true}) {
 		fmt.eprintln("not a tty"); os.exit(1)
 	}
 	defer rt.term_restore()
 
 	src, ok := rt.input_source_from_fd(fd)
-	if !ok { fmt.eprintln("bad input source"); os.exit(1) }
+	// F10. rt.term_restore() BEFORE os.exit, and this is not belt and braces.
+	// Odin's os.exit does NOT run defers, so the `defer rt.term_restore()` two
+	// lines above never fires on this path -- and by the time control reaches
+	// here term_enter_raw has already written all six of its enables: raw mode,
+	// the alternate screen, mouse 1000+1006, bracketed paste and one entry
+	// pushed on the terminal's Kitty keyboard stack. Six enables, zero
+	// disables, on a reachable error path: the user is left on a blank alt
+	// screen in raw mode with the mouse reporting, unable to see their own
+	// shell. term.odin is meticulous about pairing every enable and this line
+	// is what stops the example from throwing that away.
+	if !ok { rt.term_restore(); fmt.eprintln("bad input source"); os.exit(1) }
 	defer rt.input_close(&src)
 
 	b := strings.builder_make(); defer strings.builder_destroy(&b)
@@ -174,5 +184,34 @@ main :: proc() {
 	if w, h, ok := rt.term_size(fd); ok { p.model.term_w, p.model.term_h = w, h }
 
 	// flush_fd = the tty, so each frame reaches the screen as it is rendered.
-	if err := rt.run(&p, &src, &b, fd); err != nil { fmt.eprintln("error:", err) }
+	err := rt.run(&p, &src, &b, fd)
+	// F12 AND F31, AND THE ORDER OF THESE THREE LINES IS THE WHOLE FIX.
+	//
+	// This used to be `if err := rt.run(...); err != nil { fmt.eprintln(...) }`
+	// as the last statement of main, which got both halves wrong.
+	//
+	// (1) WHERE THE MESSAGE WENT. The eprintln ran BEFORE the deferred
+	// term_restore, so with alt = true above it was written into the ALTERNATE
+	// SCREEN -- and the very next thing the process did was write `\e[?1049l`,
+	// which throws that buffer away. Every init-time Terminal_Error ("frame
+	// arena init failed", "dispatcher/mailbox allocation failed"), every
+	// Panicked_Error with the panic text in it, and Interrupted_Error were all
+	// invisible. This example is the only place in the repository that
+	// demonstrates the alt-screen shape, so it is the copy every third-party
+	// app inherits. term_restore() first, THEN print.
+	//
+	// (2) THE EXIT STATUS. Nothing set one, so a session that ended in
+	// Panicked_Error was indistinguishable from a clean quit to any caller --
+	// a crash undetectable by both the human (see (1)) and the script.
+	// rt.exit_code maps nil -> 0, Interrupted_Error -> 130 (128 + SIGINT, the
+	// shell convention: an external signal is a request, not a fault) and the
+	// rest -> 1.
+	//
+	// term_restore is idempotent (term.odin), so calling it here and letting
+	// the defer call it again on the success path costs nothing.
+	if err != nil {
+		rt.term_restore()
+		fmt.eprintln("error:", err)
+		os.exit(rt.exit_code(err))
+	}
 }

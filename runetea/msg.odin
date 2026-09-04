@@ -25,6 +25,47 @@ import "core:strings"
 // does without needing the doc comment. See the decision doc for the fuller
 // discussion, including why the borrowing accessor is still offered at all
 // rather than removed.
+//
+// READING ONE OUT OF A TYPE SWITCH -- the control structure every `update`
+// uses, and the one place the two accessors behave differently:
+//
+//     switch v in msg {
+//     case Err_Msg:
+//         s := msg_text_clone(v.reason, alloc)     // works, allocates
+//         r := v.reason                            // works, allocates nothing
+//         t := msg_text_string(&r)                 // ... via a named copy
+//         u := msg_text_string(&v.reason)          // DOES NOT COMPILE
+//     }
+//
+// `Cannot take the pointer address of 'v.reason'`: Odin's `switch v in` binding
+// is not addressable, so nothing can take its address or slice a fixed array
+// out of it. That is not special to Msg_Text -- `v.buf[:v.n]` on ANY fixed-array
+// field of ANY Msg fails the same way ("value is not addressable"), and the one
+// line that fixes all of them is `vv := v` at the top of the case. Note the rule
+// is specifically about `switch v in`: `if pm, ok := msg.(Err_Msg); ok` binds an
+// ordinary local, and `&pm.reason` compiles there.
+//
+// THE SIGNATURE WAS RE-EXAMINED RATHER THAN JUST DOCUMENTED, and it stays as it
+// is. Three alternatives were measured and all three are worse:
+//   - `msg_text_string(m: Msg_Text)` -- taking the value. This is the version
+//     that already existed once and was reverted; see this proc's own comment
+//     below for the live failure. It cannot work: the returned string would
+//     point into the callee's copy;
+//   - `msg_text_string(#by_ptr m: Msg_Text)`, which would let the call site drop
+//     the '&' entirely. TRIED: the syntax is accepted by this compiler, but the
+//     parameter is still not addressable inside the proc, so `m.buf[:m.len]`
+//     fails to compile and the idea dies at the definition, not the call;
+//   - a new `msg_text_read(m: Msg_Text, into: ^[MSG_TEXT_CAP]u8) -> string`,
+//     copying into caller storage. It compiles, but the call site needs a
+//     255-byte scratch declaration -- strictly more code than the `r := v.reason`
+//     line it would replace, for the same copy. Adding API that loses to the
+//     workaround is not an improvement.
+// So: `msg_text_clone` for one line (and inside `update` the allocator is the
+// per-frame arena, so the copy costs a bump and is freed with the frame), or the
+// two-line named copy when the allocation genuinely must not happen.
+// test_msg_text_reads_out_of_a_type_switch_binding pins both spellings, so a
+// future signature change that breaks them fails the suite instead of the user's
+// build.
 Msg_Text :: struct {
 	buf: [MSG_TEXT_CAP]u8,
 	len: u8,

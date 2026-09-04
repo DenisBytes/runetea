@@ -1,10 +1,22 @@
 package runegloss
 
-// RuneGloss's own limitations -- no wrapping, no truncation, no layout joins,
-// `width`/`height` as FLOORS rather than clamps, non-canonical SGR resets that
-// silently lose the outer style, the colour-conversion caps -- are consolidated
-// with RuneTea's in ../docs/LIMITATIONS.md, section 7. Read it before assuming
-// this is Lipgloss with different spelling; it is deliberately a subset.
+import rt "../runetea"
+
+// RuneGloss's own limitations -- non-canonical SGR resets that silently lose the
+// outer style, the colour-conversion caps -- are consolidated with RuneTea's in
+// ../docs/LIMITATIONS.md, section 7. Read it before assuming this is Lipgloss
+// with different spelling; it is deliberately a subset.
+//
+// THREE ITEMS ON THAT LIST ARE GONE, and the reason is worth stating here rather
+// than only in the changelog, because the old behaviour was the package's single
+// largest design mistake. `width`/`height` USED TO BE FLOORS: content wider than
+// `width` widened the box and dragged the right border with it. That is not an
+// overflow, it is a SHEAR -- the widened box pushes past the terminal margin,
+// DECAWM wraps it, and every row below it in the frame is displaced. One long
+// file path in one panel destroyed the layout of panels it had nothing to do
+// with. `width` is now EXACT (see below), and `wrap`, `truncate`,
+// `join_horizontal` and `join_vertical` exist so that clamping has somewhere to
+// put the text it no longer lets overflow.
 //
 // The Style value and its setters.
 //
@@ -65,11 +77,71 @@ Style :: struct {
 	pad: [Side]int,
 	mar: [Side]int,
 
-	// A FLOOR, NOT A CLAMP. `width` is the width of the PADDED box (content
-	// area + horizontal padding), excluding border and margin; `height` is that
-	// box's row count. Content wider or taller than the request widens the box
-	// -- RuneGloss never wraps and never truncates. See render's own note.
+	// EXACT, NOT A FLOOR, and INCLUSIVE OF THE BORDER. `width` is the total
+	// number of columns the block occupies excluding margin -- left border +
+	// left padding + content + right padding + right border -- and `height` is
+	// the same for rows. 0 means "unconstrained": the block is whatever its
+	// content makes it, which is the zero-value-does-nothing rule this package
+	// keeps everywhere else.
+	//
+	// TWO CHANGES FROM THE ORIGINAL DESIGN, both deliberate, both breaking.
+	//
+	// (1) EXACT RATHER THAN A FLOOR. The old `width` was a minimum: content
+	// wider than it widened the box. That makes `width` useless for the only
+	// thing a width is for. A layout primitive whose output width is not a
+	// function of its declared width is not a layout primitive -- you cannot
+	// build a column, a panel or a join out of it, because the row you compute
+	// on paper is not the row that reaches the terminal. Worse, the failure is
+	// NOT confined to the offending box: the widened box runs past the terminal
+	// margin, DECAWM wraps it, and every subsequent row of the whole frame is
+	// displaced (and, under .Full_Screen/.Diff, the doubled row cost is charged
+	// against term_height and the bottom of the frame is silently deleted).
+	//
+	// The old comment defended flooring as "silently cutting a user's text would
+	// be worse than a block that visibly overflows". That premise was right and
+	// the conclusion did not follow, because cutting is not the only way to fit:
+	// the DEFAULT overflow policy is .Wrap, which loses no byte at all, it just
+	// moves it. Cutting is available (.Truncate) for the places an app knows one
+	// row is what it wants -- a status bar, a table cell -- and the old floor
+	// behaviour is still reachable, spelled out loud, as .Grow.
+	//
+	// (2) INCLUSIVE OF THE BORDER, which lipgloss v2 also does (style.go:408,
+	// `width -= horizontalBorderSize`) and lipgloss v0/v1 did not. RuneTea names
+	// v2 as its target, so matching v1 here was a silent 2-column-per-box error
+	// for anyone porting. But the decisive argument is local: if `width`
+	// excluded the border, then `rg.width(&s, 40)` could not be written at all
+	// without first knowing the border's own column cost, so `border()` would
+	// have to be called BEFORE `width()` and setter order would become
+	// load-bearing -- exactly the trap the border()/border_sides() note below
+	// exists to avoid. With the border included, `rg.width(&s, 40)` means "40
+	// columns" no matter what order anything is set in.
+	//
+	// MARGIN IS OUTSIDE, matching lipgloss: a margin is space BETWEEN blocks,
+	// not part of one. Total rendered columns are width + mar[.Left] +
+	// mar[.Right]. frame_size() reports the whole non-content cost including
+	// margin, the way lipgloss's GetHorizontalFrameSize does.
+	//
+	// A width smaller than the frame it must contain clamps the content area to
+	// zero rather than going negative; the block is then exactly as wide as its
+	// own border and padding, which is the least surprising floor there is.
 	width, height: int,
+
+	// What happens to content that does not fit `width`/`height`. Inert while
+	// both are 0, which is why .Wrap can be the zero value without violating
+	// "a fresh Style renders its input byte for byte".
+	overflow: Overflow,
+
+	// The tail .Truncate appends when it cuts, e.g. "…". A Border_Cell for
+	// exactly the reason border.odin gives -- Style must stay POD, and a
+	// `string` field here would be a dangling read the first time someone built
+	// one out of a heap buffer and stored the Style in their model.
+	//
+	// THE ZERO VALUE IS NO TAIL AT ALL, not "…". A truncation that silently ate
+	// one more column for a glyph the caller never asked for is precisely the
+	// kind of surprise the zero-value rule exists to prevent. The standalone
+	// truncate() defaults to "…" instead, because there the caller is asking for
+	// a truncation by name and a visible cut mark is what they want.
+	ellipsis: Border_Cell,
 
 	align_h: Align_H,
 	align_v: Align_V,
@@ -82,12 +154,52 @@ Style :: struct {
 	border_fg:    Color,
 	border_bg:    Color,
 
-	// Passed through to every rt.display_width call this package makes. See
-	// runetea's Width_Options: East_Asian_Width=Ambiguous runes (including
-	// every box-drawing character) are 1 or 2 columns depending on the
-	// terminal, and there is no universally correct answer. Leave false unless
-	// the target terminal is known to render them double-wide.
-	ambiguous_wide: bool,
+	// THE WHOLE Width_Options VALUE, not a hand-copied bool per knob. Passed
+	// through verbatim to every rt.display_width call this package makes.
+	//
+	// It used to be `ambiguous_wide: bool`, unpacked into a fresh
+	// rt.Width_Options at the top of render. That shape has a standing bug in
+	// it: every knob runetea's width layer grows has to be re-declared here, a
+	// setter written for it, and the unpack extended -- and until someone does,
+	// the knob is UNREACHABLE from a Style even though the width layer supports
+	// it. That is the shape the emoji complaint had: how many columns a terminal
+	// paints for a skin-tone modifier, a ZWJ sequence or a keycap is a matter on
+	// which real terminals disagree violently (VTE paints "👨‍💻" as 4 columns and
+	// "❤️" as 1, where the UCD emoji-presentation rules say 2 and 2), RuneGloss
+	// pads every row to runetea's number, and an application that KNEW its
+	// terminal had no way to say so. It does now -- rt.Width_Options.emoji_width
+	// is that policy, and it arrived here for free, without a line changing in
+	// this struct, which is the property embedding the options value buys.
+	// `emoji_width` below is a convenience over it, not the mechanism.
+	//
+	// rt.Width_Options is POD, so Style stays POD -- asserted in the tests.
+	wopts: rt.Width_Options,
+}
+
+// What render does with content that does not fit `width`/`height`.
+//
+// .Wrap IS THE ZERO VALUE and the default. It is the only policy that loses
+// nothing: a long line is reflowed at word boundaries (and hard-broken at
+// grapheme-cluster boundaries when a single word is wider than the box), so
+// every byte the caller passed in is still on screen. That is what makes an
+// exact `width` safe to have made the default -- see Style.width.
+Overflow :: enum u8 {
+	// Reflow to fit. Horizontally: greedy word wrap, hard-breaking words that
+	// cannot fit on a line of their own. Vertically: excess rows are dropped
+	// (there is no "reflow" for rows), from the end under .Top, the start under
+	// .Bottom, and both ends under .Middle -- i.e. the rows kept are the ones
+	// the vertical alignment says are nearest the anchor.
+	Wrap,
+	// Cut each line at `width` and append Style.ellipsis. Rows beyond `height`
+	// are dropped exactly as under .Wrap.
+	Truncate,
+	// The pre-clamp behaviour, kept and named rather than deleted: `width` and
+	// `height` become floors again and over-budget content widens or lengthens
+	// the block. Correct when the caller has already guaranteed the fit and
+	// wants to pay nothing for a re-measure, and the only honest way to render
+	// content that must not be altered at any cost. Read Style.width for what
+	// it does to a frame when that guarantee turns out to be false.
+	Grow,
 }
 
 // A Style with the process-wide detected profile (see default_profile) and
@@ -150,8 +262,26 @@ margin_trbl :: proc(s: ^Style, t, r, b, l: int) {
 	s.mar[.Top], s.mar[.Right], s.mar[.Bottom], s.mar[.Left] = max(t, 0), max(r, 0), max(b, 0), max(l, 0)
 }
 
+// EXACT COLUMNS AND ROWS, border included, margin excluded. See Style.width for
+// the full argument; the short version is that a `width` that only ever made a
+// block wider could not be used to build a layout, and that including the border
+// is what keeps `rg.width(&s, 40)` independent of the order the other setters
+// are called in.
+//
+// 0 restores "unconstrained". Negative is clamped to 0 for the same reason a
+// negative padding is: it has no meaning, and letting one through would make
+// every downstream width assertion off by it.
 width  :: proc(s: ^Style, w: int) { s.width  = max(w, 0) }
 height :: proc(s: ^Style, h: int) { s.height = max(h, 0) }
+
+// What to do when the content does not fit. See Overflow.
+overflow :: proc(s: ^Style, o: Overflow) { s.overflow = o }
+
+// The tail .Truncate appends when it cuts -- "…", "...", ">" or "". Longer than
+// BORDER_CELL_CAP yields an EMPTY tail rather than a clipped one, because a
+// clipped multi-byte glyph is invalid UTF-8 on the wire; same contract as
+// border_cell, which is the proc this calls.
+ellipsis :: proc(s: ^Style, tail: string) { s.ellipsis = border_cell(tail) }
 
 align  :: proc(s: ^Style, a: Align_H) { s.align_h = a }
 valign :: proc(s: ^Style, a: Align_V) { s.align_v = a }
@@ -176,4 +306,86 @@ border_sides :: proc(s: ^Style, sides: Sides) { s.border_sides = sides }
 border_fg :: proc(s: ^Style, c: Color) { s.border_fg = c }
 border_bg :: proc(s: ^Style, c: Color) { s.border_bg = c }
 
-ambiguous_wide :: proc(s: ^Style, on: bool) { s.ambiguous_wide = on }
+// The width knobs: two named policies and one total. `ambiguous_wide` and
+// `emoji_width` are the two an application actually reaches for, because they
+// are the two questions the terminal answers differently and never reports --
+// East_Asian_Width=Ambiguous runes (curly quotes, box-drawing, Greek, Cyrillic)
+// are 1 or 2 columns depending on the terminal, and a multi-rune emoji cluster
+// is one advance or one per rune depending on it too. `width_options` exists so
+// that no future knob runetea adds needs a new setter here to be reachable. See
+// Style.wopts.
+//
+// WHAT emoji_width IS FOR, concretely: a box drawn around "👨‍💻" pads its content
+// row to rt.display_width's number, which under the default .Grapheme_Cluster
+// is 2. A VTE-based terminal (GNOME Terminal, Tilix, Terminator, xfce4) paints
+// that cluster 4 columns wide, so the row runs 2 columns long and the right
+// border lands outside the frame; "❤️" and "1️⃣" go the other way and pull it 1
+// column inside. `emoji_width(&s, .Legacy_Wcwidth)` makes every measurement in
+// this package -- padding, wrapping, truncation, join alignment and `measure`
+// -- agree with that family of terminals instead. rt.Emoji_Width carries the
+// measured table of which terminals want which, and there is no autodetect:
+// nothing in the terminal protocol reports it.
+ambiguous_wide :: proc(s: ^Style, on: bool) { s.wopts.ambiguous_is_wide = on }
+emoji_width    :: proc(s: ^Style, p: rt.Emoji_Width) { s.wopts.emoji_width = p }
+width_options  :: proc(s: ^Style, o: rt.Width_Options) { s.wopts = o }
+
+// ---------------------------------------------------------------------------
+// frame geometry
+// ---------------------------------------------------------------------------
+
+// THE COLUMNS AND ROWS THAT ARE NOT CONTENT: margin + border + padding. This is
+// lipgloss's GetHorizontalFrameSize/GetVerticalFrameSize, and it is here because
+// without it an application cannot compute a layout AT ALL. The border's own
+// column cost is not a constant an app can assume: it is the display width of
+// the widest glyph that can appear in each vertical edge (a custom border may be
+// 2 columns, or fullwidth CJK), computed from the same rt.display_width the
+// renderer pads with, and there was previously no way to reach it from outside.
+//
+// NOTE THE ASYMMETRY WITH Style.width, which is deliberate and is lipgloss's:
+// `width` includes border and padding but NOT margin, while frame_size includes
+// all three. So the total columns a block occupies are
+//
+//	width + mar[.Left] + mar[.Right]           when width > 0
+//	content_width + horizontal_frame_size(s)   when width == 0
+//
+// and the content area inside a constrained block is
+//
+//	width - (horizontal_frame_size(s) - mar[.Left] - mar[.Right])
+//
+// which is what render computes. An app laying out two panels across `cols`
+// columns wants the first form: `rg.width(&panel, cols/2 - panel.mar[.Left] -
+// panel.mar[.Right])`.
+@(require_results)
+frame_size :: proc(s: Style) -> (w, h: int) {
+	return horizontal_frame_size(s), vertical_frame_size(s)
+}
+
+@(require_results)
+horizontal_frame_size :: proc(s: Style) -> int {
+	bw, _ := border_size(s)
+	return s.mar[.Left] + s.mar[.Right] + s.pad[.Left] + s.pad[.Right] + bw
+}
+
+@(require_results)
+vertical_frame_size :: proc(s: Style) -> int {
+	_, bh := border_size(s)
+	return s.mar[.Top] + s.mar[.Bottom] + s.pad[.Top] + s.pad[.Bottom] + bh
+}
+
+// The border's own cost, in columns and rows. Split out from frame_size because
+// it is the piece an application genuinely CANNOT recompute: `bw` is not "2 if
+// bordered", it is the max display width of the glyphs that can land in each
+// vertical edge, under this Style's own width options, and a partial
+// border_sides may contribute only one side or none.
+//
+// Rows are 0 or 1 per horizontal edge unconditionally -- a border row is one row
+// however wide its glyph is.
+@(require_results)
+border_size :: proc(s: Style) -> (w, h: int) {
+	if !s.bordered { return 0, 0 }
+	sc := s   // cell_str borrows a ^Border_Cell; `s` is a parameter and not addressable
+	lw, rw := edge_widths(&sc)
+	if .Top    in s.border_sides { h += 1 }
+	if .Bottom in s.border_sides { h += 1 }
+	return lw + rw, h
+}

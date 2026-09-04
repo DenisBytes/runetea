@@ -1,7 +1,16 @@
+#+private
+// ^ Every declaration in this file is package-private, so that `odin doc
+//   runetea` / `odin doc runegloss` -- the command README.md and docs/API.md
+//   hand a newcomer for symbol discovery -- lists the library rather than the
+//   test fixtures. Pinned by tools/doccheck/run.sh's `apidoc` check, which is
+//   also where the argument for it is written out.
 package runetea
 
+import "core:mem/virtual"
+import "core:strings"
 import "core:sync"
 import "core:testing"
+import "core:thread"
 import "core:time"
 
 // Fetch_Env is Cmd env, not a Msg -- it is never passed to box() (cmd_from
@@ -236,7 +245,7 @@ test_detached_cmds_exceed_pool_width_without_deadlock :: proc(t: ^testing.T) {
 // dispatcher_destroy must block until every detached Cmd it ever dispatched
 // has actually finished, not just until the pool workers are joined --
 // thread.Pool's join (thread.pool_finish/pool_destroy) says nothing about a
-// detached Cmd's self_cleanup thread, which is tracked nowhere else. If
+// detached Cmd's own thread, which the pool never sees. If
 // dispatcher_destroy returned early, a caller's very next line -- typically
 // mailbox_destroy, per mailbox.odin's own documented precondition -- would
 // free the mailbox out from under a detached Cmd still mid mailbox_send.
@@ -409,4 +418,371 @@ test_cancel_token_observed_by_a_polling_cmd :: proc(t: ^testing.T) {
 	testing.expectf(t, probe.iterations < 5,
 		"cancellation should be observed within a couple of 5ms poll intervals, not after running the full bound -- took %d iterations",
 		probe.iterations)
+}
+
+// ---------------------------------------------------------------------------
+// A Cmd IS SINGLE-USE (cmd.odin's Cmd ledger). These pin the enforcement per
+// Cmd kind -- cmd_from here, batch()/sequence() in batch_test.odin,
+// tick()/every() in timer_test.odin -- because each kind owns a DIFFERENT
+// shape of heap memory and each one failed differently before the ledger
+// existed.
+//
+// What this test used to do on this toolchain, verbatim: dispatch the same
+// cmd_from Cmd twice, run the body against freed env, then free the same
+// pointer a second time -- SIGSEGV (exit 139) under the default allocator,
+// 3/3 runs, and a hard "Tracking allocator error: Bad free" abort under
+// odin test's own Tracking_Allocator, which is what this test would have
+// produced. Neither is a test failure a suite can survive to report, which
+// is exactly why the fix had to make the second dispatch a REFUSAL and not
+// merely a documented hazard.
+//
+// Both messages are counted rather than ordered: dispatch #1 lands on a pool
+// worker while the refusal for dispatch #2 is delivered inline on this
+// thread, so either can reach the mailbox first.
+@(test)
+test_redispatching_a_cmd_from_is_refused_with_a_diagnostic :: proc(t: ^testing.T) {
+	m: Mailbox
+	testing.expect_value(t, mailbox_init(&m, 16), nil)
+	d: Dispatcher
+	dispatcher_init(&d, &m, 2)
+
+	c := cmd_from(fetch_run, Fetch_Env{url = "once"}, context.allocator)
+	dispatch(&d, c)
+	dispatch(&d, c)
+
+	results, refusals := 0, 0
+	for _ in 0 ..< 2 {
+		msg, ok := mailbox_recv(&m)
+		defer box_free(msg, context.allocator)   // per-iteration: Odin scopes defer to the loop BODY
+		testing.expect(t, ok, "expected one result and one refusal")
+		if _, is := msg.(Fetch_Result); is { results += 1 }
+		if p, is := msg.(Panicked_Msg); is {
+			refusals += 1
+			text := p.message
+			testing.expectf(t, strings.contains(msg_text_string(&text), "already dispatched"),
+				"the refusal must say what went wrong, got %q", msg_text_string(&text))
+			testing.expectf(t, strings.contains(msg_text_string(&text), "cmd_from"),
+				"the refusal must name the Cmd kind, got %q", msg_text_string(&text))
+		}
+	}
+	testing.expect_value(t, results, 1)
+	testing.expect_value(t, refusals, 1)
+
+	dispatcher_destroy(&d)
+	mailbox_destroy(&m)
+}
+
+// The other half of the contract, and the reason the ledger uses a ticket
+// rather than "does this Cmd own a pointer": cmd_nil() and quit_cmd() own
+// nothing, so they carry the zero ticket and stay dispatchable forever.
+// Existing code returns exactly these from update() on every single keystroke,
+// so a guard that refused the second one would break every app in the repo
+// rather than fix anything.
+@(test)
+test_cmd_nil_and_quit_cmd_survive_repeated_dispatch :: proc(t: ^testing.T) {
+	m: Mailbox
+	testing.expect_value(t, mailbox_init(&m, 16), nil)
+	d: Dispatcher
+	dispatcher_init(&d, &m, 2)
+
+	nilc := cmd_nil()
+	quit := quit_cmd()
+	for _ in 0 ..< 4 {
+		dispatch(&d, nilc)    // must produce nothing at all, not even a refusal
+		dispatch(&d, quit)
+	}
+
+	quits := 0
+	for _ in 0 ..< 4 {
+		msg, ok := mailbox_recv(&m)
+		defer box_free(msg, context.allocator)
+		testing.expect(t, ok, "expected four Quit_Msgs")
+		if _, is := msg.(Quit_Msg);     is { quits += 1 }
+		if _, is := msg.(Panicked_Msg); is { testing.fail_now(t, "a Cmd that owns nothing must never be refused") }
+	}
+	testing.expect_value(t, quits, 4)
+
+	dispatcher_destroy(&d)
+	mailbox_destroy(&m)
+}
+
+// F15: dispatch_ex's detached branch used to DISCARD
+// thread.create_and_start_with_data's return value, one line after
+// wait_group_add had already incremented d.inflight. On this toolchain that
+// call returns nil -- silently, no fault -- whenever pthread_create fails
+// (thread_unix.odin:122-125), measured at 16-100 nil returns per 100 spawns
+// under an RLIMIT_NPROC that perturbs nothing else. The Cmd then never ran and
+// d.inflight stayed permanently +1, so dispatcher_destroy's wait_group_wait
+// below NEVER RETURNED.
+//
+// That is why this test drives the failure through g_cmd_force_spawn_failure
+// instead of an rlimit: the pre-fix failure is a hang, not a wrong value, and
+// a hang cannot be asserted on from inside the process it hangs. Run against
+// the pre-fix dispatch_ex this test does not fail, it wedges the whole suite --
+// which is precisely the user-visible symptom (run_nbio() frozen with the
+// terminal still raw, no diagnostic, after the model already returned
+// quit_cmd).
+@(test)
+test_a_failed_detached_spawn_reports_and_does_not_wedge_teardown :: proc(t: ^testing.T) {
+	m: Mailbox
+	testing.expect_value(t, mailbox_init(&m, 16), nil)
+	d: Dispatcher
+	dispatcher_init(&d, &m, 2)
+
+	sync.atomic_store(&g_cmd_force_spawn_failure, true)
+	dispatch(&d, cmd_from(fetch_run, Fetch_Env{url = "never runs"}, context.allocator, detached = true))
+	sync.atomic_store(&g_cmd_force_spawn_failure, false)
+
+	msg, ok := mailbox_recv(&m)
+	defer box_free(msg, context.allocator)
+	testing.expect(t, ok, "a Cmd that could not be started must SAY so, not vanish")
+	p, is := msg.(Panicked_Msg)
+	testing.expect(t, is, "expected a Panicked_Msg reporting the failed spawn")
+	if is {
+		text := p.message
+		testing.expectf(t, strings.contains(msg_text_string(&text), "could not start a thread"),
+			"the report must name the failure, got %q", msg_text_string(&text))
+	}
+
+	// The whole point: this returns. Pre-fix it blocked forever on an
+	// inflight count that nothing would ever decrement.
+	dispatcher_destroy(&d)
+	mailbox_destroy(&m)
+}
+
+// F35: back-pressure used to be a bare `case .Full: thread.yield()` with no
+// backoff at all, which spins a producer thread at ~100% of a core for as long
+// as the consumer stays behind. The CPU cost is not something a portable test
+// can assert on without being flaky, so what this pins is the property the
+// backoff must NOT break while fixing that: retry-on-Full is still
+// retry-FOREVER, so a deliberately overflowing burst against a deliberately
+// slow consumer still delivers every single message rather than shedding any.
+// It passed before the backoff went in and passes after; it exists so a later
+// "just drop on Full" simplification cannot land unnoticed.
+@(test)
+test_backpressure_delivers_every_message_to_a_slow_consumer :: proc(t: ^testing.T) {
+	m: Mailbox
+	testing.expect_value(t, mailbox_init(&m, 4), nil)   // deliberately tiny: 4 slots for 32 messages
+	d: Dispatcher
+	dispatcher_init(&d, &m, 4)
+
+	SENT :: 32
+	for i in 0 ..< SENT {
+		dispatch(&d, cmd_from(fetch_run, Fetch_Env{url = "burst"}, context.allocator))
+	}
+
+	got := 0
+	for _ in 0 ..< SENT {
+		msg, ok := mailbox_recv(&m)
+		defer box_free(msg, context.allocator)
+		testing.expect(t, ok, "expected every burst message")
+		if _, is := msg.(Fetch_Result); is { got += 1 }
+		time.sleep(200 * time.Microsecond)   // stay behind the producers on purpose
+	}
+	testing.expect_value(t, got, SENT)
+
+	dispatcher_destroy(&d)
+	mailbox_destroy(&m)
+}
+
+// ---------------------------------------------------------------------------
+// Detached-Cmd thread lifetime (cmd.odin's WHY self_cleanup = false comment).
+//
+// The defect these two pin is a DATA RACE, not a wrong answer, and a race test
+// that merely runs the code proves nothing: ./tools/test.sh race caught the
+// self_cleanup free racing _start's sync.post 2 times in 13 under real load
+// and 0 times in 90 direct runs on an idle box. So these assert the STRUCTURE
+// that removes the race instead of trying to observe the race: cmd.odin can
+// only pass self_cleanup = false if something else joins and frees each
+// `^Thread`, and d.detached_threads is that something. Both tests fail to
+// COMPILE against the pre-fix file (there was no such field), and both fail at
+// runtime against any later edit that keeps the field but drops half the
+// scheme -- which is the regression they are actually here to catch, since
+// self_cleanup = false with no sweep is heap growth proportional to how many
+// detached Cmds have ever run, i.e. strictly worse than the race.
+// ---------------------------------------------------------------------------
+
+// Waits until every recorded detached thread reports .Done, so the assertion
+// after it is about the SWEEP rather than about scheduling luck. Returns false
+// on timeout; the caller reports that as its own failure rather than hanging
+// the suite.
+detached_threads_all_done :: proc(d: ^Dispatcher, within: time.Duration) -> bool {
+	start := time.tick_now()
+	for time.tick_since(start) < within {
+		all := true
+		sync.mutex_lock(&d.detached_mu)
+		for th in d.detached_threads {
+			if !thread.is_done(th) { all = false; break }
+		}
+		sync.mutex_unlock(&d.detached_mu)
+		if all { return true }
+		time.sleep(time.Millisecond)
+	}
+	return false
+}
+
+@(test)
+test_detached_cmd_threads_are_swept_by_the_next_dispatch :: proc(t: ^testing.T) {
+	m: Mailbox
+	testing.expect_value(t, mailbox_init(&m, 8), nil)
+	defer mailbox_destroy(&m)
+
+	d: Dispatcher
+	dispatcher_init(&d, &m, 2)
+	defer dispatcher_destroy(&d)
+
+	// Strictly SEQUENTIAL: each Cmd's result is received before the next one
+	// is dispatched, so peak concurrency is one and a correctly swept
+	// Dispatcher must hold one `^Thread` at a time no matter how many run.
+	ROUNDS :: 32
+	for _ in 0 ..< ROUNDS {
+		dispatch(&d, cmd_from(fetch_run, Fetch_Env{url = "sweep"}, context.allocator, detached = true))
+		msg, ok := mailbox_recv(&m)
+		defer box_free(msg, context.allocator)
+		testing.expect(t, ok, "expected each detached result")
+	}
+
+	// Receiving a result only proves the BODY finished -- the thread may still
+	// be inside the entry proc's epilogue, and a thread that is not .Done yet
+	// is one the sweep is right to leave alone.
+	testing.expect(t, detached_threads_all_done(&d, 2 * time.Second), "detached threads did not reach .Done")
+
+	dispatch(&d, cmd_from(fetch_run, Fetch_Env{url = "sweep"}, context.allocator, detached = true))
+	msg, ok := mailbox_recv(&m)
+	defer box_free(msg, context.allocator)
+	testing.expect(t, ok, "expected the final detached result")
+
+	// One: the ROUNDS finished threads were joined and freed by this last
+	// dispatch's sweep, and only its own thread remains recorded. Without the
+	// sweep this is ROUNDS + 1 and grows for the life of the Dispatcher.
+	sync.mutex_lock(&d.detached_mu)
+	live := len(d.detached_threads)
+	sync.mutex_unlock(&d.detached_mu)
+	testing.expect_value(t, live, 1)
+}
+
+@(test)
+test_dispatcher_destroy_frees_every_detached_thread :: proc(t: ^testing.T) {
+	m: Mailbox
+	testing.expect_value(t, mailbox_init(&m, 16), nil)
+	defer mailbox_destroy(&m)
+
+	d: Dispatcher
+	dispatcher_init(&d, &m, 2)
+
+	// Deliberately CONCURRENT and deliberately undrained: nothing here sweeps,
+	// so every one of these threads is still recorded when destroy runs. The
+	// slow body also puts real time between the spawn and the join, so the
+	// drain is exercised against threads that are genuinely still running
+	// rather than ones that happened to finish first.
+	CMDS :: 6
+	for _ in 0 ..< CMDS {
+		dispatch(&d, cmd_from(fetch_run, Fetch_Env{url = "drain", delay = 20 * time.Millisecond}, context.allocator, detached = true))
+	}
+	sync.mutex_lock(&d.detached_mu)
+	recorded := len(d.detached_threads)
+	sync.mutex_unlock(&d.detached_mu)
+	testing.expect_value(t, recorded, CMDS)
+
+	dispatcher_destroy(&d)
+
+	// Empty AND released: the drain joins each thread, frees each `^Thread`
+	// and deletes the array itself. odin test's tracking allocator is the
+	// other half of this assertion -- a `^Thread` the drain missed shows up as
+	// a leak at thread_unix.odin:_create, which tools/test.sh's leak audit
+	// allows exactly once (for dispatcher_reap's deliberate one-per-session
+	// leak) and would flag here.
+	testing.expect_value(t, len(d.detached_threads), 0)
+	testing.expect_value(t, cap(d.detached_threads), 0)
+
+	for _ in 0 ..< CMDS {
+		msg, ok := mailbox_recv(&m)
+		defer box_free(msg, context.allocator)
+		testing.expect(t, ok, "every detached result was still delivered")
+	}
+}
+
+// ============================================================================
+// F07, THE dispatch_ex BACKSTOP.
+//
+// The constructor check (cmd_from/tick/every) only fires while a frame is
+// armed, which is exactly when update() runs -- so it catches `return
+// cmd_from(fn, env, alloc)` and nothing else. This is the other population: a
+// Cmd whose env was cloned into a frame arena somewhere unarmed (a pool
+// worker, a helper that ran before the first frame) and dispatched later. Same
+// silent corruption -- the body reads a zeroed env and answers with nothing --
+// and much harder to diagnose, because the construction and the damage are in
+// different places.
+//
+// dispatch_ex REPORTS rather than panicking, and that is forced rather than
+// chosen: apply_msg dispatches AFTER guarded() has returned, so a panic there
+// would abort the process instead of ending the session. The report carries
+// CMD_ALLOC_CONTRACT_PANIC's prefix, which apply_msg escalates to
+// Panicked_Error -- so what the caller sees matches the constructor's refusal.
+// ============================================================================
+@(test)
+test_dispatch_refuses_a_cmd_whose_env_lives_in_the_frame_arena :: proc(t: ^testing.T) {
+	fa: Frame_Arena
+	testing.expect_value(t, frame_arena_init(&fa), nil)
+	defer frame_arena_destroy(&fa)
+
+	m: Mailbox
+	testing.expect_value(t, mailbox_init(&m, 8), nil)
+	d: Dispatcher
+	dispatcher_init(&d, &m, 2)
+
+	// Built with no frame armed: the constructor cannot know, and does not
+	// refuse. This is the smuggled-allocator shape, spelled out.
+	c := cmd_from(fetch_run, Fetch_Env{url = "never runs"}, frame_allocator(&fa))
+
+	prev := frame_guard_arm(frame_allocator(&fa))
+	dispatch(&d, c)
+	frame_guard_disarm(prev)
+
+	msg, ok := mailbox_recv(&m)
+	defer box_free(msg, context.allocator)
+	if !testing.expect(t, ok, "the refusal must arrive on the mailbox") { return }
+	p, is := msg.(Panicked_Msg)
+	if !testing.expectf(t, is, "a Cmd env allocated from the live frame arena must be refused, not run against reclaimed memory -- got %v", msg) { return }
+	text := p.message
+	testing.expect(t, is_cmd_alloc_contract_panic(msg_text_string(&text)),
+		"the report must carry the contract marker, so apply_msg escalates it to a session-ending Panicked_Error rather than leaving it in an empty `case Panicked_Msg`")
+
+	dispatcher_destroy(&d)
+	mailbox_destroy(&m)
+}
+
+// THE FALSE-POSITIVE THIS DESIGN REFUSES TO HAVE. Comparing only against
+// virtual.arena_allocator_proc would have been one line shorter and would have
+// rejected EVERY virtual.Arena in the program -- including an application's own
+// long-lived one, which outlives every frame and is a perfectly correct home
+// for a Cmd env. Refusing legal code is worse than the miss it prevents, so the
+// `data` half of the comparison is what does the real work: the arena of the
+// frame currently being processed, and no other.
+@(test)
+test_an_applications_own_arena_is_not_mistaken_for_the_frame_arena :: proc(t: ^testing.T) {
+	fa: Frame_Arena
+	testing.expect_value(t, frame_arena_init(&fa), nil)
+	defer frame_arena_destroy(&fa)
+
+	mine: virtual.Arena
+	testing.expect_value(t, virtual.arena_init_growing(&mine), nil)
+	defer virtual.arena_destroy(&mine)
+
+	prev := frame_guard_arm(frame_allocator(&fa))
+	defer frame_guard_disarm(prev)
+
+	testing.expect(t, is_frame_allocator(frame_allocator(&fa)),
+		"the armed frame arena's own allocator must be recognised -- that is the whole check")
+	testing.expect(t, !is_frame_allocator(virtual.arena_allocator(&mine)),
+		"an application's own virtual.Arena is NOT the frame arena and must not be refused")
+	testing.expect(t, !is_frame_allocator(context.allocator),
+		"context.allocator is the correct answer and must never be refused")
+
+	// And with nothing armed, nothing is a frame allocator -- a stale pointer
+	// from a finished session cannot start refusing later Cmds.
+	frame_guard_disarm(nil)
+	testing.expect(t, !is_frame_allocator(frame_allocator(&fa)),
+		"between frames the guard is disarmed and refuses nothing")
+	frame_guard_arm(frame_allocator(&fa))
 }

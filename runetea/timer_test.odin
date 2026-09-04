@@ -1,3 +1,9 @@
+#+private
+// ^ Every declaration in this file is package-private, so that `odin doc
+//   runetea` / `odin doc runegloss` -- the command README.md and docs/API.md
+//   hand a newcomer for symbol discovery -- lists the library rather than the
+//   test fixtures. Pinned by tools/doccheck/run.sh's `apidoc` check, which is
+//   also where the argument for it is written out.
 package runetea
 
 import "core:mem"
@@ -526,4 +532,129 @@ test_timer_unavailable_msg_is_pod :: proc(t: ^testing.T) {
 	tu, is := msg.(Timer_Unavailable_Msg)
 	testing.expect(t, is, "Timer_Unavailable_Msg must survive a box/unbox round trip")
 	testing.expect_value(t, msg_text_string(&tu.reason), "nbio: out of file descriptors")
+}
+
+// A tick()/every() Cmd IS SINGLE-USE too (cmd.odin's Cmd ledger). This kind
+// fails through the refcount rather than through a raw free: the Cmd owns the
+// SUBSYSTEM's reference on a refcounted Timer_Handle plus the cloned fn env,
+// and timer_fire releases that reference exactly once. Dispatching the same
+// Cmd value twice armed one handle twice against one reference, so the second
+// fire decremented a refcount that was already zero and freed both the handle
+// and h.fn_env a second time -- and unlike cmd_from's env, that free happens on
+// the TIMER thread, so the corruption surfaces somewhere else entirely.
+//
+// A plain tick() is used deliberately (not tick_cancellable/every): it holds
+// exactly ONE reference, so a double release is a double free with nothing
+// left to absorb it, which is the strictest form of this test.
+@(test)
+test_redispatching_a_tick_is_refused_with_a_diagnostic :: proc(t: ^testing.T) {
+	m: Mailbox
+	testing.expect_value(t, mailbox_init(&m, 16), nil)
+	d: Dispatcher
+	dispatcher_init(&d, &m, 2)
+
+	c := tick(5 * time.Millisecond, tick_result_fn, struct{}{}, context.allocator)
+	dispatch(&d, c)
+	dispatch(&d, c)
+
+	fires, refusals := 0, 0
+	for _ in 0 ..< 2 {
+		msg, ok := mailbox_recv(&m)
+		defer box_free(msg, context.allocator)
+		testing.expect(t, ok, "expected one fire and one refusal")
+		if _, is := msg.(Tick_Result); is { fires += 1 }
+		if p, is := msg.(Panicked_Msg); is {
+			refusals += 1
+			text := p.message
+			testing.expectf(t, strings.contains(msg_text_string(&text), "tick()/every()"),
+				"the refusal must name the Cmd kind, got %q", msg_text_string(&text))
+		}
+	}
+	testing.expect_value(t, fires, 1)
+	testing.expect_value(t, refusals, 1)
+
+	dispatcher_destroy(&d)
+	mailbox_destroy(&m)
+}
+
+// ============================================================================
+// F15, THE TIMER-THREAD SITE. timer_service_ensure_started did
+//
+//     ts.thread = thread.create(timer_thread_body)
+//     ts.thread.data = ts          // SIGSEGV when pthread_create failed
+//
+// on the thread that called tick()/every() -- i.e. on the loop thread, inside
+// an ordinary update(). Surviving that store would only have moved the failure
+// to sema_wait(&ts.ready), which no thread would ever post: a hang instead.
+//
+// The recovery reuses the machinery the nbio-acquire failure already has
+// (start_failed/start_error -> one Timer_Unavailable_Msg per Dispatcher), which
+// is the point: an application does not care WHICH part of starting a timer
+// subsystem failed, only that no Tick or Every on this Dispatcher will ever
+// fire. This is deliberately NOT g_timer_force_start_failure -- that hook is
+// read INSIDE the timer thread body and so proves the opposite thing (that a
+// thread which did start can report its own failure).
+// ============================================================================
+@(test)
+test_a_failed_timer_thread_spawn_is_reported_and_does_not_crash :: proc(t: ^testing.T) {
+	m: Mailbox
+	testing.expect_value(t, mailbox_init(&m, 8), nil)
+	defer mailbox_destroy(&m)
+
+	d: Dispatcher
+	dispatcher_init(&d, &m, 2)
+
+	sync.atomic_store(&g_thread_force_create_failure, true)
+	dispatch(&d, tick(time.Millisecond, tick_result_fn, struct{}{}, context.allocator))
+	sync.atomic_store(&g_thread_force_create_failure, false)
+
+	msg, ok := recv_within(&m, time.Second)
+	defer box_free(msg, context.allocator)
+	if !testing.expect(t, ok, "a timer thread that could not be spawned must say so, not crash and not go quiet") { return }
+	tu, is := msg.(Timer_Unavailable_Msg)
+	if !testing.expectf(t, is, "expected a Timer_Unavailable_Msg, got %v", msg) { return }
+	reason := tu.reason
+	testing.expectf(t, strings.contains(msg_text_string(&reason), "could not start the timer thread"),
+		"the message must name the spawn failure rather than blaming nbio, got %q", msg_text_string(&reason))
+
+	// The other half: teardown must not join a thread that was never created.
+	// timer_service_stop sees started == true with ts.thread == nil, which is
+	// the state ensure_started leaves behind so nothing retries the spawn.
+	dispatcher_destroy(&d)
+}
+
+// ============================================================================
+// F07 for the timer constructors. tick()/every() clone their fn env into the
+// caller's allocator and read it on the TIMER thread, arbitrarily long after
+// the frame that built the Cmd has been reclaimed -- so update()'s own `alloc`
+// is even more obviously wrong here than it is for cmd_from, and was equally
+// silent. examples/spinner reissues a tick() from update() on every fire; had
+// it passed `alloc` there, every frame would have armed a timer over freed
+// memory.
+// ============================================================================
+@(private = "file")
+Tick_Frame_Model :: struct { n: int }
+
+@(private = "file")
+tick_frame_view :: proc(m: Tick_Frame_Model, alloc: mem.Allocator) -> string { return "x" }
+
+@(test)
+test_a_tick_given_updates_own_frame_allocator_is_refused :: proc(t: ^testing.T) {
+	update :: proc(m: ^Tick_Frame_Model, msg: any, alloc: mem.Allocator) -> Cmd {
+		return tick(time.Millisecond, tick_result_fn, struct{}{}, alloc)
+	}
+
+	src := input_source_from_bytes(transmute([]u8)string("x"))
+	defer input_close(&src)
+	b := strings.builder_make(); defer strings.builder_destroy(&b)
+
+	p: Program(Tick_Frame_Model)
+	program_init(&p, Tick_Frame_Model{}, update, tick_frame_view)
+
+	err := run(&p, &src, &b)
+	pe, panicked := err.(Panicked_Error)
+	defer delete(pe.message, context.allocator) // the caller owns it -- see Panicked_Error's own doc comment (tea.odin)
+	if !testing.expect(t, panicked, "a tick() built from update()'s frame allocator must be refused, not armed over memory about to be reclaimed") { return }
+	testing.expectf(t, strings.contains(pe.message, "tick()"),
+		"the refusal must name the constructor that was misused, got %q", pe.message)
 }

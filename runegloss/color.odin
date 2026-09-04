@@ -216,17 +216,41 @@ clear_default_profile :: proc() {
 // the xterm 256 palette, and down-conversion
 // ---------------------------------------------------------------------------
 
-// The 16 system colours, as xterm's defaults. THESE ARE NOT FIXED IN REALITY:
-// every terminal lets the user retheme 0-15, so the RGB values below are what
-// the SPEC says, not necessarily what the user will see. That is why they are
-// used for one thing only -- deciding WHICH of the 16 is nearest -- and never
-// as a source of truth for the 256-colour step (see nearest_256).
+// The 16 system colours. THESE ARE NOT FIXED IN REALITY: every terminal lets
+// the user retheme 0-15, so the RGB values below are what a REFERENCE terminal
+// paints, not necessarily what the user will see. That is why they are used for
+// one thing only -- deciding WHICH of the 16 is nearest -- and never as a source
+// of truth for the 256-colour step (see nearest_256).
+//
+// THESE ARE XTERM'S DEFAULTS, AND THEY DID NOT USED TO BE. This table was
+// commented "xterm's defaults" while actually holding the IBM VGA / legacy
+// conhost palette -- the dim half at 0x80 and 0xC0C0C0 for white. That is a
+// different terminal's palette, and the difference is not cosmetic: it is the
+// direct cause of the contrast collapse this table was changed to fix.
+//
+// Worked example, the one measured in the audit. #7D56F4 (a mid purple,
+// L* = 48.9) against the VGA table: the nearest entry by CIE76 is slot 4,
+// #000080, L* = 13. On a black background that is a WCAG contrast ratio of
+// 1.31:1, against 4.51:1 at truecolour -- a 3.4x collapse, and below the 3.0
+// floor at which text stops being legible at all. The arithmetic was right and
+// the answer was still unusable, because the CANDIDATE SET was wrong: the VGA
+// palette simply has no mid-lightness blue, so "nearest" had nowhere good to
+// land. xterm's real palette has #5C5CFF at slot 12 (L* = 50.6), 1.7 L* from
+// the target, and CIE76 finds it without any further help.
+//
+// Real xterm's values (charproc.c / XTerm-col.ad): the dim half is 0xCD, not
+// 0x80, slot 4 is #0000EE rather than #000080, slot 7 is #E5E5E5, slot 8 is
+// #7F7F7F, and slot 12 is #5C5CFF. termenv/lipgloss reach the same bright twins
+// from the same inputs by a different route (go-colorful's DistanceHSLuv, whose
+// /100 hue normalisation lets lightness dominate among hue-matched candidates);
+// feeding xterm's palette into the CIE76 metric below gets there too, so the
+// old bias was a TABLE artifact, not a metric one, and the metric is unchanged.
 @(private = "file")
 BASE16 := [16][3]u8{
-	{0x00, 0x00, 0x00}, {0x80, 0x00, 0x00}, {0x00, 0x80, 0x00}, {0x80, 0x80, 0x00},
-	{0x00, 0x00, 0x80}, {0x80, 0x00, 0x80}, {0x00, 0x80, 0x80}, {0xC0, 0xC0, 0xC0},
-	{0x80, 0x80, 0x80}, {0xFF, 0x00, 0x00}, {0x00, 0xFF, 0x00}, {0xFF, 0xFF, 0x00},
-	{0x00, 0x00, 0xFF}, {0xFF, 0x00, 0xFF}, {0x00, 0xFF, 0xFF}, {0xFF, 0xFF, 0xFF},
+	{0x00, 0x00, 0x00}, {0xCD, 0x00, 0x00}, {0x00, 0xCD, 0x00}, {0xCD, 0xCD, 0x00},
+	{0x00, 0x00, 0xEE}, {0xCD, 0x00, 0xCD}, {0x00, 0xCD, 0xCD}, {0xE5, 0xE5, 0xE5},
+	{0x7F, 0x7F, 0x7F}, {0xFF, 0x00, 0x00}, {0x00, 0xFF, 0x00}, {0xFF, 0xFF, 0x00},
+	{0x5C, 0x5C, 0xFF}, {0xFF, 0x00, 0xFF}, {0x00, 0xFF, 0xFF}, {0xFF, 0xFF, 0xFF},
 }
 
 // The 6x6x6 colour cube's per-channel levels. NOT evenly spaced -- the gap
@@ -378,9 +402,57 @@ nearest_256 :: proc(r, g, b: u8) -> int {
 
 // Nearest of the 16, where there is no theme-independent option to prefer --
 // 0-15 is all a 16-colour terminal has.
+//
+// TWO STEPS, AND THE SECOND ONE IS THE POINT. Plain CIE76 minimisation answers
+// "which of the 16 looks most like this", which is the right question for a
+// swatch and the WRONG one for text: a foreground is only useful if it stays
+// distinguishable from the background, and a 16-entry palette is sparse enough
+// that CIE76 regularly picks a swatch 30+ L* from the target because its hue
+// matches. #7D56F4 (L* 48.9) landing on #000080 (L* 13) is 1.31:1 on black
+// against 4.51:1 at truecolour -- below the 3.0 floor at which text stops being
+// legible at all.
+//
+// THE PALETTE'S OWN STRUCTURE IS THE FIX, and it costs no tuning parameter. The
+// 16 are eight hue families of two: i and i~8 are the DIM and BRIGHT member of
+// the same hue (0/8 black-grey, 1/9 red, 2/10 green, 3/11 yellow, 4/12 blue,
+// 5/13 magenta, 6/14 cyan, 7/15 grey-white). CIE76 is good at picking the
+// FAMILY -- that is a hue judgement, which is what Lab distance is for. Within
+// a family the only remaining freedom is lightness, and lightness is exactly
+// what contrast is made of. So: let CIE76 choose the family, then take whichever
+// twin's L* is nearer the target's.
+//
+// This CANNOT CHANGE THE HUE, which is what makes it safe to apply
+// unconditionally with no threshold. An earlier version of this fix did use a
+// threshold -- "if the winner's L* is more than 20 from the target's, re-run the
+// search over candidates inside that band" -- and it was WRONG in a way that is
+// worth recording, because it looks reasonable: for #333333 (L* 21.2) the only
+// palette entry inside the band is #0000EE, so a neutral dark grey degraded to
+// BLUE. Restricting by lightness alone will always eventually trade away hue,
+// because a sparse palette has no obligation to put a neutral where you need
+// one. Restricting to the twin never can.
+//
+// TIES KEEP CIE76'S ANSWER (`<`, not `<=`), so the result is deterministic and
+// the metric stays the tie-breaker of record.
+//
+// WHAT IT ACTUALLY CHANGES, measured rather than asserted: 40 of the 240
+// cube-and-ramp entries that .ANSI256 -> .ANSI degradation feeds it move, and
+// 20.6% of a uniform 20k sample of the 24-bit space. Every single one of those
+// moves is dim-twin-to-bright or bright-to-dim; ZERO of them change family,
+// which is a property of the rule and not of the sample.
+//
+// #333333 STILL DEGRADES TO BLACK, and that is correct rather than a residual
+// bug: #333333 on a black background is 1.66:1 AT TRUECOLOUR, i.e. already
+// unreadable before any degradation happened. Nothing here can invent contrast
+// the app never asked for -- see contrast_ratio for the check an app makes
+// instead.
+//
+// NOT APPLIED TO nearest_256. The cube plus the 24-step grey ramp sample L*
+// finely enough that the unconstrained winner is essentially always within a few
+// L* of the target, and 16-255 has no twin structure to exploit anyway.
 @(private = "file")
 nearest_16 :: proc(r, g, b: u8) -> int {
 	target := to_lab(r, g, b)
+
 	best, best_d := 0, max(f64)
 	for i in 0 ..< 16 {
 		c := BASE16[i]
@@ -388,5 +460,61 @@ nearest_16 :: proc(r, g, b: u8) -> int {
 			best, best_d = i, d
 		}
 	}
+
+	twin := best ~ 8
+	wc, tc := BASE16[best], BASE16[twin]
+	if abs(to_lab(tc[0], tc[1], tc[2])[0] - target[0]) < abs(to_lab(wc[0], wc[1], wc[2])[0] - target[0]) {
+		return twin
+	}
 	return best
+}
+
+// ---------------------------------------------------------------------------
+// contrast
+// ---------------------------------------------------------------------------
+
+// WCAG 2.x relative luminance of an sRGB colour, 0 (black) to 1 (white). Shares
+// srgb_linear with the Lab path above -- the same piecewise transfer function,
+// because it is the same sRGB.
+//
+// A .None or .ANSI colour has no defined RGB (0-15 are whatever the user's
+// theme says, and even the cube is only nominally fixed), so this takes three
+// bytes rather than a Color: making it take a Color would invite
+// contrast_ratio(color(4), ...) and quietly answer for a palette the terminal
+// may not be using.
+@(require_results)
+relative_luminance :: proc(r, g, b: u8) -> f64 {
+	return 0.2126 * srgb_linear(r) + 0.7152 * srgb_linear(g) + 0.0722 * srgb_linear(b)
+}
+
+// The WCAG contrast ratio between two sRGB colours, 1.0 (identical) to 21.0
+// (black on white). 4.5 is the AA threshold for body text, 3.0 for large text.
+//
+// EXPORTED BECAUSE DEGRADATION IS NOT CONTRAST-PRESERVING AND CANNOT BE MADE SO.
+// convert() answers "which of the 16 looks most like this", and on a palette of
+// 16 that is sometimes a colour the user cannot read. nearest_16's lightness
+// band removes the worst of it; it cannot remove all of it, because an app is
+// free to pick a foreground that had no contrast to begin with. An app that
+// cares checks -- pick the colours, run them through convert() for the profile
+// it detected, and measure -- and this is the measurement.
+@(require_results)
+contrast_ratio :: proc(fr, fg_, fb: u8, br, bg_, bb: u8) -> f64 {
+	a := relative_luminance(fr, fg_, fb)
+	b := relative_luminance(br, bg_, bb)
+	if a < b { a, b = b, a }
+	return (a + 0.05) / (b + 0.05)
+}
+
+// The RGB a given Color would paint, for contrast_ratio's sake, using the
+// reference palettes above. Returns ok=false for .None -- there is no colour to
+// measure -- and is honest in its NAME about the fact that a .ANSI index is a
+// nominal value the user's theme may have replaced.
+@(require_results)
+reference_rgb :: proc(c: Color) -> (r, g, b: u8, ok: bool) {
+	switch c.kind {
+	case .None: return 0, 0, 0, false
+	case .ANSI: r, g, b = palette_rgb(c.idx); return r, g, b, true
+	case .RGB:  return c.r, c.g, c.b, true
+	}
+	return 0, 0, 0, false
 }

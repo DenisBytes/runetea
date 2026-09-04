@@ -1,3 +1,9 @@
+#+private
+// ^ Every declaration in this file is package-private, so that `odin doc
+//   runetea` / `odin doc runegloss` -- the command README.md and docs/API.md
+//   hand a newcomer for symbol discovery -- lists the library rather than the
+//   test fixtures. Pinned by tools/doccheck/run.sh's `apidoc` check, which is
+//   also where the argument for it is written out.
 package runetea
 
 import "core:strings"
@@ -31,9 +37,11 @@ test_view_diff_safe_accepts_plain_text_styling_and_hyperlinks :: proc(t: ^testin
 @(test)
 test_view_diff_safe_rejects_control_bytes :: proc(t: ^testing.T) {
 	// \t is the one that bites in practice: it is a MOVE to the next tab stop,
-	// whose position the cell model does not track, so every cell after it is
-	// somewhere the diff does not think it is. examples/editor expands tabs to
-	// spaces for exactly this reason.
+	// and a cell grid can record what is IN a cell but not a jump between them,
+	// so every cell after it is somewhere the diff does not think it is.
+	// examples/editor expands tabs to spaces for exactly this reason. Note it is
+	// rejected HERE and accepted by view_render_safe -- see
+	// test_view_render_safe_accepts_the_one_control_byte_the_row_count_models.
 	cases := []struct{ v: string, at: int }{
 		{"a\tb",    1},
 		{"a\rb",    1},
@@ -176,15 +184,78 @@ test_view_diff_safe_accepts_exactly_what_the_cell_model_tracks :: proc(t: ^testi
 }
 
 // ---------------------------------------------------------------------------
+// The mode-general tier.
+// ---------------------------------------------------------------------------
+
+@(test)
+test_view_render_safe_accepts_the_one_control_byte_the_row_count_models :: proc(t: ^testing.T) {
+	// THE F04 CONSEQUENCE, as a predicate. A tab is legal under .Inline and
+	// .Full_Screen because width.odin now MODELS it (HT advances to the next tab
+	// stop, clamped at the margin), so rows_for_line counts a tabbed line's rows
+	// correctly and .Inline's rewind stays in step. It stays illegal under .Diff,
+	// which has to name the cells a glyph landed in and a tab lands in none.
+	ok, _, _ := view_render_safe("id\tname\tstatus")
+	testing.expect(t, ok, "a tab is legal in the render tier -- width.odin models it")
+	dok, dat, dwhy := view_diff_safe("id\tname\tstatus")
+	testing.expect(t, !dok, "a tab is still illegal in the diff tier")
+	testing.expect_value(t, dwhy, Diff_Contract.Control_Byte)
+	testing.expect_value(t, dat, 2)
+}
+
+@(test)
+test_view_render_safe_rejects_everything_that_breaks_a_row_count :: proc(t: ^testing.T) {
+	// The tab is the ONLY byte the two tiers disagree about. Everything else
+	// here moves the cursor, erases, or eats the next frame's bytes, and every
+	// mode counts the physical rows it painted and acts on that count -- so all
+	// of it is fatal to .Inline's rewind and .Full_Screen's truncation too, not
+	// only to the cell model.
+	BAD := []struct{ v: string, why: Diff_Contract }{
+		{"a\rb",            .Control_Byte},          // CR: back to column 0
+		{"a\x08b",          .Control_Byte},          // BS
+		{"bell\a",          .Control_Byte},
+		{"a\x7Fb",          .Control_Byte},
+		{"a\e[2Ab",         .Motion_Escape},         // CUU: the .Inline rewind's own escape
+		{"a\e[5;1Hb",       .Motion_Escape},         // CUP
+		{"a\e[2Jb",         .Motion_Escape},         // ED
+		{"a\e]0;title\e\\b", .Other_String_Escape},
+		{"a\eMb",           .Other_Escape},          // RI: scrolls at the top margin
+		{"text\e[3",        .Truncated_Escape},
+	}
+	for c in BAD {
+		ok, _, why := view_render_safe(c.v)
+		testing.expectf(t, !ok, "expected %q to be rejected by the render tier", c.v)
+		testing.expect_value(t, why, c.why)
+	}
+	// And the two tiers agree on all of it, byte offset included.
+	for c in BAD {
+		rok, rat, rwhy := view_render_safe(c.v)
+		dok, dat, dwhy := view_diff_safe(c.v)
+		testing.expectf(t, rok == dok && rat == dat && rwhy == dwhy,
+			"%q: the tiers must differ only on \\t", c.v)
+	}
+	// The accepting side agrees too.
+	GOOD := []string{"", "hello", "\e[31mred\e[0m", "\e]8;;https://x\e\\l\e]8;;\e\\", "a\nb"}
+	for v in GOOD {
+		rok, _, _ := view_render_safe(v)
+		dok, _, _ := view_diff_safe(v)
+		testing.expectf(t, rok && dok, "%q must be legal in both tiers", v)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // The loud path.
 // ---------------------------------------------------------------------------
 //
-// DIFF_STRICT defaults to ODIN_DEBUG, which `odin test` does not set, so the
-// assertion is not live on the gate. That is the right default -- it is a
-// development check, not a production cost -- but it means the gate would never
-// notice the assertion rotting. These call diff_contract_assert DIRECTLY,
-// through the package's own panic recovery, so the loud path is exercised in
-// every build regardless of how DIFF_STRICT is set.
+// These call the assertions DIRECTLY, through the package's own panic recovery,
+// so the loud path is exercised whatever VIEW_STRICT/DIFF_STRICT are set to.
+// That mattered more than it does now: the comment here used to say "DIFF_STRICT
+// defaults to ODIN_DEBUG, which `odin test` does not set, so the assertion is
+// not live on the gate", and that was the whole finding -- the default was also
+// off for the plain `odin build` the README publishes, so the check existed only
+// for a build nobody was told to make. VIEW_STRICT is now on for anything short
+// of -o:speed, `odin test` included, so the renderer really does assert on every
+// frame of this suite. These tests stay direct anyway: they pin the MESSAGE,
+// which no amount of ambient assertion does.
 
 @(private = "file")
 Assert_Case :: struct {
@@ -203,6 +274,18 @@ run_assert :: proc(ud: rawptr) {
 check_assert :: proc(view: string) -> Panic_Info {
 	c := Assert_Case{view = view}
 	return guarded(run_assert, &c)
+}
+
+@(private = "file")
+run_render_assert :: proc(ud: rawptr) {
+	c := (^Assert_Case)(ud)
+	render_contract_assert(c.view)
+}
+
+@(private = "file")
+check_render_assert :: proc(view: string) -> Panic_Info {
+	c := Assert_Case{view = view}
+	return guarded(run_render_assert, &c)
 }
 
 @(test)
@@ -239,4 +322,65 @@ test_diff_contract_assert_excerpt_is_bounded :: proc(t: ^testing.T) {
 	testing.expect(t, info.recovered, "an illegal view must panic")
 	testing.expectf(t, len(info.message) < 1024,
 		"the diagnostic must be bounded, got %d bytes", len(info.message))
+}
+
+// ---------------------------------------------------------------------------
+// F27: the switch itself.
+// ---------------------------------------------------------------------------
+
+@(test)
+test_view_strict_is_on_in_any_build_that_is_not_optimised :: proc(t: ^testing.T) {
+	// THE FINDING, AS AN ASSERTION. The default used to be plain ODIN_DEBUG,
+	// which `odin test` does not set and which the README's own build command
+	// (`odin build . -collection:rune=vendor/runetea`) does not set either -- so
+	// the only checkable contract in the package was compiled out of every build
+	// the project actually publishes, and a tab in a .Diff view produced
+	// permanently wrong output with no diagnostic of any kind. This test failed
+	// before the default moved and is the reason it is a `when`-free runtime
+	// assertion: a compile-time `#assert` would have been just as invisible.
+	testing.expect(t, VIEW_STRICT,
+		"VIEW_STRICT must be on for `odin test` -- it is on for anything but -o:speed")
+	testing.expect(t, DIFF_STRICT,
+		"DIFF_STRICT defaults to VIEW_STRICT, so it inherits the corrected default")
+	// It is still compiled out where it must be. Stated rather than asserted --
+	// this build is not an optimised one, so there is nothing here to measure --
+	// but the expression is pinned so a future edit that drops the guard fails
+	// to compile rather than silently costing a scan per frame in production.
+	#assert(VIEW_STRICT == #config(RUNETEA_VIEW_STRICT, ODIN_DEBUG || ODIN_OPTIMIZATION_MODE < .Speed))
+}
+
+@(test)
+test_render_contract_assert_is_silent_on_a_tab_and_loud_on_a_move :: proc(t: ^testing.T) {
+	// The tab passes the render tier -- the assertion that fires for .Diff must
+	// NOT fire for .Inline, or the fix to rows_for_line would be unreachable.
+	tabbed := check_render_assert("id\tname\tstatus")
+	defer delete(tabbed.message)
+	testing.expect(t, !tabbed.recovered, "a tab is legal under .Inline and .Full_Screen")
+
+	// A cursor move is not. This is the byte that makes Renderer.last_rows a lie.
+	moved := check_render_assert("row\e[2Aoops")
+	defer delete(moved.message)
+	testing.expect(t, moved.recovered, "a motion escape must panic under VIEW_STRICT")
+	testing.expect(t, strings.contains(moved.message, "Motion_Escape"),
+		"the panic must name WHAT is wrong")
+	testing.expect(t, strings.contains(moved.message, "byte 3"),
+		"the panic must name WHERE it is wrong")
+	testing.expect(t, strings.contains(moved.message, "view_render_safe"),
+		"the panic must name the predicate the caller can run themselves")
+	testing.expect(t, strings.contains(moved.message, "RUNETEA_VIEW_STRICT"),
+		"the panic must name the escape hatch")
+}
+
+@(test)
+test_diff_contract_assert_points_a_tab_at_the_modes_that_model_it :: proc(t: ^testing.T) {
+	// A developer who hits this is one sentence away from a fix, and the
+	// sentence changed: expanding tabs is no longer the ONLY answer, because
+	// .Inline and .Full_Screen now measure them.
+	info := check_assert("status\tbar")
+	defer delete(info.message)
+	testing.expect(t, info.recovered, "a tab is still illegal under .Diff")
+	testing.expect(t, strings.contains(info.message, "tab is a move"),
+		"the panic must say WHY a tab is different from a styled byte")
+	testing.expect(t, strings.contains(info.message, ".Inline"),
+		"the panic must name the modes that do model a tab")
 }

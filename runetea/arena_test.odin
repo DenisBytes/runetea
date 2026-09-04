@@ -1,6 +1,13 @@
+#+private
+// ^ Every declaration in this file is package-private, so that `odin doc
+//   runetea` / `odin doc runegloss` -- the command README.md and docs/API.md
+//   hand a newcomer for symbol discovery -- lists the library rather than the
+//   test fixtures. Pinned by tools/doccheck/run.sh's `apidoc` check, which is
+//   also where the argument for it is written out.
 package runetea
 
 import "core:mem"
+import "core:strings"
 import "core:testing"
 
 Boxed_A :: struct { n: int }
@@ -93,6 +100,43 @@ test_box_rejects_non_pod_type :: proc(t: ^testing.T) {
 	testing.expect(t, step.boxed == nil, "the guarded body must not have completed box()")
 }
 
+// F08: the panic text must NAME the offending type and the box() call site.
+//
+// It did not, for a long time, while this file's own comment and
+// docs/API.md:379 both said it did: the message was a fixed string with no
+// format verb in it at all. That mattered far more than a missing nicety,
+// because the panic is raised on a pool worker, recovered by run_cmd_guarded
+// (cmd.odin), and reaches the application as a Panicked_Msg -- so the text WAS
+// the entire diagnostic, and it was identical for every non-POD Msg in the
+// program. A user who followed README.md:282's canonical update switch (which
+// has `case rt.Panicked_Msg:` with an empty body) got a Cmd whose result
+// simply never arrived and no way at all to find out which one.
+//
+// Both facts are asserted, and both must LEAD the message: Msg_Text truncates
+// at 255 bytes (msg.odin), so anything trailing can be cut off before it
+// reaches update().
+@(test)
+test_box_panic_names_the_offending_type_and_call_site :: proc(t: ^testing.T) {
+	Step :: struct { boxed: any }
+	step: Step
+	info := guarded(proc(ud: rawptr) {
+		s := cast(^Step)ud
+		s.boxed = box(Not_Pod_String{reason = "names itself on the way out"}, context.allocator)
+	}, &step)
+	defer delete(info.message, context.allocator)   // Panic_Info.message is a clone the CALLER owns (guard.odin)
+
+	testing.expect(t, info.recovered, "box() must panic on a non-POD Msg type")
+	testing.expectf(t, strings.contains(info.message, "Not_Pod_String"),
+		"the panic must name the offending type; got %q", info.message)
+	testing.expectf(t, strings.contains(info.message, "arena_test.odin"),
+		"the panic must name the box() call site, which guard.odin discards unless it is in the text itself; got %q", info.message)
+
+	// Whatever else changes, these must stay inside the window Msg_Text keeps.
+	idx_type := strings.index(info.message, "Not_Pod_String")
+	testing.expectf(t, idx_type >= 0 && idx_type < 255,
+		"the type name must survive Msg_Text's 255-byte truncation; it starts at %d", idx_type)
+}
+
 @(test)
 test_box_free_reclaims_the_only_allocation :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
@@ -125,4 +169,36 @@ test_frame_reset_reaches_steady_state :: proc(t: ^testing.T) {
 		}
 		frame_reset(&fa)
 	}
+}
+
+// F08's discriminator. Every Cmd failure reaches the application as the same
+// Panicked_Msg, so the ONLY thing that separates "your program broke the
+// message contract" (which now ends the session -- apply_msg, tea.odin) from
+// "your Cmd panicked" (which does not, and must not start doing so) is this
+// prefix. Pinned here because a change to box()'s message that dropped the
+// marker would silently restore the F08 silence with no test failing anywhere
+// else.
+@(test)
+test_the_box_contract_marker_leads_the_panic_and_is_not_a_substring_match :: proc(t: ^testing.T) {
+	Step :: struct { boxed: any }
+	step: Step
+	info := guarded(proc(ud: rawptr) {
+		s := cast(^Step)ud
+		s.boxed = box(Not_Pod_String{reason = "leads with the marker"}, context.allocator)
+	}, &step)
+	defer delete(info.message, context.allocator)
+
+	testing.expect(t, info.recovered, "box() must panic on a non-POD Msg type")
+	testing.expectf(t, is_box_contract_panic(info.message),
+		"apply_msg recognises a contract violation by this prefix and nothing else; got %q", info.message)
+
+	// An application may panic with anything at all, including text that quotes
+	// ours. Only OUR words coming FIRST make a report ours -- a substring search
+	// would let an app's own panic end the session on the framework's behalf.
+	testing.expect(t, !is_box_contract_panic("could not parse: box(): Msg type"),
+		"a panic that merely mentions box() is the application's, not the framework's")
+	testing.expect(t, !is_box_contract_panic("pool cmd exploded"),
+		"an ordinary Cmd panic must stay an ordinary Cmd panic")
+	testing.expect(t, !is_box_contract_panic("box"),
+		"a text shorter than the marker cannot match it")
 }

@@ -3,6 +3,7 @@ package runetea
 import "core:nbio"
 import "core:strings"
 import "core:sys/posix"
+import "core:time"
 
 // nbio-hosted variant of run() (tea.odin). See
 // docs/superpowers/nbio-decision.md for the full comparison and the T1
@@ -41,6 +42,20 @@ import "core:sys/posix"
 //     immediately after a successful mailbox_send. This is the linchpin the
 //     whole design in spec §6 depends on; see the direct, isolated proof in
 //     tools/nbiowakecheck alongside the full-loop proof here.
+//
+//   - DECODED INPUT DOES NOT USE THE MAILBOX AT ALL, and this is the one
+//     place the two hosts genuinely diverge rather than merely differ in
+//     plumbing. run()'s reader is a separate thread, so its keys have to
+//     cross a thread boundary and the Mailbox is exactly the right thing for
+//     that. Here they do not cross one -- nbio_on_read decodes them on this
+//     same thread, inside nbio.tick() -- so they go straight into
+//     Nbio_Read_Ctx.backlog and the loop applies them from there. Routing
+//     them through the Mailbox instead put the keyboard in a capacity fight
+//     with the app's own timers and Cmds that it could lose permanently; see
+//     the loop's own comment for the measurement. What follows from it: in
+//     this host a keystroke that arrives while Cmd results are queued is
+//     applied BEFORE them, whereas run() interleaves the two in mailbox
+//     arrival order. Order WITHIN the input stream is identical in both.
 run_nbio :: proc(p: ^Program($T), fd: posix.FD, out: ^strings.Builder, flush_fd: posix.FD = -1) -> Run_Error {
 	fa: Frame_Arena
 	if err := frame_arena_init(&fa); err != nil {
@@ -49,7 +64,7 @@ run_nbio :: proc(p: ^Program($T), fd: posix.FD, out: ^strings.Builder, flush_fd:
 	defer frame_arena_destroy(&fa)
 
 	mbox: Mailbox
-	if err := mailbox_init(&mbox, 256); err != nil {
+	if err := mailbox_init(&mbox, MAILBOX_CAP); err != nil {
 		return Terminal_Error{detail = "mailbox init failed"}
 	}
 	defer mailbox_destroy(&mbox)
@@ -72,6 +87,41 @@ run_nbio :: proc(p: ^Program($T), fd: posix.FD, out: ^strings.Builder, flush_fd:
 	disp: Dispatcher
 	dispatcher_init(&disp, &mbox, 4, wake = nbio_wake, wake_data = loop)
 	defer dispatcher_destroy(&disp)
+	// CLOSE THE MAILBOX BEFORE TEARING DOWN ANYTHING THAT CAN STILL SEND INTO
+	// IT. Declared here, immediately after dispatcher_destroy's defer, so
+	// LIFO ordering runs it FIRST of the two -- which is the same invariant
+	// run() gets from dispatcher_reap (cmd.odin closes the mailbox as its very
+	// first act) and from its reader-teardown defer.
+	//
+	// WHAT ITS ABSENCE COST. run_nbio used to call mailbox_close in exactly one
+	// place -- the EOF branch of nbio_on_read -- and never on the quit or error
+	// teardown path. So `defer dispatcher_destroy(&disp)` ran against a mailbox
+	// that was still OPEN and that nothing was draining any more, and every
+	// producer in this package retries forever on Full precisely because Full is
+	// documented as transient (mailbox.odin): a pool worker or detached Cmd in
+	// deliver_result, a timer fire, a Signal_Watcher message in send_or_retry.
+	// Any one of them landing on a full queue spun there for the rest of the
+	// process's life, thread.pool_finish never returned, and the process hung
+	// with the terminal still in raw mode and the alternate screen still up,
+	// burning a core per stuck producer.
+	//
+	// It did not need a panic or anything exotic to reach: an ordinary
+	// quit_cmd() quit with a repeating every() running and one Cmd still in
+	// flight is enough, because dispatcher_destroy blocks in thread.pool_finish
+	// for that Cmd and only stops the timer service afterwards -- the timer
+	// fills the undrained mailbox during exactly that window. That is the shape
+	// test_run_nbio_closes_the_mailbox_before_tearing_the_dispatcher_down
+	// (loop_nbio_test.odin) drives: every(1 ms), one 1 s Cmd, then quit.
+	// Without this line it did not return inside a 10 s bound; with it,
+	// 1.003 s 3/3 -- exactly the in-flight Cmd's own duration, which
+	// dispatcher_destroy waits for by design, and nothing more. run() on the
+	// equivalent program never had the problem, because dispatcher_reap
+	// (cmd.odin) closes the mailbox as its very first act.
+	//
+	// Closing here also makes signal_watcher_stop's defer (declared above, so
+	// it runs after this one) collect a watcher that sees .Closed and gives up,
+	// rather than one parked in a retry loop.
+	defer mailbox_close(&mbox)
 
 	r: Renderer
 	// Same width-seeding rationale as run() (tea.odin) -- see the comment
@@ -120,51 +170,151 @@ run_nbio :: proc(p: ^Program($T), fd: posix.FD, out: ^strings.Builder, flush_fd:
 		delete(rc.keys)
 		delete(rc.enh)
 		delete(rc.st.markers)
-		// Any entries still sitting unflushed (only reachable if the mailbox
-		// closed mid-flush -- see nbio_flush_backlog) were boxed but never
-		// handed to apply(), so nothing else will ever free them; box_free
-		// them here rather than leaving them for delete(rc.backlog) below,
-		// which only reclaims the [dynamic]any's own backing slice, not what
-		// each element's box() call allocated.
+		// Any entries still sitting unapplied (only reachable when the loop
+		// broke out mid-backlog -- a quit, a panic, a write failure) were
+		// boxed but never handed to apply_msg, so nothing else will ever free
+		// them; box_free them here rather than leaving them for
+		// delete(rc.backlog) below, which only reclaims the [dynamic]any's own
+		// backing slice, not what each element's box() call allocated.
 		for i in rc.backlog_pos ..< len(rc.backlog) { box_free(rc.backlog[i], context.allocator) }
 		delete(rc.backlog)
 	}
 	nbio_issue_read(&rc)
 
 	for !p.quit {
-		// Drain everything currently queued -- Key_Msgs the last tick's read
-		// callback decoded, plus any Cmd/signal result that arrived and
-		// called nbio_wake before we reached this point (mailbox_send and
-		// nbio.wake_up cannot lose a wakeup relative to this drain: wake_up
-		// writes to a SEMAPHORE-flagged eventfd, whose count persists
-		// regardless of send-vs-wait ordering -- see the decision doc's
-		// answer to 2b).
-		for {
+		// ONE ITERATION = apply the decoded input this thread is already
+		// holding, then apply what is queued in the mailbox, then paint ONCE.
+		// Identical shape to run()'s loop, by the same pair of shared procs
+		// (apply_msg then guarded_render); see run()'s own comment for why
+		// `dirty` is what keeps a quit from inventing an extra frame, and
+		// apply_msg's for the amplification measurements that forced the
+		// split.
+		dirty := false
+
+		// ---- INPUT FIRST, AND WITHOUT GOING THROUGH THE MAILBOX AT ALL ----
+		//
+		// This used to push decoded keys into the mailbox (nbio_flush_backlog)
+		// and let the drain below pick them up, which put the keyboard in
+		// direct competition with the Cmd/timer/signal producers for the 256
+		// slots -- and lose. Under a producer that keeps the queue saturated,
+		// mailbox_send returned .Full on every attempt the loop ever made, so
+		// the key sat in this backlog forever. That is not a hypothetical
+		// interaction of two bugs: with the drain bounded (below) but the keys
+		// still routed through the mailbox, a 'q' written 500 ms into a session
+		// running every(1 ms) against 2 ms of work per message was still
+		// undelivered 20 s later -- the drain frees 256 slots and the timer
+		// refills all 256 during the very same 512 ms the drain takes, so the
+		// queue is never once observed with room in it.
+		//
+		// The mailbox exists to get messages ACROSS A THREAD BOUNDARY. These
+		// did not cross one: nbio_on_read decoded them on THIS thread, inside
+		// nbio.tick(), a few lines below. Round-tripping them through a
+		// mutex-guarded, fixed-capacity, thread-safe ring bought nothing and
+		// cost the keyboard its liveness. Applying them directly is both
+		// simpler and strictly stronger: input can no longer be delayed,
+		// dropped or reordered by how busy the app's own timers are.
+		//
+		// The trade this makes explicit: a keystroke that arrives while Cmd
+		// results are queued is now applied BEFORE them, rather than behind
+		// them. There was never a meaningful arrival order between two
+		// different producers to preserve -- what does have to hold is the
+		// order WITHIN the input stream (Paste_Start_Msg before the first
+		// pasted character, a Mouse_Msg before whatever was typed after the
+		// click), and that is exactly what this array preserves.
+		//
+		// Unbounded on purpose, unlike the mailbox drain: the backlog holds
+		// what ONE 1024-byte read decoded to and nothing refills it while it
+		// is being consumed (no new read is issued until it is empty), so
+		// "everything already here" is a bounded, self-limiting quantity --
+		// the definition of the coalescing rule rather than an exception to it.
+		for rc.backlog_pos < len(rc.backlog) {
+			msg := rc.backlog[rc.backlog_pos]
+			rc.backlog_pos += 1
+			e, updated := apply_msg(p, msg, &fa, &disp, &r)
+			if updated { dirty = true }
+			if e != nil { return e }
+			if p.quit { break }
+		}
+		if rc.backlog_pos >= len(rc.backlog) {
+			clear(&rc.backlog)
+			rc.backlog_pos = 0
+			// Re-arm. `reading` is what makes this safe to ask every
+			// iteration: nbio_on_read clears it, and a second read submitted
+			// while one is in flight would race two callbacks over rc.buf.
+			// It also has to be asked HERE rather than at the end of
+			// nbio_on_read, because a read that decodes to nothing at all --
+			// the first byte of a multi-byte escape sequence, half a UTF-8
+			// rune -- leaves the backlog empty, and the old code's
+			// "re-issue from inside the flush" then never fired: the loop
+			// would park in tick() with no read outstanding and go deaf for
+			// a reason that had nothing to do with the mailbox.
+			if !rc.reading && !rc.eof { nbio_issue_read(&rc) }
+		}
+
+		// ---- THEN THE MAILBOX (Cmd results, timer fires, signals) ----
+		//
+		// Whatever arrived and called nbio_wake before we reached this point
+		// is here (mailbox_send and nbio.wake_up cannot lose a wakeup relative
+		// to this drain: wake_up writes to a SEMAPHORE-flagged eventfd, whose
+		// count persists regardless of send-vs-wait ordering -- see the
+		// decision doc's answer to 2b).
+		//
+		// THE DRAIN IS BOUNDED, and that bound is a fix for a hang, not a
+		// tuning knob. It used to run to EMPTY, with nbio.tick() -- the ONLY
+		// thing that ever completes a read -- sitting below it and reachable
+		// only once the mailbox had been observed empty. Any producer that
+		// kept the queue topped up therefore had absolute, unbounded priority
+		// over reading the keyboard: with a sustained per-message cost above
+		// the arrival interval, tick() ran exactly once (loop iteration 1) and
+		// never again, so the read completion already sitting in the io_uring
+		// completion queue was never reaped, no key was ever decoded, and the
+		// program stayed permanently deaf while repainting happily enough to
+		// look alive. It is a cliff, not a gradient: every(16 ms) against 12 ms
+		// of work per message quits normally, every(16 ms) against 17 ms never
+		// sees another keystroke, and so do 16/20 ms and 5/8 ms.
+		// test_run_nbio_still_reads_input_while_the_mailbox_never_empties sits
+		// well past that cliff (every(1 ms) against 2 ms of work) and writes a
+		// 'q' 500 ms in: undelivered after 20 s without this bound and the
+		// direct-apply path above, delivered in 1.08 s 3/3 with them.
+		//
+		// run() never had this failure mode because its reader is a separate
+		// thread competing fairly for mailbox slots; here the reader IS this
+		// thread.
+		saturated := false   // the drain stopped on the budget, not on an empty queue
+		for n := 0; n < COALESCE_BUDGET && !p.quit; n += 1 {
 			msg, ok := mailbox_try_recv(&mbox)
 			if !ok { break }
-			if e := apply(p, msg, &fa, &disp, &r, out, flush_fd); e != nil { return e }
-			if p.quit { break }
+			e, updated := apply_msg(p, msg, &fa, &disp, &r)
+			if updated { dirty = true }
+			if e != nil { return e }
+			if n + 1 == COALESCE_BUDGET { saturated = true }
+		}
+
+		if dirty {
+			if e := guarded_render(p, &fa, &r, out, flush_fd); e != nil { return e }
 		}
 		if p.quit { break }
 
-		// Backpressure: a read that decoded more keys than the mailbox has
-		// room for right now (e.g. a large paste) leaves them here instead of
-		// spinning inside nbio_on_read -- there is no second thread on this
-		// design for a spin-and-retry to yield to, so a blocking retry INSIDE
-		// the callback would self-deadlock: the only thing that ever drains
-		// the mailbox is this loop, and the callback runs on this same
-		// thread, borrowed by nbio.tick(). See nbio_flush_backlog's own
-		// comment. No new read is issued while backlog is nonempty, so
-		// calling nbio.tick() here would have nothing to wake it -- loop back
-		// to draining instead.
-		if len(rc.backlog) > rc.backlog_pos {
-			if nbio_flush_backlog(&rc) { break }   // mailbox closed mid-flush
-			continue
-		}
+		// EOF, drained -- mirrors run()'s mailbox_recv ok=false. Both queues
+		// have to be empty, not just the mailbox: the backlog may still hold
+		// the keys decoded from the very read that hit EOF.
+		if rc.backlog_pos >= len(rc.backlog) && mailbox_closed_and_empty(&mbox) { break }
 
-		if mailbox_closed_and_empty(&mbox) { break }   // EOF, drained -- mirrors run()'s mailbox_recv ok=false
-
-		if terr := nbio.tick(); terr != nil {
+		// tick() is reached on EVERY iteration now; only its timeout varies.
+		// NO_TIMEOUT (the default, and what this call used to pass
+		// unconditionally) parks the thread until the kernel has something,
+		// which is exactly right when the drain emptied the queue -- that is
+		// the idle path, and it must not spin. But when the drain stopped on
+		// the budget there is still work sitting in the mailbox, and blocking
+		// here would stall it behind an io_uring completion that may never
+		// come; a zero timeout submits and reaps whatever is already ready and
+		// returns immediately (core:nbio/impl_linux.odin: timeout == 0 submits
+		// with wait_nr 0 and no timespec). So the loop alternates
+		// input/drain/paint/poll for as long as producers keep it busy, and
+		// blocks only when there is genuinely nothing left to do.
+		tick_timeout := nbio.NO_TIMEOUT
+		if saturated { tick_timeout = time.Duration(0) }
+		if terr := nbio.tick(tick_timeout); terr != nil {
 			return Terminal_Error{detail = "nbio tick failed"}
 		}
 	}
@@ -194,42 +344,64 @@ Nbio_Read_Ctx :: struct {
 	// the paste boundaries.
 	st:          Input_State,
 	legacy:      Legacy_Key_Encoding, // copy of Program.legacy; see its comment
-	// Boxed (via context.allocator), not raw Key_Msg -- box()'s own MESSAGE
-	// OWNERSHIP CONTRACT (arena.odin) requires anything that reaches the
-	// mailbox to be a real box() allocation, not an implicit `any` pointing
-	// into this dynamic array's own backing storage. That was the ORIGINAL
-	// shape here (`mailbox_send(rc.mailbox, rc.backlog[rc.backlog_pos])`
-	// with `backlog: [dynamic]Key_Msg`) and it happened to work only because
-	// nothing downstream ever freed a message; the moment apply() started
-	// calling box_free() on every message (the T1 message-ownership fix,
-	// see docs/superpowers/message-ownership-decision.md), that pattern
-	// surfaced as Tracking_Allocator "bad free" reports -- free() was being
-	// called on a pointer into the middle of this array's buffer, not on a
-	// new()'d block's start address. Boxing once here, at append time, also
-	// means a .Full retry in nbio_flush_backlog resends the SAME allocation
-	// rather than boxing (and leaking) a fresh one on every retry attempt.
+	// THE INPUT QUEUE. One nbio read completion decodes into here, and
+	// run_nbio's loop applies these to the model directly -- they do NOT go
+	// through the Mailbox. See the loop's own comment for why (the Mailbox
+	// exists to cross a thread boundary and these never cross one, and routing
+	// them through it made the keyboard lose a capacity fight it could not
+	// win against a saturating timer).
+	//
+	// Boxed (via context.allocator), not raw Key_Msg, because apply_msg
+	// box_free's every message it is handed -- box()'s MESSAGE OWNERSHIP
+	// CONTRACT (arena.odin). That was NOT the original shape here
+	// (`backlog: [dynamic]Key_Msg`, sent as an implicit `any` pointing into
+	// this array's own backing storage) and it happened to work only because
+	// nothing downstream ever freed a message; the moment the loop started
+	// calling box_free() on every message (the T1 message-ownership fix, see
+	// docs/superpowers/message-ownership-decision.md), that pattern surfaced
+	// as Tracking_Allocator "bad free" reports -- free() on a pointer into the
+	// middle of a dynamic array's buffer rather than on a new()'d block's
+	// start address.
 	backlog:     [dynamic]any,
-	backlog_pos: int,                // next unsent index into backlog
+	backlog_pos: int,                // next unapplied index into backlog
+
+	// Is a read op outstanding? Written only on this thread (nbio_issue_read
+	// sets it, nbio_on_read clears it), so no atomics: nbio callbacks run on
+	// the loop thread, inside nbio.tick(). Two reads in flight at once would
+	// race two callbacks over rc.buf, and the loop asks "should I re-arm?"
+	// once per iteration, so it needs a way to answer that is not "did the
+	// backlog just become empty" -- a read that decodes to nothing (the first
+	// byte of an escape sequence, half a UTF-8 rune) leaves the backlog empty
+	// without having produced anything.
+	reading:     bool,
+	// Input is gone (EOF or a read error). Nothing may re-arm a read after
+	// this; nbio_on_read has already closed the mailbox and the loop is
+	// unwinding.
+	eof:         bool,
 }
 
 @(private = "file")
 nbio_issue_read :: proc(rc: ^Nbio_Read_Ctx) {
+	rc.reading = true
 	op := nbio.read(rc.handle, 0, rc.buf[:], nbio_on_read)
 	op.user_data[0] = rc
 }
 
-// Runs on the loop thread, inside nbio.tick(). Precondition (see run_nbio and
-// nbio_flush_backlog): rc.backlog is always empty when a read is in flight,
-// so appending fresh keys here never clobbers an unflushed one.
+// Runs on the loop thread, inside nbio.tick(). Precondition, enforced by
+// run_nbio's loop: rc.backlog is fully applied and cleared before a read is
+// re-armed, so appending fresh keys here never clobbers an unapplied one.
 @(private = "file")
 nbio_on_read :: proc(op: ^nbio.Operation) {
 	rc := cast(^Nbio_Read_Ctx)op.user_data[0]
+	rc.reading = false
 
 	// .EOF is the expected terminal case (input closed). Any other error is
 	// treated the same way tea.odin's reader_thread treats a failed read:
 	// input is gone, so close the mailbox and let run_nbio's main loop
-	// unwind via mailbox_closed_and_empty.
+	// unwind via mailbox_closed_and_empty. `eof` stops the loop re-arming a
+	// read against a dead fd forever.
 	if op.read.err != nil || op.read.read <= 0 {
+		rc.eof = true
 		mailbox_close(rc.mailbox)
 		return
 	}
@@ -243,9 +415,9 @@ nbio_on_read :: proc(op: ^nbio.Operation) {
 	if consumed > 0 { remove_range(&rc.pending, 0, consumed) }
 
 	// Boxed here, once per key, via context.allocator -- same convention as
-	// tea.odin's reader_thread -- so every message that ever reaches the
-	// mailbox is a genuine box() allocation. See Nbio_Read_Ctx's own comment
-	// on `backlog` for why this replaced sending rc.keys' elements directly.
+	// tea.odin's reader_thread -- so every message the loop later box_free's
+	// is a genuine box() allocation. See Nbio_Read_Ctx's own comment on
+	// `backlog` for why this replaced handing rc.keys' elements on directly.
 	//
 	// Markers interleave with the keys, for the reason spelled out in
 	// tea.odin's copy of this loop: their POSITION is their meaning, so
@@ -263,40 +435,9 @@ nbio_on_read :: proc(op: ^nbio.Operation) {
 		append(&rc.backlog, input_marker_box(rc.st.markers[mi]))
 	}
 	for e in rc.enh  { append(&rc.backlog, box(e, context.allocator)) }
-	nbio_flush_backlog(rc)
+	// Nothing is sent or flushed from here. run_nbio's loop owns the backlog
+	// and re-arms the next read once it has applied it; a callback that also
+	// tried to move messages on would be doing so from inside nbio.tick(),
+	// on the very thread that has to return to the loop to make progress.
 }
 
-// Tries to push everything in rc.backlog into the mailbox without blocking,
-// and issues the next read ONLY once the backlog is fully drained. Called
-// from nbio_on_read (right after decoding) and from run_nbio's own loop
-// (after every drain, while backlog remains nonempty).
-//
-// Deliberately does NOT retry-with-yield the way tea.odin's reader_thread
-// and cmd.odin's deliver_result do on Full: those run on a thread DIFFERENT
-// from the one draining the mailbox, so yielding lets the drainer make
-// progress concurrently. Here the "drainer" is run_nbio's own for loop on
-// THIS SAME thread -- a blocking retry inside this callback would prevent
-// that loop from ever running again, hanging exactly the way the FIX 1
-// mailbox-full regression (addendum, spike-findings.md) hung the reader-
-// thread path before it was fixed there. The fix here is architectural
-// rather than a yield: stop, remember how far we got, and let the caller's
-// own event-loop iteration make room before asking again.
-//
-// Returns true if the mailbox was closed mid-flush (caller should stop).
-@(private = "file")
-nbio_flush_backlog :: proc(rc: ^Nbio_Read_Ctx) -> (closed: bool) {
-	for rc.backlog_pos < len(rc.backlog) {
-		switch mailbox_send(rc.mailbox, rc.backlog[rc.backlog_pos]) {
-		case .Ok:
-			rc.backlog_pos += 1
-		case .Full:
-			return false
-		case .Closed:
-			return true
-		}
-	}
-	clear(&rc.backlog)
-	rc.backlog_pos = 0
-	nbio_issue_read(rc)
-	return false
-}

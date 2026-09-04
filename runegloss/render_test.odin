@@ -1,7 +1,15 @@
+#+private
+// ^ Every declaration in this file is package-private, so that `odin doc
+//   runetea` / `odin doc runegloss` -- the command README.md and docs/API.md
+//   hand a newcomer for symbol discovery -- lists the library rather than the
+//   test fixtures. Pinned by tools/doccheck/run.sh's `apidoc` check, which is
+//   also where the argument for it is written out.
 package runegloss
 
+import "core:mem"
 import "core:strings"
 import "core:testing"
+import "core:unicode/utf8"
 import rt "../runetea"
 
 // ---------------------------------------------------------------------------
@@ -328,15 +336,21 @@ test_a_truncated_trailing_escape_does_not_swallow_the_padding :: proc(t: ^testin
 	// row happens to measure right" are different claims and only the first one
 	// keeps the header's "SGR escapes, printable text and \n, nothing else"
 	// promise true.
+	// width(7) is now the width of the WHOLE BLOCK including its border, so this
+	// is a 7-column box: 2 border + 2 padding + 3 content, and "abc" fills the
+	// content area exactly. It used to be a 9-column box (border added on top of
+	// a 7-column padded box), which is the lipgloss-v1-vs-v2 divergence F48 is
+	// about; the fragment-swallowing claim being pinned here is unaffected by
+	// which of the two it is.
 	for text in ([]string{"abc\e[3", "abc\e[", "abc\e"}) {
 		s := new_style_profile(.True_Color)
 		border(&s, NORMAL); padding(&s, 1, 1); width(&s, 7)
 		one(t, &s, text,
-			"┌───────┐\n" +
-			"│       │\n" +
-			"│ abc   │\n" +
-			"│       │\n" +
-			"└───────┘")
+			"┌─────┐\n" +
+			"│     │\n" +
+			"│ abc │\n" +
+			"│     │\n" +
+			"└─────┘")
 	}
 
 	// A COMPLETE escape at the end of a line is NOT dropped -- only truncated
@@ -487,15 +501,498 @@ test_diff_renderer_agrees_with_the_full_screen_repaint_on_a_styled_block :: proc
 // misc
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// the box model: width CLAMPS
+// ---------------------------------------------------------------------------
+
 @(test)
-test_width_is_a_floor_never_a_truncation :: proc(t: ^testing.T) {
-	// Stated scope: RuneGloss does not wrap or truncate. Content wider than
-	// `width` widens the block rather than being cut -- silently losing a
-	// user's text is worse than a block that overflows visibly.
+test_width_clamps_instead_of_flooring :: proc(t: ^testing.T) {
+	// THE REVERSAL. This test used to be called
+	// test_width_is_a_floor_never_a_truncation and asserted
+	// render(width(3), "abcdef") == "abcdef" -- a 6-column block from a Style
+	// that asked for 3. Nothing downstream could do anything with that: a
+	// `width` that only ever grows cannot be used to fit a viewport, a column or
+	// a panel, which is the only thing a width is for.
+	//
+	// It is not a truncation either, which is what the old name assumed the only
+	// alternative was. .Wrap is the default and loses no byte.
 	s := new_style_profile(.True_Color)
 	width(&s, 3)
-	one(t, &s, "abcdef", "abcdef")
+	one(t, &s, "abcdef", "abc\ndef")
+
+	// And the old behaviour, still reachable, now spelled out loud.
+	g := new_style_profile(.True_Color)
+	width(&g, 3); overflow(&g, .Grow)
+	one(t, &g, "abcdef", "abcdef")
 }
+
+@(test)
+test_one_long_line_cannot_widen_a_bordered_block :: proc(t: ^testing.T) {
+	// F06/F21, reduced to its smallest form. Under the floor semantics this
+	// produced a 53-column box out of a Style that asked for 20 -- and the
+	// damage did not stop at the box: the over-wide rows run past the terminal
+	// margin, DECAWM wraps each of them onto a second physical row, and every
+	// row of the frame BELOW this block is displaced. One long path in one panel
+	// sheared layouts it had nothing to do with.
+	s := new_style_profile(.True_Color)
+	border(&s, NORMAL); padding(&s, 0, 1); width(&s, 20)
+
+	long := "/home/user/dev/some/deeply/nested/project/file.odin"
+	out := render(&s, long, context.allocator)
+	defer delete(out, context.allocator)
+
+	lines := strings.split_lines(out, context.allocator)
+	defer delete(lines, context.allocator)
+	testing.expect(t, len(lines) > 3, "expected the content to wrap onto several rows")
+	for line, i in lines {
+		if w := rt.display_width(line); w != 20 {
+			testing.expectf(t, false, "row %d measures %d, want 20: %q", i, w, line)
+		}
+	}
+
+	// NOTHING WAS DELETED: every character of the path is still in the block, in
+	// order. That is the half of the claim that distinguishes wrapping from the
+	// truncation the old comment feared, and it is why an exact `width` could be
+	// made the default at all.
+	joined := strings.concatenate(lines, context.allocator)
+	defer delete(joined, context.allocator)
+	kept, _ := strings.remove_all(joined, " ", context.allocator)
+	defer delete(kept, context.allocator)
+	bare, _ := strings.remove_all(kept, "│", context.allocator)
+	defer delete(bare, context.allocator)
+	testing.expect(t, strings.contains(bare, long), "wrapping lost or reordered content")
+}
+
+@(test)
+test_width_includes_the_border_and_frame_size_reports_the_cost :: proc(t: ^testing.T) {
+	// F48. `width` is the OUTER width (border + padding + content), matching
+	// lipgloss v2, which is the version RuneTea names as its target. Before this
+	// the border was added on top and a ported layout came out 2 columns wider
+	// per box, with no getter anywhere to notice it with.
+	s := new_style_profile(.True_Color)
+	border(&s, ROUNDED); padding(&s, 1, 2); margin(&s, 0, 3); width(&s, 20); height(&s, 7)
+
+	hw, vh := frame_size(s)
+	testing.expect_value(t, hw, 12)   // margin 3+3, padding 2+2, border 1+1
+	testing.expect_value(t, vh, 4)    // margin 0+0, padding 1+1, border 1+1
+	bw, bh := border_size(s)
+	testing.expect_value(t, bw, 2)
+	testing.expect_value(t, bh, 2)
+	testing.expect_value(t, horizontal_frame_size(s), 12)
+	testing.expect_value(t, vertical_frame_size(s), 4)
+
+	out := render(s, "hello world this is long enough to wrap", context.allocator)
+	defer delete(out, context.allocator)
+	w, h := measure(out)
+	testing.expect_value(t, w, 20 + 3 + 3)
+	testing.expect_value(t, h, 7)
+
+	// A CUSTOM 2-COLUMN BORDER, which is the case an application cannot compute
+	// for itself and the reason border_size is exported rather than assumed to
+	// be 2 whenever `bordered` is set.
+	c := new_style_profile(.True_Color)
+	b := NORMAL
+	b.left, b.right = border_cell("<<"), border_cell(">>")
+	border(&c, b); width(&c, 12)
+	cbw, _ := border_size(c)
+	testing.expect_value(t, cbw, 4)
+	cout := render(c, "abcdefgh", context.allocator)
+	defer delete(cout, context.allocator)
+	testing.expect_value(t, measure_width(cout), 12)
+}
+
+@(test)
+test_a_width_smaller_than_its_own_frame_yields_a_frame_wide_block :: proc(t: ^testing.T) {
+	// The degenerate case, pinned so it is a documented answer rather than a
+	// discovered one: 2 border columns plus 4 padding columns cannot fit in 4,
+	// so the content area goes to zero and the frame wins. Nothing asks the
+	// builder for a negative run of spaces on the way, and nothing tries to wrap
+	// to zero columns (which cannot terminate).
+	s := new_style_profile(.True_Color)
+	border(&s, NORMAL); padding(&s, 0, 2); width(&s, 4)
+	one(t, &s, "abcdef", "┌────┐\n│    │\n└────┘")
+}
+
+@(test)
+test_height_clamps_and_align_v_chooses_which_rows_survive :: proc(t: ^testing.T) {
+	// There is no reflow for rows, so an over-tall block loses some. WHICH ones
+	// follows from align_v: the alignment already says which end the content is
+	// anchored to, so the rows nearest that anchor are the ones kept.
+	body := "1\n2\n3\n4\n5"
+
+	top := new_style_profile(.True_Color); height(&top, 2); valign(&top, .Top)
+	one(t, &top, body, "1\n2")
+	bot := new_style_profile(.True_Color); height(&bot, 2); valign(&bot, .Bottom)
+	one(t, &bot, body, "4\n5")
+	mid := new_style_profile(.True_Color); height(&mid, 3); valign(&mid, .Middle)
+	one(t, &mid, body, "2\n3\n4")
+
+	// .Grow keeps the old floor semantics on the vertical axis too.
+	g := new_style_profile(.True_Color); height(&g, 2); overflow(&g, .Grow)
+	one(t, &g, body, body)
+
+	// A dropped line must not widen the block it is no longer in.
+	w := new_style_profile(.True_Color); height(&w, 1); valign(&w, .Top)
+	one(t, &w, "ab\nlonger", "ab")
+}
+
+// ---------------------------------------------------------------------------
+// wrap / truncate
+// ---------------------------------------------------------------------------
+
+@(test)
+test_wrap_breaks_at_words_and_drops_the_break_spaces :: proc(t: ^testing.T) {
+	got := wrap("the quick brown fox", 10, {}, context.allocator)
+	defer delete(got, context.allocator)
+	testing.expect_value(t, got, "the quick\nbrown fox")
+
+	// The spaces AT a break are dropped -- left in, they would sit at the head of
+	// the next row and shift it right by however many there were.
+	many := wrap("aaa     bbb", 5, {}, context.allocator)
+	defer delete(many, context.allocator)
+	testing.expect_value(t, many, "aaa\nbbb")
+
+	// Multi-line input stays multi-line, and a line that fits is untouched.
+	ml := wrap("fits\nthis one does not fit", 8, {}, context.allocator)
+	defer delete(ml, context.allocator)
+	testing.expect_value(t, ml, "fits\nthis one\ndoes not\nfit")
+}
+
+@(test)
+test_wrap_hard_breaks_a_word_with_nowhere_to_break :: proc(t: ^testing.T) {
+	// A 200-character URL in a 40-column panel is the case that has to work, and
+	// there is no space anywhere in it to break at.
+	got := wrap("abcdefghij", 4, {}, context.allocator)
+	defer delete(got, context.allocator)
+	testing.expect_value(t, got, "abcd\nefgh\nij")
+
+	// The break lands on a CLUSTER boundary, not a byte or a rune one: "日本語"
+	// is 3 clusters of 2 columns each, so a 3-column limit fits exactly one per
+	// row and never splits one in half.
+	cjk := wrap("日本語", 3, {}, context.allocator)
+	defer delete(cjk, context.allocator)
+	testing.expect_value(t, cjk, "日\n本\n語")
+
+	// A cluster wider than the whole box overflows by a column rather than being
+	// split (unpaintable bytes) or dropped (a deleted character).
+	narrow := wrap("日本", 1, {}, context.allocator)
+	defer delete(narrow, context.allocator)
+	testing.expect_value(t, narrow, "日\n本")
+}
+
+@(test)
+test_wrap_reestablishes_the_active_style_on_every_row :: proc(t: ^testing.T) {
+	// The failure a naive implementation ships and nobody notices until a
+	// coloured paragraph loses its colour halfway down: "\e[31mhello world\e[0m"
+	// wrapped at 5 must not become "\e[31mhello" / "world\e[0m", where the second
+	// row paints in the terminal default.
+	got := wrap("\e[31mhello world\e[0m", 5, {}, context.allocator)
+	defer delete(got, context.allocator)
+	testing.expect_value(t, got, "\e[31mhello\e[0m\n\e[31mworld\e[0m")
+
+	// Every produced row independently ends at the terminal default, which is
+	// the invariant runetea's .Diff renderer needs from every row this package
+	// emits (see this file's header on unbounded style growth).
+	lines := strings.split_lines(got, context.allocator)
+	defer delete(lines, context.allocator)
+	for line, i in lines {
+		testing.expectf(t, strings.has_suffix(line, "\e[0m"), "row %d does not close: %q", i, line)
+	}
+
+	// A canonical reset inside the line CLEARS the carry, so rows after it are
+	// not re-opened in a style the content already closed.
+	after := wrap("\e[31maa\e[0m bb cc", 2, {}, context.allocator)
+	defer delete(after, context.allocator)
+	testing.expect_value(t, after, "\e[31maa\e[0m\nbb\ncc")
+}
+
+@(test)
+test_truncate_budgets_its_tail_inside_the_width :: proc(t: ^testing.T) {
+	// A truncate whose output could exceed the width it was given would be
+	// useless to the box model that calls it.
+	for n in 1 ..= 12 {
+		got := truncate("abcdefghijkl", n, "…", {}, context.allocator)
+		defer delete(got, context.allocator)
+		testing.expectf(t, rt.display_width(got) <= n, "truncate to %d gave %q (%d cols)", n, got, rt.display_width(got))
+	}
+	four := truncate("abcdefghijkl", 4, "…", {}, context.allocator)
+	defer delete(four, context.allocator)
+	testing.expect_value(t, four, "abc…")
+
+	// A line that already fits is copied byte for byte -- no tail, no reset.
+	fits := truncate("abc", 8, "…", {}, context.allocator)
+	defer delete(fits, context.allocator)
+	testing.expect_value(t, fits, "abc")
+
+	// A tail wider than the whole budget is dropped rather than the content: a
+	// row consisting only of ellipsis carries no information at all.
+	tiny := truncate("abcdef", 2, "...", {}, context.allocator)
+	defer delete(tiny, context.allocator)
+	testing.expect_value(t, tiny, "ab")
+
+	// Multi-line stays multi-line, and a line that fits is left alone.
+	ml := truncate("abcdef\nxy", 3, "", {}, context.allocator)
+	defer delete(ml, context.allocator)
+	testing.expect_value(t, ml, "abc\nxy")
+}
+
+@(test)
+test_truncate_closes_a_style_run_it_cut_through :: proc(t: ^testing.T) {
+	// A cut that lands mid-run leaves the run open, which costs runetea's .Diff
+	// renderer unbounded per-frame growth (this file's header) and floods the
+	// next row's background on a real terminal. The reset goes AFTER the tail so
+	// the ellipsis is painted in the style of the text it replaced.
+	got := truncate("\e[31mabcdef", 4, "…", {}, context.allocator)
+	defer delete(got, context.allocator)
+	testing.expect_value(t, got, "\e[31mabc…\e[0m")
+
+	// Escapes AFTER the cut are dropped: they style nothing that is still there.
+	// Escapes before it are kept, because they style what survived.
+	mixed := truncate("ab\e[32mcd\e[0mef", 3, "", {}, context.allocator)
+	defer delete(mixed, context.allocator)
+	testing.expect_value(t, mixed, "ab\e[32mc\e[0m")
+}
+
+@(test)
+test_truncation_never_splits_a_grapheme_cluster :: proc(t: ^testing.T) {
+	// F25's mechanical half. Cutting between a base rune and its combining mark,
+	// or inside a ZWJ sequence, puts bytes on the wire that no terminal can paint
+	// back into what the caller wrote -- and then the row is padded to a width
+	// derived from the un-split string, so it is ragged as well as corrupt.
+	for input in ([]string{"éx", "❤️x", "\U0001F1EF\U0001F1F5x", "👨‍💻x", "日本x"}) {
+		for n in 0 ..= 8 {
+			got := truncate(input, n, "", {}, context.allocator)
+			defer delete(got, context.allocator)
+			testing.expectf(t, rt.display_width(got) <= n, "%q -> %d cols for a %d-col budget", input, rt.display_width(got), n)
+			testing.expectf(t, utf8.valid_string(got), "%q truncated to %d is not valid UTF-8: %q", input, n, got)
+			testing.expectf(t, strings.has_prefix(input, got), "%q truncated to %d is not a prefix: %q", input, n, got)
+		}
+	}
+}
+
+@(test)
+test_per_cluster_widths_sum_to_the_whole_strings_display_width :: proc(t: ^testing.T) {
+	// THE EQUIVALENCE prefix_fitting is built on, pinned from the outside. It
+	// walks cluster boundaries locally (core:unicode) and asks rt.display_width
+	// for every width, one cluster at a time; that is only sound if measuring the
+	// clusters separately gives the same answer as measuring the whole string.
+	//
+	// It is also the assertion that catches the mistake this area is full of:
+	// summing PER-RUNE widths instead of per-cluster ones scores "👨‍💻" as 4 (or 6,
+	// depending on the table) against the 2 columns it advances, so a truncation
+	// built on it cuts in the wrong place AND pads to the wrong width.
+	for input in ([]string{"hello", "日本語", "é", "❤️", "\U0001F1EF\U0001F1F5", "👨‍💻", "a日❤️b", "👨‍👩‍👧‍👦"}) {
+		sum, rest := 0, input
+		for len(rest) > 0 {
+			n := clip_prefix_len(rest)
+			sum += rt.display_width(rest[:n])
+			rest = rest[n:]
+		}
+		testing.expectf(t, sum == rt.display_width(input),
+			"%q: per-cluster sum %d != display_width %d", input, sum, rt.display_width(input))
+	}
+}
+
+// Byte length of the first grapheme cluster of `s`. Written out here rather than
+// made non-file-private in render.odin: a test that called the implementation's
+// own helper would pass even if that helper walked runes instead of clusters,
+// which is exactly the defect the test above exists to catch.
+@(private = "file")
+clip_prefix_len :: proc(s: string) -> int {
+	it := utf8.decode_grapheme_iterator_make(s)
+	seen := 0
+	for {
+		_, g, more := utf8.decode_grapheme_iterate(&it)
+		if !more { break }
+		seen += 1
+		if seen == 2 { return g.byte_index }
+	}
+	return len(s)
+}
+
+@(test)
+test_measure_reports_the_number_render_pads_to :: proc(t: ^testing.T) {
+	// F25's other half. RuneGloss pads every row to runetea's opinion of how many
+	// columns a cluster occupies, and terminals disagree with that opinion on
+	// emoji (VTE paints "👨‍💻" as 4 and "❤️" as 1, where the UCD rules say 2 and 2).
+	// That disagreement cannot be settled from in here -- only the terminal knows
+	// -- but it USED TO BE UNDETECTABLE from outside, because there was no way to
+	// ask RuneGloss what number it was about to pad to. There is now, and it is
+	// the same measure render uses, which is the part worth pinning.
+	for input in ([]string{"hello", "日本語", "❤️", "👨‍💻", "\U0001F1EF\U0001F1F5", "a\nbb\nccc"}) {
+		s := new_style_profile(.True_Color)
+		out := render(s, input, context.allocator)
+		defer delete(out, context.allocator)
+		w, h := measure(input)
+		ow, oh := measure(out)
+		testing.expectf(t, w == ow && h == oh, "%q: measure said %dx%d, render produced %dx%d", input, w, h, ow, oh)
+	}
+
+	// And the POLICY is reachable, which it was not: `wopts` is the whole
+	// rt.Width_Options value rather than one hand-copied bool, so every present
+	// and future width knob is exposed by construction. Box-drawing characters
+	// are East_Asian_Width=Ambiguous, which is the knob that exists today.
+	a := new_style_profile(.True_Color)
+	b := new_style_profile(.True_Color); ambiguous_wide(&b, true)
+	testing.expect_value(t, measure_width("┌─┐", a.wopts), 3)
+	testing.expect_value(t, measure_width("┌─┐", b.wopts), 6)
+}
+
+// The OTHER width policy, and the one F25 was actually about. A live VTE 2.91
+// advances 4 columns for "👨‍💻" and 1 for "❤️" where the UCD emoji-presentation
+// rules -- and therefore this package's default padding -- say 2 and 2. That
+// cannot be settled from in here (kitty and WezTerm advance 2 and 2, so
+// switching the numbers would only move the raggedness), but it can be SAID,
+// and this pins that saying it reaches the renderer and not merely the measure.
+@(test)
+test_emoji_width_policy_squares_a_box_on_a_per_character_terminal :: proc(t: ^testing.T) {
+	dev    :: "\U0001F468\u200D\U0001F4BB"
+	legacy := rt.Width_Options{emoji_width = .Legacy_Wcwidth}
+
+	cluster_style := new_style_profile(.True_Color)
+	legacy_style  := new_style_profile(.True_Color); emoji_width(&legacy_style, .Legacy_Wcwidth)
+	border(&cluster_style, NORMAL)
+	border(&legacy_style,  NORMAL)
+
+	// The knob reaches the measure...
+	testing.expect_value(t, measure_width(dev, cluster_style.wopts), 2)
+	testing.expect_value(t, measure_width(dev, legacy_style.wopts),  4)
+
+	// ...and it reaches the BOX, which is the half an application could not
+	// reach before: the border rows are sized from the same measure the content
+	// row is padded to, so selecting the policy squares the frame under it.
+	for st, i in ([]Style{cluster_style, legacy_style}) {
+		st := st
+		opts := st.wopts
+		out  := render(&st, dev, context.allocator)
+		defer delete(out, context.allocator)
+		lines := strings.split_lines(out, context.allocator)
+		defer delete(lines, context.allocator)
+		testing.expect_value(t, len(lines), 3)
+		want := rt.display_width(lines[0], opts)
+		testing.expect_value(t, want, i == 0 ? 4 : 6)   // 2 or 4 columns of emoji + 2 of border
+		for line, row in lines {
+			testing.expectf(t, rt.display_width(line, opts) == want,
+				"policy %v row %d measures %d, want %d: %q",
+				opts.emoji_width, row, rt.display_width(line, opts), want, line)
+		}
+	}
+
+	// AND THE DEFECT ITSELF, pinned rather than described: the block rendered
+	// under the default policy is NOT rectangular when measured the way a
+	// VTE-based terminal (GNOME Terminal, Tilix, Terminator, xfce4) measures
+	// it. 4-6-4 is the right border hanging two columns outside the frame.
+	ragged := render(&cluster_style, dev, context.allocator)
+	defer delete(ragged, context.allocator)
+	rows := strings.split_lines(ragged, context.allocator)
+	defer delete(rows, context.allocator)
+	testing.expect_value(t, rt.display_width(rows[0], legacy), 4)
+	testing.expect_value(t, rt.display_width(rows[1], legacy), 6)
+	testing.expect_value(t, rt.display_width(rows[2], legacy), 4)
+}
+
+// ---------------------------------------------------------------------------
+// joins
+// ---------------------------------------------------------------------------
+
+@(test)
+test_join_horizontal_keeps_every_column_aligned :: proc(t: ^testing.T) {
+	left  := "aaa\nbbb\nccc"
+	right := "XX\nYY"
+
+	top := join_horizontal(.Top, {left, right}, {}, context.allocator)
+	defer delete(top, context.allocator)
+	testing.expect_value(t, top, "aaaXX\nbbbYY\nccc  ")
+
+	bot := join_horizontal(.Bottom, {left, right}, {}, context.allocator)
+	defer delete(bot, context.allocator)
+	testing.expect_value(t, bot, "aaa  \nbbbXX\ncccYY")
+
+	mid := join_horizontal(.Middle, {left, right}, {}, context.allocator)
+	defer delete(mid, context.allocator)
+	testing.expect_value(t, mid, "aaaXX\nbbbYY\nccc  ")
+
+	// Ragged blocks: each block is padded to ITS OWN width, so column offsets
+	// stay fixed down the whole join. This is only well-defined now that `width`
+	// clamps -- under the old floor semantics one long line widened one block's
+	// rows and not the others, and everything below the join sheared.
+	ragged := join_horizontal(.Top, {"a\nlonger", "1\n2"}, {}, context.allocator)
+	defer delete(ragged, context.allocator)
+	testing.expect_value(t, ragged, "a     1\nlonger2")
+}
+
+@(test)
+test_join_closes_a_styled_row_before_padding_it :: proc(t: ^testing.T) {
+	// Without this, the padding of a red row paints red and the join grows a
+	// coloured notch exactly where the blocks meet.
+	got := join_horizontal(.Top, {"\e[41mred", "x"}, {}, context.allocator)
+	defer delete(got, context.allocator)
+	testing.expect_value(t, got, "\e[41mred\e[0mx")
+
+	// A row that already closed itself -- which every row this package emits does
+	// -- gets no second reset.
+	clean := join_horizontal(.Top, {"\e[41mred\e[0m", "x"}, {}, context.allocator)
+	defer delete(clean, context.allocator)
+	testing.expect_value(t, clean, "\e[41mred\e[0mx")
+}
+
+@(test)
+test_join_vertical_aligns_narrow_blocks_against_the_widest :: proc(t: ^testing.T) {
+	l := join_vertical(.Left, {"aaaa", "b"}, {}, context.allocator)
+	defer delete(l, context.allocator)
+	testing.expect_value(t, l, "aaaa\nb   ")
+
+	r := join_vertical(.Right, {"aaaa", "b"}, {}, context.allocator)
+	defer delete(r, context.allocator)
+	testing.expect_value(t, r, "aaaa\n   b")
+
+	// Odd remainder goes RIGHT, the same fixed choice render's own centring
+	// makes, so a centred block and a centred join cannot disagree by a column.
+	c := join_vertical(.Center, {"aaaa", "b"}, {}, context.allocator)
+	defer delete(c, context.allocator)
+	testing.expect_value(t, c, "aaaa\n b  ")
+
+	testing.expect_value(t, join_vertical(.Left, {}, {}, context.allocator), "")
+	testing.expect_value(t, join_horizontal(.Top, {}, {}, context.allocator), "")
+}
+
+// ---------------------------------------------------------------------------
+// the ^Style / by-value friction
+// ---------------------------------------------------------------------------
+
+@(private = "file")
+Themed :: struct { title: Style }
+
+// SHAPED EXACTLY LIKE A RUNETEA VIEW -- model by value, allocator second -- so
+// that if the proc group ever stops resolving, this file stops compiling rather
+// than this test starting to fail in some subtler way.
+@(private = "file")
+themed_view :: proc(m: Themed, alloc: mem.Allocator) -> string {
+	return render(m.title, "X", alloc)   // by value: `&m.title` cannot compile
+}
+
+@(test)
+test_render_takes_a_style_by_pointer_or_by_value :: proc(t: ^testing.T) {
+	// F49/F52. runetea's view contract passes the model BY VALUE, and an Odin
+	// procedure parameter is not addressable, so `rg.render(&m.title, ...)` --
+	// the pattern docs/API.md §12 recommends -- was a compile error pointing at
+	// Odin addressability rather than at anything the caller did wrong. The proc
+	// group makes both spellings legal without forcing the 184-byte copy on the
+	// call sites that already hold a local and pay nothing today.
+	m := Themed{title = new_style_profile(.True_Color)}
+	bold(&m.title, true)
+
+	by_value := themed_view(m, context.allocator)
+	defer delete(by_value, context.allocator)
+
+	local := m.title
+	by_ptr := render(&local, "X", context.allocator)
+	defer delete(by_ptr, context.allocator)
+
+	testing.expect_value(t, by_value, "\e[1mX\e[0m")
+	testing.expect_value(t, by_value, by_ptr)
+}
+
 
 @(test)
 test_render_allocates_only_from_the_supplied_allocator :: proc(t: ^testing.T) {
@@ -510,4 +1007,36 @@ test_render_allocates_only_from_the_supplied_allocator :: proc(t: ^testing.T) {
 	out := render(&s, "日本語\n\e[1mx\e[0m\n", context.allocator)
 	defer delete(out, context.allocator)
 	testing.expect(t, len(out) > 0)
+}
+
+@(test)
+test_a_tab_is_measured_from_the_column_it_actually_lands_in :: proc(t: ^testing.T) {
+	// prefix_fitting threads opts.start_col through runetea's cluster iterator,
+	// and this is what that buys. A TAB's width is next_tab_stop(col) - col, so
+	// the same "\t" is 8 columns at column 0 and 1 column at column 7. Measuring
+	// each escape-free run from column 0 -- which is what a per-cluster
+	// display_width call over an isolated span does -- scores every tab after the
+	// first one wrong, and the cut lands somewhere the terminal does not agree is
+	// that many columns in.
+	//
+	// The assertion is the additivity law runetea's Width_Options states: a
+	// truncation of `s` to n columns must itself measure at most n columns WHEN
+	// MEASURED THE SAME WAY.
+	for input in ([]string{"a\tb\tc", "\t\t", "ab\tcd", "日\t本"}) {
+		for n in 0 ..= 20 {
+			got := truncate(input, n, "", {}, context.allocator)
+			defer delete(got, context.allocator)
+			testing.expectf(t, rt.display_width(got) <= n,
+				"truncate(%q, %d) = %q measures %d", input, n, got, rt.display_width(got))
+			testing.expectf(t, strings.has_prefix(input, got), "%q is not a prefix of %q", got, input)
+		}
+	}
+
+	// And the whole string survives once the budget reaches its real width, which
+	// is the direction a from-column-zero measure gets wrong (it over-counts the
+	// later tabs and cuts a string that fits).
+	full := rt.display_width("a\tb\tc")
+	got := truncate("a\tb\tc", full, "", {}, context.allocator)
+	defer delete(got, context.allocator)
+	testing.expect_value(t, got, "a\tb\tc")
 }

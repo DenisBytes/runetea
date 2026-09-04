@@ -150,7 +150,14 @@ Timer_Handle :: struct {
 // NO CAPABILITY IS LOST: tick_cancellable below still covers the genuine
 // "cancel a one-shot before it fires" case, at the cost of an explicit
 // timer_stop the caller has actually opted into.
-tick :: proc(d: time.Duration, fn: Timer_Fn, env: $E, alloc: mem.Allocator) -> Cmd {
+//
+// `alloc` MUST OUTLIVE THE FRAME, exactly as it must for cmd_from: the fn env
+// is heap-cloned into it and read on the TIMER thread, long after the frame
+// that built the Cmd has been reclaimed. Passing update()'s own `alloc` is
+// refused here -- see cmd.odin's THE FRAME ALLOCATOR IS NOT A Cmd ALLOCATOR.
+// `loc` is defaulted and exists only so the refusal can name the call site.
+tick :: proc(d: time.Duration, fn: Timer_Fn, env: $E, alloc: mem.Allocator, loc := #caller_location) -> Cmd {
+	cmd_alloc_contract_check("tick()", alloc, loc)
 	c, _ := timer_new(d, fn, env, alloc, repeat = false, caller_ref = false)
 	return c
 }
@@ -166,7 +173,8 @@ tick :: proc(d: time.Duration, fn: Timer_Fn, env: $E, alloc: mem.Allocator) -> C
 // the caller's `h` stays valid after the subsystem is done with it, and
 // timer_stop is the only thing that ever releases it. Do not reach for this
 // as the default -- if you are not going to cancel, use tick().
-tick_cancellable :: proc(d: time.Duration, fn: Timer_Fn, env: $E, alloc: mem.Allocator) -> (Cmd, ^Timer_Handle) {
+tick_cancellable :: proc(d: time.Duration, fn: Timer_Fn, env: $E, alloc: mem.Allocator, loc := #caller_location) -> (Cmd, ^Timer_Handle) {
+	cmd_alloc_contract_check("tick_cancellable()", alloc, loc)
 	return timer_new(d, fn, env, alloc, repeat = false, caller_ref = true)
 }
 
@@ -198,7 +206,8 @@ tick_cancellable :: proc(d: time.Duration, fn: Timer_Fn, env: $E, alloc: mem.All
 // a few dozen stranded bytes, so "you forgot to stop it" is a genuine caller
 // error worth forcing the caller to confront. THE CALLER MUST CALL timer_stop
 // ON THE RETURNED HANDLE EXACTLY ONCE.
-every :: proc(d: time.Duration, fn: Timer_Fn, env: $E, alloc: mem.Allocator) -> (Cmd, ^Timer_Handle) {
+every :: proc(d: time.Duration, fn: Timer_Fn, env: $E, alloc: mem.Allocator, loc := #caller_location) -> (Cmd, ^Timer_Handle) {
+	cmd_alloc_contract_check("every()", alloc, loc)
 	return timer_new(d, fn, env, alloc, repeat = true, caller_ref = true)
 }
 
@@ -225,7 +234,18 @@ timer_new :: proc(d: time.Duration, fn: Timer_Fn, env: $E, alloc: mem.Allocator,
 	h.dur       = d
 	h.repeat    = repeat
 
-	return Cmd{timer = h}, h
+	// SINGLE-USE, same gate every other heap-owning Cmd constructor passes
+	// through -- see cmd.odin's Cmd ledger. A Tick/Every Cmd owns a
+	// refcounted Timer_Handle plus the cloned fn env above, and the
+	// subsystem's reference is released exactly once, by whichever of
+	// timer_fire / timer_dispatch's failure branch / compose_free_unrun gets
+	// there. Dispatching the SAME Cmd value twice armed the same handle twice
+	// against one reference, so the second fire released a refcount that was
+	// already at zero and freed h and h.fn_env a second time. Note the
+	// handle a caller gets back from tick_cancellable()/every() is NOT
+	// affected: it is a separate reference with its own timer_stop, and
+	// re-dispatching the Cmd never changes what that handle owes.
+	return Cmd{timer = h, ticket = cmd_ticket_issue()}, h
 }
 
 // Cancels a pending Tick (from tick_cancellable) or a repeating Every.
@@ -336,9 +356,12 @@ Timer_Service :: struct {
 }
 
 // Returns the running loop, starting the thread on the first call. nil means
-// the timer subsystem failed to start (e.g. nbio.acquire_thread_event_loop
-// itself failed) or has already been torn down -- callers must treat a nil
-// result as "this Tick/Every will never fire" rather than crash.
+// the timer subsystem failed to start -- either the thread could not be
+// created at all (F15, below) or it started and could not acquire an nbio
+// event loop -- or that it has already been torn down. Callers must treat a
+// nil result as "this Tick/Every will never fire" rather than crash. Both
+// failure modes publish start_failed/start_error, so timer_dispatch can tell
+// them from the torn-down case, which is not reportable.
 @(private = "file")
 timer_service_ensure_started :: proc(ts: ^Timer_Service) -> ^nbio.Event_Loop {
 	sync.mutex_lock(&ts.start_mu)
@@ -347,7 +370,33 @@ timer_service_ensure_started :: proc(ts: ^Timer_Service) -> ^nbio.Event_Loop {
 	if ts.started { return ts.loop }
 	if ts.stop_requested { return nil }
 
-	ts.thread = thread.create(timer_thread_body)
+	ts.thread = thread_create_checked(timer_thread_body)
+	if ts.thread == nil {
+		// F15: thread.create returns nil, silently and without faulting, when
+		// pthread_create fails (core/thread/thread_unix.odin:122-125). This
+		// used to be unchecked, so `ts.thread.data = ts` on the next line
+		// segfaulted -- and had it survived, sema_wait below would have parked
+		// the DISPATCHING thread forever on a `ready` nothing would ever post.
+		// Under the RLIMIT_NPROC pressure this finding is about, that is a
+		// crash (or a hang) inside an ordinary tick(), on the loop thread.
+		//
+		// PUBLISHED THE SAME WAY THE nbio ACQUIRE FAILURE IS, because it is
+		// the same fact from the application's point of view: this Dispatcher
+		// has no timer subsystem and no Tick or Every on it will ever fire.
+		// Setting `started` is what makes it PERMANENT and silent-free: every
+		// later ensure_started returns this same nil without trying (and
+		// failing) to spawn again, and timer_dispatch turns each attempt into
+		// the one-per-Dispatcher Timer_Unavailable_Msg. Retrying would be the
+		// worse choice under exactly the pressure that causes this -- a
+		// re-issuing animation tick would attempt a pthread_create per frame.
+		//
+		// timer_service_stop's `if th == nil` arm is the other half of this:
+		// `started` is true here with no thread to join.
+		ts.start_failed = true
+		ts.start_error  = msg_text_from("timer subsystem: could not start the timer thread (pthread_create failed)")
+		ts.started      = true
+		return nil
+	}
 	ts.thread.data = ts
 	ts.thread.init_context = context
 	thread.start(ts.thread)
@@ -568,8 +617,17 @@ timer_service_stop :: proc(ts: ^Timer_Service) {
 
 	if !started { return }
 
-	thread.join(th)
-	thread.destroy(th)
+	// th == nil with started == true is timer_service_ensure_started's
+	// thread-creation failure (F15): the service is permanently marked as
+	// started-and-dead so nothing retries the spawn, but there is no thread to
+	// join and thread.join/destroy would dereference the nil. The two sweeps
+	// below still run -- they are cheap on empty lists, and skipping them
+	// outright would make this arm the one teardown path that can leak a
+	// handle if timer_dispatch's ordering ever changes.
+	if th != nil {
+		thread.join(th)
+		thread.destroy(th)
+	}
 
 	// Anything still in ts.pending here was registered but never armed: the
 	// timer thread's loop checks stop_requested BEFORE its drain, so a handle

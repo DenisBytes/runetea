@@ -1,11 +1,14 @@
 package runetea
 
 import "base:runtime"
+import "core:fmt"
 import "core:mem"
 import "core:mem/virtual"
 
-// One arena per event-loop iteration. Every Msg payload and every View string
-// is allocated here and released wholesale by frame_reset.
+// One arena per FRAME (see the LIFETIME CONTRACT below for why that is no
+// longer the same thing as one arena per event-loop iteration). Every Msg
+// payload and every View string is allocated here and released wholesale by
+// frame_reset.
 //
 // This also serves the crash path: longjmp does not run `defer`, so after a
 // recovered panic the loop calls frame_reset to reclaim everything the failed
@@ -19,12 +22,31 @@ import "core:mem/virtual"
 // model. See Program.update's own comment and
 // docs/superpowers/tier1-coverage-decision.md §5.
 //
-// LIFETIME CONTRACT: frame_reset runs once per iteration, on the main thread,
-// and unconditionally reclaims (memory_block_dealloc) everything allocated
-// from this arena since the last reset -- including on the crash-recovery
-// path above, where longjmp has skipped every `defer` that might otherwise
-// have kept something alive longer. A frame_allocator(fa) allocation is only
-// good for the remainder of the iteration that made it.
+// LIFETIME CONTRACT: frame_reset runs once per FRAME, on the main thread, and
+// unconditionally reclaims (memory_block_dealloc) everything allocated from
+// this arena since the last reset -- including on the crash-recovery path
+// above, where longjmp has skipped every `defer` that might otherwise have
+// kept something alive longer. A frame_allocator(fa) allocation is good until
+// the next frame_reset, and no longer.
+//
+// A FRAME IS NOT A MESSAGE, since coalescing. This sentence used to say "only
+// good for the remainder of the ITERATION that made it", and that was exact
+// while apply() ended in a render: one message in, one paint out, one reset.
+// run() and run_nbio now apply a whole BATCH -- up to COALESCE_BUDGET messages
+// (tea.odin) -- and paint once at the end, so the reset that reclaims what the
+// first message's update() allocated fires only after the LAST message of the
+// batch has been applied and the view has run. The lifetime got strictly
+// LONGER, so nothing that was safe under the old sentence became unsafe under
+// this one and no caller had to change; the sentence was simply stricter than
+// the truth, and a lifetime rule that overstates is one callers learn to
+// distrust. What did NOT change is where the reset lives: guarded_render
+// (tea.odin) calls frame_reset on every one of its exit paths, the successful
+// one and the view-panicked one alike, so "once per frame" is unconditional
+// rather than a property of the happy path.
+//
+// The arena is virtual.arena_init_growing, so the higher per-batch high-water
+// mark has no cap to run into: a batch that allocates more than a message did
+// grows the arena and hands the blocks back at the same single reset.
 //
 // Anything that crosses a thread boundary, or that may still be sitting
 // unprocessed in the mailbox when the next frame_reset fires, MUST be boxed
@@ -60,6 +82,42 @@ frame_allocator :: proc(fa: ^Frame_Arena) -> mem.Allocator {
 
 frame_reset :: proc(fa: ^Frame_Arena) {
 	virtual.arena_free_all(&fa.arena)
+}
+
+// THE FIRST BYTES OF box()'s REFUSAL, as a named constant rather than a literal
+// buried in the format string, because tea.odin's apply_msg matches on it and a
+// coupling between two files should be visible from both ends.
+//
+// WHY THERE IS A MARKER AT ALL. This panic is raised on a pool worker or a
+// detached Cmd thread, recovered by run_cmd_guarded (cmd.odin) and delivered to
+// the application as a Panicked_Msg -- the SAME Msg type that carries an
+// ordinary panic from inside a Cmd body. Those two are not the same kind of
+// event and must not have the same consequence:
+//
+//   AN ORDINARY Cmd PANIC is a runtime condition. The app decides what it
+//   means, the session continues, and cmd.odin's design decision b (Panicked_Msg
+//   rather than a session-ending error) is right about it.
+//   A REFUSED box() IS A CONTRACT VIOLATION -- the program asked the framework
+//   to do something the framework has told it, in this file and in
+//   docs/API.md, that it will not do. There is nothing for an application to
+//   decide and nothing for it to recover: that Cmd's result will never arrive,
+//   and it will never arrive again on the next attempt either.
+//
+// Without a marker the two are indistinguishable downstream (both are a
+// Msg_Text), which is exactly why the second one used to be as ignorable as the
+// first. See apply_msg (tea.odin) for what happens to it now and for the
+// alternatives that were weighed.
+@(private = "package")
+BOX_CONTRACT_PANIC :: "box(): "
+
+// True iff `text` is the panic box() raises for a non-POD Msg -- i.e. the panic
+// text that reached us through a Panicked_Msg was a MESSAGE-CONTRACT violation
+// and not an application's own panic. A prefix test rather than a substring
+// search on purpose: an app is free to panic with any text it likes, including
+// text quoting this one, and a report is only ours if OUR words come first.
+@(private = "package")
+is_box_contract_panic :: proc(text: string) -> bool {
+	return len(text) >= len(BOX_CONTRACT_PANIC) && text[:len(BOX_CONTRACT_PANIC)] == BOX_CONTRACT_PANIC
 }
 
 // MESSAGE OWNERSHIP CONTRACT (T1 decision, docs/superpowers/message-ownership-
@@ -105,11 +163,12 @@ frame_reset :: proc(fa: ^Frame_Arena) {
 //
 // `alloc` is the caller's choice, and that choice matters: see Frame_Arena's
 // LIFETIME CONTRACT above. Box with frame_allocator(fa) only for a payload
-// consumed within the same loop iteration that created it. Box with
-// context.allocator (or another allocator that outlives the frame) for
-// anything crossing a thread boundary or headed for the mailbox queue --
-// Task 5's worker pool and Task 7's signal-watcher thread both need this.
-box :: proc(v: $V, alloc: mem.Allocator) -> any {
+// consumed within the same FRAME that created it -- which, since coalescing,
+// may span several messages. Box with context.allocator (or another allocator
+// that outlives the frame) for anything crossing a thread boundary or headed
+// for the mailbox queue -- Task 5's worker pool and Task 7's signal-watcher
+// thread both need this.
+box :: proc(v: $V, alloc: mem.Allocator, loc := #caller_location) -> any {
 	// A `panic()`, not `assert()`: -disable-assert strips assert() (see
 	// guard.odin's own FIX 3 for the exact same lesson learned once already
 	// in this codebase, about g_armed's re-entrancy guard) but NOT panic(),
@@ -117,9 +176,27 @@ box :: proc(v: $V, alloc: mem.Allocator) -> any {
 	// with a bad V -- at the box() call site inside the offending Cmd, with
 	// V's name in the message -- not silently later as a leak or a
 	// use-after-free discovered by some unrelated symptom.
+	//
+	// THE TYPE NAME AND THE CALL SITE ARE IN THE TEXT, not merely promised
+	// by it. This comment and docs/API.md:379 both said the panic names your
+	// type; for a long time it did not -- the message was a fixed string with
+	// no %v in it at all, so the one fact a reader needs (WHICH Msg is not
+	// POD, and where it was boxed) was the one fact it withheld. Worse, that
+	// panic is raised on a pool worker, recovered by run_cmd_guarded
+	// (cmd.odin), and arrives as a Panicked_Msg whose text was therefore
+	// interchangeable between every non-POD Msg in the program.
+	//
+	// `loc` is threaded through the FORMAT STRING rather than passed as
+	// panic's own `loc` parameter, and that is not redundancy: guard.odin's
+	// guard_assertion_failure clones only `message` and discards the
+	// runtime.Source_Code_Location it is handed, so a location passed the
+	// ordinary way is thrown away before it can reach the Panicked_Msg. Both
+	// facts lead the message so they survive Msg_Text's 255-byte truncation
+	// (msg.odin).
 	if !is_pod_type(typeid_of(V)) {
-		panic("box(): Msg type is not POD (contains a string/pointer/slice/map/any field, " +
-			"directly or nested) -- see arena.odin's MESSAGE OWNERSHIP CONTRACT and msg.odin's Msg_Text")
+		fmt.panicf(
+			BOX_CONTRACT_PANIC + "Msg type %v boxed at %v is not POD -- it has a string/pointer/slice/map/any field, directly or nested. See arena.odin's MESSAGE OWNERSHIP CONTRACT and msg.odin's Msg_Text.",
+			typeid_of(V), loc)
 	}
 	p, err := new(V, alloc)
 	if err != nil { return nil }

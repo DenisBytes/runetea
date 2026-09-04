@@ -1,5 +1,6 @@
 package runetea
 
+import "core:c/libc"
 import "core:sys/linux"
 import "core:sys/posix"
 
@@ -27,10 +28,17 @@ Kitty_Flags :: bit_set[Kitty_Flag; u8]
 
 Term_State :: struct {
 	fd:           posix.FD,
+	// The COOKED settings, captured by the acquire that first put this terminal
+	// into raw mode and never overwritten until term_restore_c has handed them
+	// back. Guarded by raw_active for exactly that reason -- see term_acquire's
+	// ALREADY OURS branch, and the bug it exists to prevent: an unguarded
+	// tcgetattr on a second entry captures the RAW termios as the "cooked"
+	// settings, and the next term_restore() then faithfully reinstates raw mode
+	// on a clean, fully-paired, exit-0 run.
 	saved:        posix.termios,
 	raw_active:   bool,
 	// True for exactly the interval in which ONE entry of ours could be on
-	// the terminal's keyboard stack. See term_enter_raw's second ordering
+	// the terminal's keyboard stack. See kitty_enable's second ordering
 	// invariant and term_restore_c's POP-EXACTLY-ONCE comment -- this flag is
 	// the whole mechanism that stops the normal teardown and the crash-signal
 	// teardown from both popping.
@@ -40,11 +48,15 @@ Term_State :: struct {
 	// it guards is genuinely milder; see term_restore_c's "SET/RESET, NOT
 	// PUSH/POP" note for why, and for why the guard stays anyway.
 	paste_active: bool,
-	// T2-A. True from the first moment the renderer could have written a
-	// "\e[?25l" to this terminal. Set by cursor_hide_arm below (never
-	// cleared except by term_restore_c), so the paired "\e[?25h" is written
-	// on every teardown path -- see term_restore_c's DECTCEM note for why
-	// this one is deliberately STICKY where kitty_active is not.
+	// T2-A. True from the first moment a "\e[?25l" could have reached this
+	// terminal from this process. Two things set it and neither ever clears
+	// it (only term_restore_c does): cursor_hide_enable, when the application
+	// declared Term_Opts.cursor_hide and this file wrote the hide itself, and
+	// cursor_hide_arm, when render.odin is about to write one into a frame.
+	// One flag for both because the teardown's question is not "who hid it"
+	// but "could this process have hidden it", and the answer drives exactly
+	// one write. See term_restore_c's DECTCEM note for why this one is
+	// deliberately STICKY where kitty_active is not.
 	cursor_hidden: bool,
 	// T2-B. The guarded flag AND the value the teardown needs: .None means "we
 	// never enabled mouse reporting", anything else names the tracking mode
@@ -63,6 +75,98 @@ Term_State :: struct {
 	// what a missed `l` costs the user, and what an unpaired `l` (one written by
 	// a process that never wrote the `h`) does to a terminal.
 	alt_active:    bool,
+	// What the application ASKED FOR, kept so that the terminal can be rebuilt
+	// from nothing after a job-control stop -- guard.odin's SIGTSTP handler tears
+	// the terminal all the way down before the process stops, and has to put
+	// exactly this back on SIGCONT.
+	//
+	// NOT A GUARD, and deliberately not cleared by term_restore_c. Every field
+	// above it answers "did WE set this, and is it still set?"; this one answers
+	// "what did the caller want?", which survives a teardown by design. Reading
+	// it as a guard would break the pairing discipline the six flags enforce, so
+	// nothing in this file does: the only reader is the resume path, which gates
+	// on the raw_active it captured BEFORE the teardown.
+	opts:          Term_Opts,
+	// The capability verdict from the acquire that entered raw mode, cached
+	// rather than re-derived. Two reasons, and the second is the binding one:
+	// TERM cannot meaningfully change under a running process, and getenv(3) is
+	// NOT on POSIX's async-signal-safe list -- the SIGCONT resume path re-enters
+	// term_acquire from a signal handler and must not consult the environment
+	// there. See term_supports_escapes.
+	escapes_ok:    bool,
+}
+
+// The terminal opt-ins, as ONE named-field struct rather than five trailing
+// positional parameters. `Term_Opts{alt = true}` says at the call site which
+// mode it is asking for; the signature this replaces could not.
+//
+// WHY THIS IS A BREAKING CHANGE AND NOT A DOC FIX. The old spelling was
+// `term_enter_raw(fd, kb: Kitty_Flags = {}, paste: bool = false, mouse:
+// Mouse_Mode = .None, focus: bool = false, alt: bool = false)` -- five trailing
+// opt-ins, THREE OF THEM BARE BOOLS, two of those adjacent. Odin's type checker
+// catches a transposition across the Kitty_Flags or Mouse_Mode slots, so the
+// silent failure was confined to the bools and to any arg-count slip that
+// shifted them: write `term_enter_raw(fd, {.Disambiguate}, true, .Normal, true)`
+// meaning "alternate screen" and you get `?1004h` (focus reporting) on the wire
+// where you wanted `?1049h` (alternate screen). It compiles, it returns true,
+// the frame looks identical, and the only way to find it is to read DECSET
+// numbers off the wire. Named arguments were the cheaper fix and were rejected:
+// they are optional, and not one of the 48 mentions of this proc anywhere in
+// the repository -- source, tests or docs -- had used one, including the two
+// call sites a user copies from (examples/editor and docs/API.md, both passing
+// all six positionally). A convention nobody follows is not a mitigation.
+//
+// THE ZERO VALUE MEANS EXACTLY WHAT THE OLD DEFAULTS MEANT: touch nothing.
+// `kb == {}` writes no keyboard push and pushes nothing on the terminal's
+// stack, `paste == false`/`focus == false`/`alt == false`/`cursor_hide ==
+// false` write no DECSET, and `mouse == .None` writes no tracking mode -- and
+// the paired teardown in term_restore_c stays silent for each. That is what
+// makes `term_enter_raw(fd)` still mean "raw mode and not one byte more", which
+// is what every tool under tools/ relies on.
+Term_Opts :: struct {
+	kb:    Kitty_Flags,
+	paste: bool,
+	mouse: Mouse_Mode,
+	focus: bool,
+	alt:   bool,
+	// T2-A, and the newest of the six: HIDE THE HARDWARE CARET FOR THE WHOLE
+	// SESSION. `CSI ? 25 l` on acquire, `CSI ? 25 h` from term_restore_c on
+	// every exit path there is -- the orderly one, the crash handlers, and the
+	// SIGTSTP stop.
+	//
+	// WHAT THIS FIXES, and it is a terminal left broken after exit rather than
+	// a cosmetic. There was no supported way to say it. .Full_Screen and .Diff
+	// hide the caret themselves because they own the viewport (render.odin's
+	// Cursor), but .Inline does not and must not, and NO mode offered the
+	// declaration to an application that simply does not want a blinking block
+	// in its output: `Cursor{show = false}` is the zero value and reads as "no
+	// opinion", and cursor_hide_arm is package-private. An app that wrote
+	// "\e[?25l" itself therefore got NO paired show from term_restore, from the
+	// crash handlers, or from the stop path -- measured on a pty as exit 0 with
+	// hides=1 shows=0, i.e. the user's SHELL left with an invisible caret,
+	// recoverable only by blind-typing `reset` or `tput cnorm`.
+	//
+	// WHY THIS AND NOT AN EXPORTED cursor_hide_arm, which is the smaller
+	// change and was the obvious one. An arm-only export would still leave the
+	// app writing the bytes, and the bytes are the half that cannot be
+	// replayed: g_term.opts is what guard.odin's SIGCONT handler feeds back
+	// into term_acquire to rebuild the terminal after a stop, so an opt-in
+	// RECORDED here comes back automatically on resume while an app's own
+	// write does not -- `fg` after a `Ctrl+Z` would show the caret again for
+	// the rest of the session. Same reason the other five live here. It also
+	// keeps the pairing where every other pairing in this file already is:
+	// this file writes both halves, so there is exactly one place to get
+	// wrong. cursor_hide_arm STAYS package-private, deliberately: it promises
+	// a show for bytes it did not write and cannot replay, which is a promise
+	// only render.odin -- which writes its hide into a frame this file never
+	// sees -- has any business asking for.
+	//
+	// A PER-FRAME cursor still wins over it. A frame that declares
+	// `Cursor{show = true}` shows the caret at that position and the next
+	// frame hides it again; the declaration here is the session's default, not
+	// a veto. An application that wants the caret gone for one frame does not
+	// need this field at all -- it just declares no cursor.
+	cursor_hide: bool,
 }
 
 // Which mouse events the terminal should report. SELECTABLE rather than
@@ -177,7 +281,7 @@ ALT_OFF: string : "\e[?1049l"
 // application finds out which of the two it got -- the reply (CSI ? <flags> u)
 // comes back through the ordinary input path as a Keyboard_Enhancements_Msg.
 @(private="file")
-kitty_push_seq :: proc(kb: Kitty_Flags, buf: []u8) -> []u8 {
+kitty_push_seq :: proc "c" (kb: Kitty_Flags, buf: []u8) -> []u8 {
 	v := transmute(u8)kb                  // == the protocol's flag word, see Kitty_Flag
 	n := copy(buf, "\e[>")
 	if v >= 10 { buf[n] = '0' + v / 10; n += 1 }
@@ -187,51 +291,157 @@ kitty_push_seq :: proc(kb: Kitty_Flags, buf: []u8) -> []u8 {
 	return buf[:n]
 }
 
-// `kb` defaults to {}, which means DO NOT TOUCH the terminal's keyboard mode:
-// nothing is written, nothing is pushed, and the paired teardown in
-// term_restore_c stays a no-op. `paste` defaults to false and means the same
-// thing for bracketed paste; `mouse` defaults to .None and `focus` to false
-// (T2-B) and `alt` to false (T2-C) and mean the same thing again. Opting in is
-// the application's call, not the framework's -- unlike Bubble Tea, run() does
-// not own the terminal here (the app calls term_enter_raw itself, and the golden
-// tests drive run() with a plain pipe), so the layer that entered raw mode is the
-// layer that gets to decide, and a terminal that never opted in must see zero
-// sequences of any kind. All five are trailing defaulted parameters so that every
-// call site written before they existed keeps compiling and keeps behaving
-// identically.
+// Does this terminal understand escape sequences at all?
 //
-// `alt` is the terminal half of render.odin's Render_Mode.Full_Screen, and the
-// two are deliberately INDEPENDENT: entering the alt screen without a
+// FALSE for `TERM=dumb` and for a TERM that is unset or empty, TRUE otherwise.
+// That is the whole rule, and it is deliberately not a terminfo lookup: the
+// three values this returns false for are the three whose entire meaning is
+// "this terminal has no capabilities", and everything else is a terminal that at
+// minimum speaks ANSI. Reading terminfo to decide which of ?1049/?1000/?2004/
+// CSI-u a given entry claims would be a much bigger machine answering a much
+// finer question than any caller here asks.
+//
+// WHY THIS IS PUBLIC. Before it existed there was no way, anywhere in runetea or
+// runegloss's caller-facing surface, to ask whether the terminal was capable:
+// TERM was read in exactly one place (runegloss/color.odin's colour-profile
+// detector) and for colour only. So on an Emacs comint/shell-mode pty -- the
+// real-world TERM=dumb -- an application degraded its COLOUR correctly and then
+// painted a wall of CUP/ED/SGR at a terminal that renders every byte of it
+// literally. term_enter_raw now gates its own opt-ins on this (see term_acquire),
+// which covers the keyboard push, bracketed paste, mouse tracking and the
+// alternate screen; the renderer's absolute addressing is not this file's to
+// gate, so an application that wants to degrade THAT should consult this and
+// pick its Render_Mode accordingly.
+//
+// Not cached: one getenv per acquire is nothing, and a cached verdict is a
+// second source of truth for a question the environment already answers. What IS
+// cached is the verdict for the interval a terminal is held (g_term.escapes_ok),
+// and that is for async-signal-safety, not for speed -- see its comment.
+//
+// libc.getenv rather than os.get_env: os.get_env ALLOCATES a copy, and this runs
+// on the acquire path where the rest of the file is deliberately allocation-free.
+@(require_results)
+term_supports_escapes :: proc() -> bool {
+	v := libc.getenv("TERM")
+	if v == nil { return false }
+	s := string(v)
+	return s != "" && s != "dumb"
+}
+
+// `opts` defaults to Term_Opts{}, which means DO NOT TOUCH anything but the line
+// discipline: no keyboard push, no bracketed paste, no mouse tracking, no focus
+// reporting, no alternate screen, no DECTCEM, and a paired teardown in
+// term_restore_c that stays a no-op for each. Opting in is the application's call, not the
+// framework's -- unlike Bubble Tea, run() does not own the terminal here (the app
+// calls term_enter_raw itself, and the golden tests drive run() with a plain
+// pipe), so the layer that entered raw mode is the layer that gets to decide, and
+// a terminal that never opted in must see zero sequences of any kind.
+//
+// Five of the six used to be trailing defaulted PARAMETERS. They are one struct
+// now, and Term_Opts' own comment argues why that break was worth taking. The
+// sixth, `cursor_hide`, was never a parameter and could not have been one: it
+// exists because there was no supported way to ask for it at all, which left
+// applications writing "\e[?25l" themselves and getting no paired show from any
+// of this file's exit paths.
+//
+// `opts.alt` is the terminal half of render.odin's Render_Mode.Full_Screen, and
+// the two are deliberately INDEPENDENT: entering the alt screen without a
 // full-screen renderer is legal (an inline renderer would simply rewind inside
 // the alt buffer), and a full-screen renderer without the alt screen is legal
 // too (it repaints over the shell's output and clears below itself). Coupling
 // them would mean this file knowing about the renderer, and would take the
 // choice away from an application that has a reason to want one and not the
 // other. Nothing in this package writes `?1049h` anywhere else, so this
-// parameter is the ONE place the alt screen can be entered from.
-term_enter_raw :: proc(
-	fd:     posix.FD,
-	kb:     Kitty_Flags = {},
-	paste:  bool        = false,
-	mouse:  Mouse_Mode  = .None,
-	focus:  bool        = false,
-	alt:    bool        = false,
-) -> bool {
-	if posix.tcgetattr(fd, &g_term.saved) != .OK { return false }
+// field is the ONE place the alt screen can be entered from.
+term_enter_raw :: proc(fd: posix.FD, opts := Term_Opts{}) -> bool {
+	// The ONE place TERM is consulted. Everything below this line runs in
+	// signal context too (SIGCONT resume), where getenv(3) is not safe to call.
+	return term_acquire(fd, opts, term_supports_escapes())
+}
 
-	// ORDERING INVARIANT: raw_active must be true for the entire interval in
-	// which the tty could possibly be in raw mode, and g_term.saved must be
-	// valid before raw_active is ever true. g_term.saved holds valid
-	// cooked-mode settings as of the line above, so it is safe to flip
-	// raw_active on now, before tcsetattr below has actually touched the
-	// terminal. A crash signal landing anywhere from here through the
-	// tcsetattr call sees raw_active == true and calls term_restore_c(),
-	// which re-applies g_term.saved -- correct and harmless whether the tty
-	// is still cooked or has just become raw. Setting raw_active only after
-	// tcsetattr succeeds would leave a window where the tty is already raw
-	// but term_restore_c() no-ops, stranding the terminal with no recovery.
-	g_term.fd = fd
-	g_term.raw_active = true
+// The whole of term_enter_raw, minus the environment lookup, and callable from a
+// signal handler: tcgetattr/tcsetattr/write are all on POSIX's async-signal-safe
+// list, the only bytes written are static strings or a stack-built one, and
+// nothing here allocates, formats or locks. That is what lets guard.odin's
+// SIGTSTP handler rebuild the terminal on SIGCONT from the same code path that
+// built it in the first place, rather than a second implementation that can
+// drift.
+//
+// IDEMPOTENT ON A SECOND ENTRY, and this is a correctness fix, not a nicety.
+// What this used to do was tcgetattr into g_term.saved UNCONDITIONALLY. Called a
+// second time while the terminal was already raw -- by a library, by a
+// re-acquire helper, by any second caller anywhere in the process, since g_term
+// is process-global -- it captured the RAW termios as the "cooked" settings, and
+// the subsequent term_restore() then faithfully reinstated raw mode. Measured on
+// a real pty: two entries and one restore left the terminal with ECHO=0
+// ICANON=0 ISIG=0 IEXTEN=0 OPOST=0 ICRNL=0, on a clean, fully-paired, exit-0
+// run, recoverable only by blind-typing `reset`. It returned true and said
+// nothing. The same call also pushed a SECOND Kitty stack entry that only one
+// `\e[<1u` ever pops, leaving our Disambiguate entry on the terminal's keyboard
+// stack after exit so the shell's own keys come back mis-encoded. (Note which
+// half of the Kitty pairing that is: an unpaired PUSH. term_restore_c's
+// POP-EXACTLY-ONCE rule guards the other direction, and the kitty_active
+// boolean still enforces it correctly -- the pop count can never exceed one no
+// matter how many times this is entered.)
+//
+// WHY IDEMPOTENT RATHER THAN A REFUSAL. Returning false on a second entry was
+// the other candidate and is worse HERE, specifically because of the shape every
+// call site in this repository (and in docs/API.md) uses: `if
+// !rt.term_enter_raw(fd, ...) { eprintln("not a tty"); os.exit(1) }`, with the
+// os.exit placed BEFORE the `defer rt.term_restore()`. A false from the second
+// entry would therefore exit the process past its own teardown and strand
+// exactly the terminal the guard exists to protect -- turning a recoverable
+// programming error into the unrecoverable one. `false` keeps its single honest
+// meaning: THIS PROCESS DOES NOT HAVE A RAW TTY. After a true, it does, whether
+// this call is the one that acquired it or not.
+//
+// The one case that IS refused is a second entry naming a DIFFERENT fd, because
+// g_term holds exactly one terminal's worth of state: accepting it would
+// overwrite the first terminal's saved termios and every guard flag describing
+// it, stranding a tty nothing can ever restore. Refusing leaves the first
+// terminal intact and reports, accurately, that the second one was not acquired.
+//
+// A second entry can ADD opt-ins but cannot CHANGE one that is already on: the
+// `!g_term.<flag>` guards below skip an enable whose mode this process already
+// set, so nothing is pushed or DECSET twice. Asking for .Any_Event when .Normal
+// is already on is therefore a no-op rather than two tracking modes with one
+// reset; the way to change a mode is the release/re-acquire cycle
+// (term_restore() then term_enter_raw()), which was already correct.
+@(private="package")
+term_acquire :: proc "c" (fd: posix.FD, opts: Term_Opts, escapes: bool) -> bool {
+	first := !g_term.raw_active
+	if first {
+		if posix.tcgetattr(fd, &g_term.saved) != .OK { return false }
+
+		// ORDERING INVARIANT: raw_active must be true for the entire interval in
+		// which the tty could possibly be in raw mode, and g_term.saved must be
+		// valid before raw_active is ever true. g_term.saved holds valid
+		// cooked-mode settings as of the line above, so it is safe to flip
+		// raw_active on now, before tcsetattr below has actually touched the
+		// terminal. A crash signal landing anywhere from here through the
+		// tcsetattr call sees raw_active == true and calls term_restore_c(),
+		// which re-applies g_term.saved -- correct and harmless whether the tty
+		// is still cooked or has just become raw. Setting raw_active only after
+		// tcsetattr succeeds would leave a window where the tty is already raw
+		// but term_restore_c() no-ops, stranding the terminal with no recovery.
+		g_term.fd = fd
+		g_term.raw_active = true
+		g_term.escapes_ok = escapes
+		g_term.opts = opts
+	} else {
+		// ALREADY OURS. No tcgetattr: g_term.saved already holds this terminal's
+		// cooked settings and re-reading them now would capture raw mode as the
+		// thing to restore. The escapes verdict of the acquire that took the
+		// terminal stands too -- TERM cannot change under a running process, and
+		// the resume path has no safe way to re-read it.
+		if fd != g_term.fd { return false }
+		g_term.opts.kb += opts.kb
+		if opts.paste { g_term.opts.paste = true }
+		if opts.focus { g_term.opts.focus = true }
+		if opts.alt   { g_term.opts.alt   = true }
+		if opts.cursor_hide { g_term.opts.cursor_hide = true }
+		if g_term.opts.mouse == .None { g_term.opts.mouse = opts.mouse }
+	}
 
 	raw := g_term.saved
 
@@ -249,10 +459,24 @@ term_enter_raw :: proc(
 	raw.c_cc[.VTIME] = 0
 
 	if posix.tcsetattr(fd, .TCSAFLUSH, &raw) != .OK {
-		// Roll back: the tty was never actually put into raw mode.
-		g_term.raw_active = false
+		// Roll back, but ONLY if this call is the one that claimed the terminal:
+		// the tty was never actually put into raw mode by it. On a re-entry the
+		// tty IS still raw from the first acquire and g_term.saved still holds
+		// the real cooked settings, so clearing raw_active here would silence the
+		// teardown that terminal genuinely needs.
+		if first { g_term.raw_active = false }
 		return false
 	}
+
+	// TERM=dumb, or no TERM at all: raw mode is granted (it is kernel line
+	// discipline, and works identically on a terminal that renders nothing), but
+	// NOT ONE ESCAPE SEQUENCE goes out. Every one of the six below is a request
+	// for a capability such a terminal is declaring it does not have, and an
+	// Emacs comint pty answers a `\e[?1049h` by printing it. Skipping the enables
+	// also means the flags stay false, so the paired teardown stays silent too --
+	// the same "undo only what was actually set" rule that governs everything
+	// else in this file, applied one level up.
+	if !g_term.escapes_ok { return true }
 
 	// Every opt-in is written from here down, and ALL OF THEM ONLY AFTER
 	// tcsetattr SUCCEEDED. The Kitty block has its own (different, stronger)
@@ -262,16 +486,27 @@ term_enter_raw :: proc(
 	// term_restore()`, so anything already written to the terminal at that
 	// point would never be undone. Writing after the last thing that can fail
 	// means there is nothing stranded when it does.
-	if kb != {}        { kitty_enable(fd, kb) }
-	if paste           { paste_enable(fd) }
-	if mouse != .None  { mouse_enable(fd, mouse) }
-	if focus           { focus_enable(fd) }
-	if alt             { alt_enable(fd) }
+	//
+	// Each is additionally gated on its own flag being off, so a second acquire
+	// (the SIGCONT resume, or a caller adding an opt-in) never pushes or sets a
+	// mode this process already has on. See this proc's IDEMPOTENT note.
+	if opts.kb != {} && !g_term.kitty_active         { kitty_enable(fd, opts.kb) }
+	if opts.paste && !g_term.paste_active            { paste_enable(fd) }
+	if opts.mouse != .None && g_term.mouse_mode == .None { mouse_enable(fd, opts.mouse) }
+	if opts.focus && !g_term.focus_active            { focus_enable(fd) }
+	if opts.alt && !g_term.alt_active                { alt_enable(fd) }
+	// LAST, and after the alternate screen specifically. Some terminals track
+	// DECTCEM per screen buffer; hiding after `?1049h` means the hide lands on
+	// the buffer the application is about to paint, and term_restore_c's
+	// worst-first order writes the show AFTER `?1049l`, i.e. on the normal
+	// buffer the user is returning to. Being last also leaves the four existing
+	// enable sequences byte-for-byte where they were.
+	if opts.cursor_hide && !g_term.cursor_hidden     { cursor_hide_enable(fd) }
 	return true
 }
 
 @(private="file")
-kitty_enable :: proc(fd: posix.FD, kb: Kitty_Flags) {
+kitty_enable :: proc "c" (fd: posix.FD, kb: Kitty_Flags) {
 	// THE KEYBOARD PUSH MUST COME AFTER tcsetattr, not before. TCSAFLUSH
 	// DISCARDS pending input, and the query below asks the terminal to send
 	// some: push+query written first would race the mode change, and a reply
@@ -331,7 +566,7 @@ kitty_enable :: proc(fd: posix.FD, kb: Kitty_Flags) {
 // input-discarding has nothing to race; the reason this still runs after
 // tcsetattr is the rollback one stated at the call site.
 @(private="file")
-paste_enable :: proc(fd: posix.FD) {
+paste_enable :: proc "c" (fd: posix.FD) {
 	g_term.paste_active = true
 	if posix.write(fd, raw_data(PASTE_ON), len(PASTE_ON)) <= 0 {
 		// Nothing went out at all (EIO once the far end is gone), so there is
@@ -356,7 +591,7 @@ paste_enable :: proc(fd: posix.FD) {
 // term_restore_c for the full comparison and for why mouse still sits high in
 // the restore ordering despite the low pairing hazard.
 @(private="file")
-mouse_enable :: proc(fd: posix.FD, mode: Mouse_Mode) {
+mouse_enable :: proc "c" (fd: posix.FD, mode: Mouse_Mode) {
 	seq: string
 	switch mode {
 	case .Normal:       seq = MOUSE_ON_NORMAL
@@ -381,7 +616,7 @@ mouse_enable :: proc(fd: posix.FD, mode: Mouse_Mode) {
 // a single eight-byte sequence like paste_enable's -- so a partial write is not
 // a case worth splitting: it leaves the terminal mid-sequence either way.
 @(private="file")
-focus_enable :: proc(fd: posix.FD) {
+focus_enable :: proc "c" (fd: posix.FD) {
 	g_term.focus_active = true
 	if posix.write(fd, raw_data(FOCUS_ON), len(FOCUS_ON)) <= 0 {
 		g_term.focus_active = false
@@ -408,7 +643,7 @@ focus_enable :: proc(fd: posix.FD) {
 // which is two independent sequences): this is one eight-byte sequence, so a
 // partial write leaves the terminal mid-sequence either way.
 @(private="file")
-alt_enable :: proc(fd: posix.FD) {
+alt_enable :: proc "c" (fd: posix.FD) {
 	g_term.alt_active = true
 	if posix.write(fd, raw_data(ALT_ON), len(ALT_ON)) <= 0 {
 		// Nothing went out at all (EIO once the far end is gone), so the terminal
@@ -419,17 +654,66 @@ alt_enable :: proc(fd: posix.FD) {
 	}
 }
 
-// DECTCEM show. Static, and written from a signal handler, for exactly the
-// reasons KITTY_POP and PASTE_OFF are static (write(2) is async-signal-safe,
-// fmt and the allocator are not). Deliberately NOT paired here with a
-// CURSOR_HIDE constant: the hide is emitted by the renderer, into the frame
-// BUILDER, alongside the rest of a frame's bytes -- see cursor_hide_arm.
+// DECTCEM. Static strings, and CURSOR_SHOW is written from a signal handler,
+// for exactly the reasons KITTY_POP and PASTE_OFF are static (write(2) is
+// async-signal-safe, fmt and the allocator are not).
+//
+// THE HIDE HAS TWO EMITTERS AND THEY ARE NOT INTERCHANGEABLE. This file writes
+// CURSOR_HIDE to the fd, once, for the session, when the application declared
+// Term_Opts.cursor_hide. render.odin writes its own copy of the same six bytes
+// into the frame BUILDER, interleaved with a frame's other output, and arms the
+// paired show through cursor_hide_arm. Both spellings exist on purpose: the
+// renderer's has to be ordered against the rest of its frame and this one has
+// to reach a terminal held by an application that may never call the renderer
+// at all (term_enter_raw + decode_keys with no run() is a supported shape).
+// They cannot be folded, so render.odin keeps its own private CURSOR_HIDE
+// constant and this one is not exported to it -- a shared constant would imply
+// a shared writer.
+@(private="file")
+CURSOR_HIDE: string : "\e[?25l"
 @(private="file")
 CURSOR_SHOW: string : "\e[?25h"
 
+// `CSI ? 25 l`, the session-long half. Ordering invariant identical in SHAPE to
+// the four enables above -- the flag goes true BEFORE the write -- with one
+// difference from every one of them: THIS ONE DOES NOT ROLL THE FLAG BACK WHEN
+// THE WRITE FAILS. The four siblings do, because for them an enable that never
+// left the process means there is genuinely nothing to undo and the undo itself
+// is not free (an unpaired `\e[<1u` eats someone else's keyboard stack entry, an
+// unpaired `\e[?1049l` jumps a cursor). cursor_hidden is the flag this file has
+// already argued should err towards writing in every ambiguous case -- see
+// cursor_hide_arm -- because the two outcomes are an idempotent extra six bytes
+// versus a user's shell with no caret in it. A write that returns <= 0 is
+// ambiguous in exactly that way, so it keeps the flag; if the fd is genuinely
+// dead the paired show fails identically and nothing is lost either way.
+@(private="file")
+cursor_hide_enable :: proc "c" (fd: posix.FD) {
+	g_term.cursor_hidden = true
+	posix.write(fd, raw_data(CURSOR_HIDE), len(CURSOR_HIDE))
+}
+
+// Does the application want the caret hidden for the whole session? For
+// render.odin, which has to stop UNDOING that at the end of a frame -- .Inline
+// pairs its own hide with a show, and a session-long declaration it did not
+// know about would be re-shown 60 times a second.
+//
+// ALL THREE TERMS ARE LOAD-BEARING. `opts.cursor_hide` is the declaration;
+// `escapes_ok` is the TERM=dumb gate, so a terminal that got no `\e[?25l` is not
+// modelled as hidden; and `raw_active` is what makes this false for a process
+// that does not currently own a terminal at all. That last one also keeps
+// g_term -- a process-global whose `opts` field deliberately survives
+// term_restore_c -- from leaking one test's declaration into the next test's
+// renderer output.
+@(private="package")
+cursor_hide_requested :: proc "contextless" () -> bool {
+	return g_term.raw_active && g_term.escapes_ok && g_term.opts.cursor_hide
+}
+
 // Called by render.odin immediately BEFORE it writes a "\e[?25l" into a frame,
-// to arm the paired show in term_restore_c. Three things about it are
-// deliberate.
+// to arm the paired show in term_restore_c. It is the RENDERER's half of the
+// pairing; an application that wants the caret gone for the session declares
+// Term_Opts.cursor_hide and this file writes both halves itself
+// (cursor_hide_enable). Three things about this one are deliberate.
 //
 // GATED ON raw_active. This is the "did WE do it" check, and it has to be
 // something the renderer cannot answer itself: the renderer writes to a
@@ -535,12 +819,15 @@ term_restore :: proc() {
 // immediately visible to the user, and trivially undone by that program. The
 // guard (`cursor_hidden`) therefore exists to keep a process that never touched
 // the cursor silent, NOT to prevent a catastrophe, and unlike the other two it
-// is deliberately STICKY once armed -- see cursor_hide_arm for why (the hide is
-// buffered into a frame this proc never sees, and the flush that carries it is
-// interruptible by a crash signal and abortable on a write error, so "the show
-// got dropped" and "the show landed" are indistinguishable from here; leaving a
-// terminal with an invisible cursor is precisely the "actively wrong output"
-// this comment's last paragraph warns about).
+// is deliberately STICKY once armed -- see cursor_hide_arm for why (the
+// renderer's hide is buffered into a frame this proc never sees, and the flush
+// that carries it is interruptible by a crash signal and abortable on a write
+// error, so "the show got dropped" and "the show landed" are indistinguishable
+// from here; leaving a terminal with an invisible cursor is precisely the
+// "actively wrong output" this comment's last paragraph warns about). The other
+// setter, cursor_hide_enable, writes its hide straight to the fd and so has no
+// such window -- but it shares the flag, because this proc's question is
+// "could this process have hidden the caret", not "which of the two did".
 //
 // MOUSE AND FOCUS ARE DECSET/DECRST TOO (T2-B), so the pairing hazard is the
 // mild one, not the Kitty one, and that is stated rather than inherited:
@@ -659,6 +946,31 @@ term_restore :: proc() {
 // The seven flags are checked INDEPENDENTLY rather than nested under one
 // early return, so that no restoration can ever be skipped because of
 // another's state.
+//
+// WHAT AN UNCATCHABLE SIGNAL STRANDS -- i.e. what this proc would have undone
+// and never got the chance to. `kill -9` and `kill -STOP` run no handler, so the
+// leak is exactly the set of opt-ins the application asked for, and it is worth
+// stating precisely because docs/LIMITATIONS.md 6.1 currently says only "leaves
+// the shell in raw mode and possibly in the alternate screen". Measured on
+// examples/editor (Kitty .Disambiguate + paste + .Normal mouse + alt), FIVE
+// things leak: raw mode; one Kitty keyboard-stack entry (the `\e[>1u` push, with
+// its `\e[<1u` never written); the alternate screen (`?1049h`); mouse tracking
+// with SGR coordinates (`?1000h` + `?1006h`); and bracketed paste (`?2004h`).
+// Mouse tracking is the most user-visible of the four escape-level leaks -- it
+// injects `\e[<0;12;7M`-style garbage into the shell's command line on every
+// click and every scroll flick, which is why the ordering above ranks it where
+// it does. Focus reporting (`?1004h`) leaks only for an application that enables
+// it, and the cursor is normally left VISIBLE, not hidden: a frame ends by
+// showing the cursor at the caret, so an invisible cursor is the narrow
+// mid-frame race and not the normal outcome. Under TERM=dumb or no TERM the
+// escape-level leaks cannot happen at all, because term_acquire never wrote the
+// enables (see its capability gate) -- only raw mode leaks there. `reset` is
+// still the recovery for every one of them.
+//
+// WHAT THIS PROC DELIBERATELY DOES NOT CLEAR: g_term.opts and g_term.escapes_ok.
+// They are a RECORD of what the caller asked for and what the terminal can take,
+// not guards for what is currently set, and guard.odin's SIGCONT resume needs
+// both to survive the teardown that SIGTSTP performed. See their fields.
 term_restore_c :: proc "c" () {
 	if g_term.raw_active {
 		posix.tcsetattr(g_term.fd, .TCSAFLUSH, &g_term.saved)

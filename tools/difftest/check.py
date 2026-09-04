@@ -22,9 +22,30 @@ later frame happens to overwrite is still a frame the user saw wrong.
 Input is tools/difftest's `dump` output on stdin:
 
     CASE <seed> <cols> <rows> <frames>
+    SIZE <n> <cols> <rows>        (optional, before the frame it applies to)
     REF <n> <hex>
     DIF <n> <hex>
     ...
+
+THE SIZE RECORD is F34's resize prong reaching this side of the process
+boundary. Until it existed, this harness ran the generator with `resizes` off
+and the whole prong lived only in runetea/diff_oracle_test.odin -- whose VT
+model IS the renderer's own screen.odin, i.e. exactly the shared ancestry this
+program exists to escape. A resize is the one mutation the generator cannot
+perform alone, because the size lives in the harness's Renderer and in these
+two pyte screens; the dumper pushes it into the renderers and announces it
+here.
+
+BOTH SCREENS ARE RESIZED AND NEITHER IS BLANKED, which is the choice that keeps
+the check honest. Blanking (or making fresh screens) would be defensible --
+after a resize both renderers repaint, so the next frame is fully determined by
+its own bytes -- but it would also erase the one thing worth watching: if .Diff
+did NOT repaint after a resize, a blanked screen would show its half-frame
+against .Full_Screen's whole one and the divergence would still be caught, but
+any disagreement about what SURVIVES a resize would not be. Keeping the content
+costs nothing, because the two screens are compared on every frame and are
+therefore known to be equal on the way in, and pyte's resize is deterministic
+(clip from the top, pad at the bottom and right).
 
 Exit status 0 if every case matched, 1 otherwise. A failing seed can be
 replayed in the Odin oracle -- both harnesses drive the same generator.
@@ -36,9 +57,9 @@ try:
     import pyte
 except ImportError:  # pragma: no cover
     sys.stderr.write(
-        "pyte is not installed (pip install pyte). This checker is NOT on the\n"
-        "gate precisely so that its absence cannot silently turn into a green\n"
-        "run -- so this is a hard failure, not a skip.\n")
+        "pyte is not installed (pip install pyte). This checker IS on the default\n"
+        "gate, and its absence must never silently turn into a green run -- so\n"
+        "this is a hard failure, not a skip.\n")
     sys.exit(2)
 
 
@@ -140,6 +161,7 @@ def main():
     cols = rows = 0
     seed = -1
     pending = {}
+    resizes = 0
 
     def compare(n):
         nonlocal frames
@@ -159,6 +181,15 @@ def main():
             screen_dif, stream_dif = make_screen(cols, rows)
             pending = {}
             cases += 1
+            continue
+        if parts[0] == "SIZE":
+            # `cols` is also what describe() divides by to name a failing cell,
+            # so it has to move with the screen or a post-resize failure would
+            # be reported at the wrong coordinates.
+            _n, cols, rows = (int(v) for v in parts[1:4])
+            screen_ref.resize(rows, cols)
+            screen_dif.resize(rows, cols)
+            resizes += 1
             continue
         if parts[0] in ("REF", "DIF"):
             n = int(parts[1])
@@ -183,9 +214,20 @@ def main():
             print("  ... and %d more" % (len(failures) - 20))
         return 1
 
-    print("pyte cross-check OK: %d cases, %d frames, "
+    # The resize count is printed rather than merely tallied, and it is an
+    # assertion in the same sense the corpus's own coverage test is: a
+    # generator prong that never fires is a corpus with a longer changelog and
+    # no more reach. Zero here means either the dumper stopped passing
+    # `resizes = true` or the generator stopped resizing, and both are silent
+    # losses of exactly what F34 was about.
+    if resizes == 0:
+        print("pyte cross-check FAILED: not one SIZE record in %d cases -- the "
+              "resize prong is not reaching this harness" % cases)
+        return 1
+
+    print("pyte cross-check OK: %d cases, %d frames, %d resize(s), "
           "diff output replays to the same screen as the full repaint"
-          % (cases, frames))
+          % (cases, frames, resizes))
     return 0
 
 

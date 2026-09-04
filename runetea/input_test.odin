@@ -1,3 +1,9 @@
+#+private
+// ^ Every declaration in this file is package-private, so that `odin doc
+//   runetea` / `odin doc runegloss` -- the command README.md and docs/API.md
+//   hand a newcomer for symbol discovery -- lists the library rather than the
+//   test fixtures. Pinned by tools/doccheck/run.sh's `apidoc` check, which is
+//   also where the argument for it is written out.
 package runetea
 
 import "core:testing"
@@ -1952,5 +1958,431 @@ test_only_csi_z_carries_an_implied_modifier :: proc(t: ^testing.T) {
 		testing.expectf(t, len(out) == 1, "%q decoded to %d keys", seq, len(out))
 		testing.expectf(t, out[0].mods == {}, "%q must carry no implied modifier, got %v", seq, out[0].mods)
 		_ = i
+	}
+}
+
+// ---------------------------------------------------------------------------
+// THE "NOTHING LEAKS AS A KEYSTROKE" CONTRACT.
+//
+// decode_keys' standing promise is that a sequence it does not understand is
+// consumed WHOLE and emits nothing. The tests below cover the five populations
+// where that promise used to be false, each of which turned bytes the terminal
+// sent into keypresses the application acted on.
+// ---------------------------------------------------------------------------
+
+// ESC + C0 == Alt + that KEY.
+//
+// The Alt branch used to be reached for ANY byte after ESC and never consulted
+// decode_c0, contradicting its own "ESC followed by a printable byte" comment.
+// The keys below are the ones a user actually presses: every one of them used
+// to arrive as a raw control RUNE with the Alt bit and, for Ctrl+Alt+<letter>,
+// with no Ctrl bit at all -- so `k.mods == {.Ctrl, .Alt}` matched nothing, and
+// an editor with an unfiltered `case .Rune` inserted the control byte into the
+// document.
+@(test)
+test_esc_plus_c0_decodes_through_the_c0_policy :: proc(t: ^testing.T) {
+	out := make([dynamic]Key_Msg); defer delete(out)
+	Case :: struct { seq: string, want: Key_Msg }
+	for c in ([?]Case{
+		{"\e\r",   {code = .Enter,     mods = {.Alt}}},              // Alt+Enter, NOT Rune '\r'
+		{"\e\x7f", {code = .Backspace, mods = {.Alt}}},              // Alt+Backspace, NOT Rune U+007F
+		{"\e\t",   {code = .Tab,       mods = {.Alt}}},              // Alt+Tab, NOT Rune '\t'
+		{"\e ",    {code = .Space, r = ' ', mods = {.Alt}}},         // Alt+Space
+		{"\e\x01", {code = .Rune, r = 'a', mods = {.Ctrl, .Alt}}},   // Ctrl+Alt+A keeps BOTH bits
+		{"\e\x1c", {code = .Rune, r = '\\', mods = {.Ctrl, .Alt}}},  // the 0x1C-0x1F punctuation band
+		{"\e\x00", {code = .Space, mods = {.Ctrl, .Alt}}},           // Ctrl+Alt+Space
+	}) {
+		clear(&out)
+		n := decode_keys(transmute([]u8)c.seq, &out)
+		testing.expectf(t, n == len(c.seq), "%q: consumed %d, want %d", c.seq, n, len(c.seq))
+		if !testing.expectf(t, len(out) == 1, "%q: emitted %d keys, want 1 (%v)", c.seq, len(out), out[:]) {
+			continue
+		}
+		testing.expectf(t, out[0] == c.want, "%q: got %v, want %v", c.seq, out[0], c.want)
+	}
+
+	// Alt+<printable> is untouched, and so is the double-Escape resolution --
+	// 0x1b is <= 0x20 and would land in the new C0 gate if the double-Escape arm
+	// above it ever stopped claiming it first.
+	clear(&out)
+	n := decode_keys(transmute([]u8)string("\ea\e\e"), &out)
+	testing.expect_value(t, n, 4)
+	testing.expect_value(t, len(out), 3)
+	testing.expect_value(t, out[0], Key_Msg{code = .Rune, r = 'a', mods = {.Alt}})
+	testing.expect_value(t, out[1], Key_Msg{code = .Escape})
+	testing.expect_value(t, out[2], Key_Msg{code = .Escape})
+}
+
+// The C0 policy really is ONE policy: the legacy flags reach the Alt path too,
+// so Alt+Enter with .Ctrl_M set is Ctrl+Alt+m rather than Alt+Enter. What must
+// NOT change is Ctrl_Open_Bracket, because ESC-after-ESC is claimed by the
+// double-Escape arm before the C0 gate can see it.
+@(test)
+test_alt_c0_honours_the_legacy_flags :: proc(t: ^testing.T) {
+	out := make([dynamic]Key_Msg); defer delete(out)
+	decode_keys(transmute([]u8)string("\e\r"), &out, {.Ctrl_M})
+	testing.expect_value(t, len(out), 1)
+	testing.expect_value(t, out[0], Key_Msg{code = .Rune, r = 'm', mods = {.Ctrl, .Alt}})
+
+	clear(&out)
+	decode_keys(transmute([]u8)string("\e\x7f"), &out, {.Backspace})
+	testing.expect_value(t, len(out), 1)
+	testing.expect_value(t, out[0], Key_Msg{code = .Delete, mods = {.Alt}})
+
+	// With Ctrl_Open_Bracket set, "\e\e" is still TWO ctrl+[ keypresses -- the
+	// double-Escape arm, not an Alt+ctrl+[.
+	clear(&out)
+	decode_keys(transmute([]u8)string("\e\e"), &out, {.Ctrl_Open_Bracket})
+	testing.expect_value(t, len(out), 2)
+	testing.expect_value(t, out[0], Key_Msg{code = .Rune, r = '[', mods = {.Ctrl}})
+	testing.expect_value(t, out[1], Key_Msg{code = .Rune, r = '[', mods = {.Ctrl}})
+}
+
+// STRING ESCAPES (OSC, DCS, APC, PM, SOS) must be consumed whole and emit
+// NOTHING.
+//
+// These are the bytes a terminal sends unbidden -- an OSC 11 background-colour
+// reply left in flight by the shell, an OSC 52 clipboard read, an XTVERSION
+// DCS, a Kitty graphics APC ack. With no arm for them the introducer became
+// Alt+']' / Alt+'P' / Alt+'_', every payload byte became a Key_Msg, a BEL
+// terminator became Ctrl+G and an ST terminator became Alt+'\'. The OSC 11
+// reply below produced 23 keypresses before this arm existed; the assertion is
+// zero.
+@(test)
+test_string_escapes_are_consumed_whole :: proc(t: ^testing.T) {
+	out := make([dynamic]Key_Msg); defer delete(out)
+	for seq in ([?]string{
+		"\e]11;rgb:2e2e/3434/3a3a\e\\",         // OSC 11 background colour, ST-terminated
+		"\e]11;rgb:2e2e/3434/3a3a\a",           // the same reply, BEL-terminated
+		"\e]52;c;aGVsbG8gd29ybGQ=\a",           // OSC 52 clipboard read
+		"\e]0;a window title\a",                // OSC 0
+		"\eP>|xterm(390)\e\\",                  // XTVERSION DCS reply
+		"\eP1$r0m\e\\",                         // DECRQSS reply
+		"\eP1;2|\a payload\e\\",               // BEL does NOT terminate a DCS: ST does
+		"\e_Gi=1;\a\e\\",                      // nor an APC
+		"\e_Gi=31;OK\e\\",                      // Kitty graphics APC ack
+		"\e^some private message\e\\",          // PM
+		"\eXa start-of-string\e\\",             // SOS
+		"\e]11;rgb:0/0/0\x9c",                  // 8-bit ST terminator
+		"\e]11;\x18",                           // CAN cancels the string
+		"\e]11;\x1a",                           // SUB cancels it too
+	}) {
+		clear(&out)
+		n := decode_keys(transmute([]u8)seq, &out)
+		testing.expectf(t, n == len(seq), "%q: consumed %d, want %d", seq, n, len(seq))
+		testing.expectf(t, len(out) == 0, "%q: emitted %d keys, want 0 (%v)", seq, len(out), out[:])
+	}
+}
+
+// The hold-back contract on the new arm: every proper prefix of a string escape
+// must consume nothing and emit nothing, so a reply split across two read()s
+// cannot half-decode. The lone-ESC exception at k == 1 is the same documented
+// ambiguity every other sequence has.
+@(test)
+test_string_escape_holds_back_until_its_terminator :: proc(t: ^testing.T) {
+	out := make([dynamic]Key_Msg); defer delete(out)
+	for seq in ([?]string{"\e]11;rgb:00/00/00\e\\", "\eP>|xterm\a\e\\", "\e_Gi=1;OK\e\\"}) {
+		b := transmute([]u8)seq
+		for k in 2 ..< len(b) {
+			clear(&out)
+			n := decode_keys(b[:k], &out)
+			testing.expectf(t, n == 0 && len(out) == 0,
+				"%q[:%d]: got n=%d %v, want a complete hold-back", seq, k, n, out[:])
+		}
+	}
+
+	// And a real keypress after a complete reply still decodes, in the same
+	// buffer -- the whole point of consuming the reply rather than resyncing
+	// somewhere inside it.
+	clear(&out)
+	n := decode_keys(transmute([]u8)string("\e]11;rgb:0/0/0\a\e[A"), &out)
+	testing.expect_value(t, n, 18)
+	testing.expect_value(t, len(out), 1)
+	testing.expect_value(t, out[0], Key_Msg{code = .Up})
+}
+
+// An ESC inside a string that is NOT followed by '\' aborts the string and is
+// handed back to the main loop, so a real sequence arriving after a malformed
+// reply still decodes instead of being swallowed as payload.
+@(test)
+test_an_esc_inside_a_string_escape_aborts_it :: proc(t: ^testing.T) {
+	out := make([dynamic]Key_Msg); defer delete(out)
+	n := decode_keys(transmute([]u8)string("\e]11;rgb\e[A"), &out)
+	testing.expect_value(t, n, 11)
+	testing.expect_value(t, len(out), 1)
+	testing.expect_value(t, out[0], Key_Msg{code = .Up})
+}
+
+// Inside a bracketed paste a string introducer is TEXT, like everything else --
+// the paste branch runs before the introducer gate, and pasting a file that
+// happens to contain "\e]0;" must not put the decoder into an OSC.
+@(test)
+test_string_escapes_are_literal_text_inside_a_paste :: proc(t: ^testing.T) {
+	out := make([dynamic]Key_Msg); defer delete(out)
+	pst := Input_State{}; defer delete(pst.markers)
+	seq := "\e[200~\e]0;x\a\e[201~"
+	n := decode_keys(transmute([]u8)seq, &out, {}, nil, &pst)
+	testing.expect_value(t, n, len(seq))
+	testing.expect(t, !pst.in_paste, "the paste must have ended")
+	// ESC ] 0 ; x BEL -- six literal runes, all flagged pasted.
+	testing.expect_value(t, len(out), 6)
+	for k in out {
+		testing.expect(t, k.pasted, "pasted content must be flagged")
+		testing.expect_value(t, k.code, Key_Code.Rune)
+	}
+}
+
+// urxvt's '$'-final modified keys. '$' is 0x24, an ECMA-48 INTERMEDIATE byte,
+// so the old scan treated "\e[3$" as incomplete and took the NEXT byte as the
+// sequence's final -- destroying the following keystroke when it was printable,
+// and injecting the parameter run as literal runes when it was not.
+@(test)
+test_urxvt_dollar_keys_do_not_eat_the_next_keystroke :: proc(t: ^testing.T) {
+	out := make([dynamic]Key_Msg); defer delete(out)
+
+	// (a) The keystroke after a '$' key is a letter -- it used to be consumed as
+	//     the sequence's final byte and lost outright.
+	n := decode_keys(transmute([]u8)string("\e[3$X"), &out)
+	testing.expect_value(t, n, 5)
+	if testing.expect_value(t, len(out), 2) {
+		testing.expect_value(t, out[0], Key_Msg{code = .Delete, mods = {.Shift}})
+		testing.expect_value(t, out[1], Key_Msg{code = .Rune, r = 'X'})
+	}
+
+	// (b) The keystroke after it is an arrow -- ESC is not a valid final, so the
+	//     old resynchronisation arm dropped "\e[" and typed '3' and '$'.
+	clear(&out)
+	n = decode_keys(transmute([]u8)string("\e[3$\e[A"), &out)
+	testing.expect_value(t, n, 7)
+	if testing.expect_value(t, len(out), 2) {
+		testing.expect_value(t, out[0], Key_Msg{code = .Delete, mods = {.Shift}})
+		testing.expect_value(t, out[1], Key_Msg{code = .Up})
+	}
+}
+
+// The full urxvt modified-tilde table, in all three final bytes. rxvt-unicode
+// is one of the two terminals the xterm defaults measurably do not cover, and
+// these twelve keys are the larger half of that miss.
+@(test)
+test_urxvt_modified_tilde_keys_decode :: proc(t: ^testing.T) {
+	out := make([dynamic]Key_Msg); defer delete(out)
+	Case :: struct { seq: string, want: Key_Msg }
+	for c in ([?]Case{
+		{"\e[2$", {code = .Insert,    mods = {.Shift}}},          // kIC
+		{"\e[3$", {code = .Delete,    mods = {.Shift}}},          // kDC
+		{"\e[5$", {code = .Page_Up,   mods = {.Shift}}},          // kPRV
+		{"\e[6$", {code = .Page_Down, mods = {.Shift}}},          // kNXT
+		{"\e[7$", {code = .Home,      mods = {.Shift}}},          // kHOM
+		{"\e[8$", {code = .End,       mods = {.Shift}}},          // kEND
+		{"\e[3^", {code = .Delete,    mods = {.Ctrl}}},
+		{"\e[7^", {code = .Home,      mods = {.Ctrl}}},
+		{"\e[3@", {code = .Delete,    mods = {.Ctrl, .Shift}}},
+	}) {
+		clear(&out)
+		n := decode_keys(transmute([]u8)c.seq, &out)
+		testing.expectf(t, n == len(c.seq), "%q: consumed %d, want %d", c.seq, n, len(c.seq))
+		if !testing.expectf(t, len(out) == 1, "%q: emitted %d keys, want 1 (%v)", c.seq, len(out), out[:]) {
+			continue
+		}
+		testing.expectf(t, out[0] == c.want, "%q: got %v, want %v", c.seq, out[0], c.want)
+	}
+}
+
+// THE GUARD ON THE '$' ARM. A DECRQM reply's '$' is a genuine intermediate byte
+// followed by the final 'y'; terminating the sequence at the '$' would leave the
+// 'y' in the stream as a rune, which is the same leak on a different sequence.
+// "\e[?2004;1$y" is already in test_decode_unsupported_csi_is_cleanly_ignored's
+// corpus; this pins WHY it still passes.
+@(test)
+test_the_dollar_arm_does_not_steal_decrpm :: proc(t: ^testing.T) {
+	out := make([dynamic]Key_Msg); defer delete(out)
+	for seq in ([?]string{"\e[?2004;1$y", "\e[?1;2$y", "\e[$y"}) {
+		clear(&out)
+		n := decode_keys(transmute([]u8)seq, &out)
+		testing.expectf(t, n == len(seq), "%q: consumed %d, want %d", seq, n, len(seq))
+		testing.expectf(t, len(out) == 0, "%q: emitted %d keys, want 0 (%v)", seq, len(out), out[:])
+	}
+}
+
+// A CSI whose intermediate run is followed by a byte that cannot be a final is
+// consumed THROUGH the intermediates rather than resynchronised two bytes in.
+// The old arm dropped only "\e[" and left the parameter and intermediate bytes
+// -- all printable ASCII -- to be typed into the application.
+@(test)
+test_a_csi_ending_on_an_intermediate_is_consumed_not_leaked :: proc(t: ^testing.T) {
+	out := make([dynamic]Key_Msg); defer delete(out)
+	// "\e[1 " (an intermediate SP) followed by Ctrl+C: the C0 byte cannot be a
+	// final, so the sequence ends at the SP and Ctrl+C decodes on its own.
+	n := decode_keys(transmute([]u8)string("\e[1 \x03"), &out)
+	testing.expect_value(t, n, 5)
+	testing.expect_value(t, len(out), 1)
+	testing.expect_value(t, out[0], Key_Msg{code = .Rune, r = 'c', mods = {.Ctrl}})
+}
+
+// THE LINUX VIRTUAL CONSOLE'S F1-F5: "\e[[A" .. "\e[[E". '[' is a legal CSI
+// final byte, so the old scan consumed "\e[[" as an unknown three-byte sequence
+// and left the letter behind -- pressing F1 on a bare TTY typed a capital 'A'
+// into the application.
+@(test)
+test_linux_console_function_keys_decode :: proc(t: ^testing.T) {
+	out := make([dynamic]Key_Msg); defer delete(out)
+	for seq, k in ([?]string{"\e[[A", "\e[[B", "\e[[C", "\e[[D", "\e[[E"}) {
+		clear(&out)
+		n := decode_keys(transmute([]u8)seq, &out)
+		testing.expectf(t, n == 4, "%q: consumed %d, want 4", seq, n)
+		if !testing.expectf(t, len(out) == 1, "%q: emitted %d keys, want 1 (%v)", seq, len(out), out[:]) {
+			continue
+		}
+		testing.expectf(t, out[0] == Key_Msg{code = Key_Code(int(Key_Code.F1) + k)},
+			"%q: got %v, want F%d", seq, out[0], k + 1)
+	}
+
+	// A letter outside A-E is consumed whole and emits nothing -- never leaked.
+	clear(&out)
+	n := decode_keys(transmute([]u8)string("\e[[Z"), &out)
+	testing.expect_value(t, n, 4)
+	testing.expect_value(t, len(out), 0)
+
+	// And the three-byte prefix holds back for its letter instead of resolving.
+	clear(&out)
+	n = decode_keys(transmute([]u8)string("\e[["), &out)
+	testing.expect_value(t, n, 0)
+	testing.expect_value(t, len(out), 0)
+}
+
+// 8-BIT C1 INTRODUCERS. 0x9B is CSI, 0x8F is SS3, 0x90 is DCS, 0x9D is OSC.
+// These used to fall through to the UTF-8 path, where utf8_lead_len reports 1
+// for the whole 0x80-0xBF band and decode_rune substitutes U+FFFD -- so an
+// 8-bit Up arrow came out as a replacement rune plus a literal 'A', and an
+// 8-bit OSC leaked its entire payload.
+@(test)
+test_eight_bit_c1_introducers_decode :: proc(t: ^testing.T) {
+	out := make([dynamic]Key_Msg); defer delete(out)
+
+	clear(&out)
+	n := decode_keys([]u8{0x9b, 'A'}, &out)                 // CSI A == Up
+	testing.expect_value(t, n, 2)
+	testing.expect_value(t, len(out), 1)
+	testing.expect_value(t, out[0], Key_Msg{code = .Up})
+
+	clear(&out)
+	n = decode_keys([]u8{0x9b, '1', ';', '5', 'C'}, &out)   // CSI 1;5C == Ctrl+Right
+	testing.expect_value(t, n, 5)
+	testing.expect_value(t, len(out), 1)
+	testing.expect_value(t, out[0], Key_Msg{code = .Right, mods = {.Ctrl}})
+
+	clear(&out)
+	n = decode_keys([]u8{0x8f, 'P'}, &out)                  // SS3 P == F1
+	testing.expect_value(t, n, 2)
+	testing.expect_value(t, len(out), 1)
+	testing.expect_value(t, out[0], Key_Msg{code = .F1})
+
+	// 8-bit DCS and OSC, consumed whole and emitting nothing.
+	clear(&out)
+	n = decode_keys([]u8{0x90, '>', '|', 'x', 0x9c}, &out)
+	testing.expect_value(t, n, 5)
+	testing.expect_value(t, len(out), 0)
+
+	clear(&out)
+	n = decode_keys([]u8{0x9d, '1', '1', ';', 'x', 0x07}, &out)
+	testing.expect_value(t, n, 6)
+	testing.expect_value(t, len(out), 0)
+}
+
+// The 8-bit introducers hold back exactly like their 7-bit spellings. 0x8F is
+// the one that differs from ESC O: a lone ESC O is a plausible Alt+O keypress
+// and resolves, whereas a lone 0x8F can only be SS3, so it waits.
+@(test)
+test_eight_bit_introducers_hold_back :: proc(t: ^testing.T) {
+	out := make([dynamic]Key_Msg); defer delete(out)
+	for b in ([?][]u8{{0x9b}, {0x9b, '1'}, {0x9b, '1', ';'}, {0x8f}, {0x90, 'x'}, {0x9d, 'x'}}) {
+		clear(&out)
+		n := decode_keys(b, &out)
+		testing.expectf(t, n == 0 && len(out) == 0,
+			"%v: got n=%d %v, want a complete hold-back", b, n, out[:])
+	}
+}
+
+// A C1 byte that introduces nothing is xterm's eightBitInput meta encoding:
+// with that resource on and UTF-8 off, Alt+Ctrl+A arrives as 0x81 rather than
+// as "ESC 0x01". Routed through decode_c0 so the two spellings produce the
+// IDENTICAL Key_Msg -- a decoder that answered "what is Ctrl+Alt+A" twice would
+// be indefensible.
+@(test)
+test_plain_c1_bytes_decode_as_alt_plus_their_c0 :: proc(t: ^testing.T) {
+	seven := make([dynamic]Key_Msg); defer delete(seven)
+	eight := make([dynamic]Key_Msg); defer delete(eight)
+	for b in u8(0x80) ..= u8(0x9f) {
+		// The six introducers have their own grammars and are covered above.
+		switch b {
+		case 0x8f, 0x90, 0x98, 0x9b, 0x9d, 0x9e, 0x9f: continue
+		}
+		clear(&seven); clear(&eight)
+		decode_keys([]u8{0x1b, b - 0x80}, &seven)
+		n := decode_keys([]u8{b}, &eight)
+		testing.expectf(t, n == 1, "%02x: consumed %d, want 1", b, n)
+		if !testing.expectf(t, len(eight) == 1 && len(seven) == 1,
+			"%02x: emitted %d/%d keys, want 1/1", b, len(seven), len(eight)) { continue }
+		testing.expectf(t, eight[0] == seven[0],
+			"%02x: 8-bit gave %v, 7-bit gave %v -- they must agree", b, eight[0], seven[0])
+	}
+	// Spot-check the actual value, not just the agreement.
+	clear(&eight)
+	decode_keys([]u8{0x81}, &eight)
+	testing.expect_value(t, len(eight), 1)
+	testing.expect_value(t, eight[0], Key_Msg{code = .Rune, r = 'a', mods = {.Ctrl, .Alt}})
+
+	// 0xA0-0xBF stays what utf8_lead_len says it is: a stray continuation byte,
+	// U+FFFD. The C1 band is 0x80-0x9F and must not have widened.
+	clear(&eight)
+	decode_keys([]u8{0xa0}, &eight)
+	testing.expect_value(t, len(eight), 1)
+	testing.expect_value(t, eight[0].code, Key_Code.Rune)
+	testing.expect_value(t, eight[0].r, rune(0xfffd))
+}
+
+// XTERM'S modifyOtherKeys REPORT: CSI 27 ; <mod> ; <codepoint> ~. Rejected twice
+// over before -- by csi_decode's `count > 2` gate, and by csi_tilde_code, whose
+// table lists 27 as unassigned. It is the only legacy mechanism besides the
+// Kitty protocol that resolves the Ctrl+I/Tab and Ctrl+M/Enter collisions or
+// delivers Ctrl+digit at all.
+@(test)
+test_modify_other_keys_reports_decode :: proc(t: ^testing.T) {
+	out := make([dynamic]Key_Msg); defer delete(out)
+	Case :: struct { seq: string, want: Key_Msg }
+	for c in ([?]Case{
+		{"\e[27;5;9~",   {code = .Tab,   mods = {.Ctrl}}},              // Ctrl+Tab, NOT Tab
+		{"\e[27;5;13~",  {code = .Enter, mods = {.Ctrl}}},              // Ctrl+Enter, NOT Enter
+		{"\e[27;5;49~",  {code = .Rune, r = '1', mods = {.Ctrl}}},      // Ctrl+1
+		{"\e[27;6;46~",  {code = .Rune, r = '.', mods = {.Ctrl, .Shift}}},
+		{"\e[27;2;65~",  {code = .Rune, r = 'A', mods = {.Shift}}},
+	}) {
+		clear(&out)
+		n := decode_keys(transmute([]u8)c.seq, &out)
+		testing.expectf(t, n == len(c.seq), "%q: consumed %d, want %d", c.seq, n, len(c.seq))
+		if !testing.expectf(t, len(out) == 1, "%q: emitted %d keys, want 1 (%v)", c.seq, len(out), out[:]) {
+			continue
+		}
+		testing.expectf(t, out[0] == c.want, "%q: got %v, want %v", c.seq, out[0], c.want)
+	}
+
+	// It agrees with the Kitty spelling of the same keypress, for the same
+	// reason Shift+Tab has to: one physical key must not mean two things
+	// depending on which protocol the terminal happened to negotiate.
+	kitty := make([dynamic]Key_Msg); defer delete(kitty)
+	clear(&out)
+	decode_keys(transmute([]u8)string("\e[27;5;9~"), &out)
+	decode_keys(transmute([]u8)string("\e[9;5u"),    &kitty)
+	if testing.expect_value(t, len(out), 1) && testing.expect_value(t, len(kitty), 1) {
+		testing.expect_value(t, out[0], kitty[0])
+	}
+
+	// 27 is still not a tilde KEY id: the two-parameter forms stay ignored, and
+	// a three-parameter form whose codepoint has no Key_Code is ignored too.
+	for seq in ([?]string{"\e[27~", "\e[27;5~", "\e[27;5;57400~"}) {
+		clear(&out)
+		n := decode_keys(transmute([]u8)seq, &out)
+		testing.expectf(t, n == len(seq), "%q: consumed %d, want %d", seq, n, len(seq))
+		testing.expectf(t, len(out) == 0, "%q: emitted %d keys, want 0 (%v)", seq, len(out), out[:])
 	}
 }

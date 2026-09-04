@@ -1,3 +1,9 @@
+#+private
+// ^ Every declaration in this file is package-private, so that `odin doc
+//   runetea` / `odin doc runegloss` -- the command README.md and docs/API.md
+//   hand a newcomer for symbol discovery -- lists the library rather than the
+//   test fixtures. Pinned by tools/doccheck/run.sh's `apidoc` check, which is
+//   also where the argument for it is written out.
 package runetea
 
 import "core:strings"
@@ -157,17 +163,51 @@ test_wide_cjk_line_wraps_and_rewinds_correctly :: proc(t: ^testing.T) {
 @(test)
 test_emoji_with_vs16_wraps_and_rewinds_correctly :: proc(t: ^testing.T) {
 	// "❤️" (U+2764 U+FE0F) is one grapheme cluster, corrected width 2 (defect
-	// 2). At a 1-column terminal that is ceil(2/1) = 2 physical rows.
+	// 2) -- that half is unchanged and is what this test was written for.
+	//
+	// WHAT CHANGED, AND WHY THE OLD ANSWER WAS THE BUG. This test used to say
+	// "at a 1-column terminal that is ceil(2/1) = 2 physical rows" and assert a
+	// two-row rewind. The ceil division is exactly the model width.odin's
+	// measure_line replaced, because it does not describe where a terminal puts
+	// a wide cluster that does not fit before the right margin. Under the
+	// placement rule -- screen_put's, and pyte's -- the cluster is written AT
+	// the last column with no continuation cell and the cursor CLAMPS to
+	// term_width, entering DECAWM's pending-wrap state; the wrap resolves on the
+	// NEXT printable cluster, and there isn't one. So the content occupies ONE
+	// row, and a two-row rewind would walk \e[1A up past the frame and \e[2K a
+	// row that belongs to whatever the shell printed before the program started.
+	//
+	// Checked against pyte rather than reasoned about, since the whole point of
+	// the change is that reasoning about this got it wrong once already:
+	//
+	//   cols=4  "abc<CJK>"   -> cursor (4,0), content on row 0 only
+	//   cols=5  "abcd<CJK>"  -> cursor (5,0), content on row 0 only
+	//   cols=6  "abcd<CJK>X" -> cursor (1,1); the NEXT char wraps, not the
+	//                           cluster -- which is what "pending" means
+	//   cols=1  "❤️"          -> content on row 0 only
+	//
+	// THE RESIDUAL, STATED RATHER THAN PAPERED OVER: .Inline is painted by the
+	// REAL terminal, and xterm-family terminals do not do this. Alacritty
+	// inserts a leading-wide-char spacer and wraps the cluster; foot pads with
+	// spacers and forces a line wrap. On those, this content occupies TWO rows
+	// and the rewind here is one row short. That divergence is screen.odin's
+	// documented margin rule (see its header, and docs/LIMITATIONS.md 3.8),
+	// taken deliberately because pyte -- the independent oracle tools/difftest
+	// scores this package against -- takes this side, and because .Diff and
+	// .Full_Screen are immune to it (they address every row absolutely, so a
+	// model that agrees with itself paints a correct screen either way). .Inline
+	// is the one mode it can still reach, and only for a line whose LAST cluster
+	// is wide and starts on the LAST column.
 	b := strings.builder_make(); defer strings.builder_destroy(&b)
 	r: Renderer
 	renderer_init(&r, &b, 1)
 
 	renderer_render(&r, "❤️")
-	testing.expect_value(t, r.last_rows, 2)
+	testing.expect_value(t, r.last_rows, 1)
 	strings.builder_reset(&b)
 
 	renderer_render(&r, "x")
-	testing.expect_value(t, strings.to_string(b), "\e[1A\e[2K\e[1A\e[2K" + "x\r\n")
+	testing.expect_value(t, strings.to_string(b), "\e[1A\e[2K" + "x\r\n")
 }
 
 @(test)
@@ -479,7 +519,15 @@ test_unknown_width_falls_back_to_pre_fix_behavior_byte_for_byte :: proc(t: ^test
 //
 // THE FULL-SCREEN FRAME SHAPE, once and for all:
 //
-//   \e[?25l                    hide, iff this frame declares a cursor
+//   \e[?25l                    hide, iff the caret is not already hidden. NOT
+//                              conditional on a declared cursor any more -- this
+//                              mode owns the viewport and hides the caret for as
+//                              long as it does. See
+//                              test_full_screen_hides_the_caret_it_owns.
+//   \e[0m                      iff the PREVIOUS frame left an SGR open. A frame
+//                              starts from the default pen, or the trailing
+//                              \e[J below erases the rest of the screen in the
+//                              view's leftover background.
 //   \e[H                       HOME -- the absolute origin the whole mode exists for
 //   <line>\e[K                 per painted line; \r\n BETWEEN lines, never after
 //                              the last one (a \r\n on the bottom row SCROLLS,
@@ -488,7 +536,9 @@ test_unknown_width_falls_back_to_pre_fix_behavior_byte_for_byte :: proc(t: ^test
 //   \r\n\e[J                   clear everything below the frame, iff a row
 //                              exists below it
 //   \e[<row>;<col>H            place -- ABSOLUTE CUP, 1-based, not a relative walk
-//   \e[?25h                    show
+//   \e[?25h                    show, iff this frame DECLARED a cursor. A frame
+//                              that declared none leaves the caret hidden --
+//                              that is the whole point of hiding it.
 //
 // There is no rewind and no return-to-home walk: absolute positioning is the
 // point, so `cursor_up` stays 0 forever in this mode and the inline renderer's
@@ -502,8 +552,11 @@ test_full_screen_first_frame_is_byte_exact :: proc(t: ^testing.T) {
 	renderer_init(&r, &b, 0, 0, .Full_Screen)   // width/height unknown
 
 	renderer_render(&r, "hello\nworld")
+	// \e[?25l WITH NO CURSOR DECLARED, and that is the change F24 asked for:
+	// the mode that owns the viewport hides the caret before it paints and
+	// leaves it hidden. See test_full_screen_hides_the_caret_it_owns.
 	testing.expect_value(t, strings.to_string(b),
-		"\e[H" + "hello\e[K" + "\r\n" + "world\e[K" + "\r\n\e[J")
+		"\e[?25l" + "\e[H" + "hello\e[K" + "\r\n" + "world\e[K" + "\r\n\e[J")
 	testing.expect_value(t, r.last_rows, 2)
 	testing.expect_value(t, r.cursor_up, 0)
 }
@@ -549,7 +602,7 @@ test_full_screen_truncates_content_taller_than_the_viewport :: proc(t: ^testing.
 	// "c" and "d" are dropped, and there is NO trailing \r\n\e[J: the frame
 	// fills the screen exactly, so there is no row below to clear and the \r\n
 	// that would precede the clear would scroll.
-	testing.expect_value(t, strings.to_string(b), "\e[H" + "a\e[K" + "\r\n" + "b\e[K")
+	testing.expect_value(t, strings.to_string(b), "\e[?25l" + "\e[H" + "a\e[K" + "\r\n" + "b\e[K")
 	testing.expect_value(t, r.last_rows, 2)
 }
 
@@ -566,7 +619,7 @@ test_full_screen_truncation_counts_physical_rows :: proc(t: ^testing.T) {
 	line :: "Hi. This program will exit on 'q'."   // 34 cols -> 2 rows at width 20
 	renderer_render(&r, line + "\nsecond\nthird")
 	testing.expect_value(t, strings.to_string(b),
-		"\e[H" + line + "\e[K" + "\r\n" + "second\e[K")
+		"\e[?25l" + "\e[H" + line + "\e[K" + "\r\n" + "second\e[K")
 	testing.expect_value(t, r.last_rows, 3)
 }
 
@@ -584,7 +637,7 @@ test_full_screen_drops_a_line_that_cannot_fit_whole :: proc(t: ^testing.T) {
 	renderer_init(&r, &b, 10, 1, .Full_Screen)
 
 	renderer_render(&r, "日本語日本語")   // 12 cols -> 2 rows at width 10, screen is 1
-	testing.expect_value(t, strings.to_string(b), "\e[H" + "\e[J")
+	testing.expect_value(t, strings.to_string(b), "\e[?25l" + "\e[H" + "\e[J")
 	testing.expect_value(t, r.last_rows, 0)
 }
 
@@ -600,7 +653,7 @@ test_full_screen_unknown_height_paints_everything :: proc(t: ^testing.T) {
 
 	renderer_render(&r, "a\nb\nc\nd")
 	testing.expect_value(t, strings.to_string(b),
-		"\e[H" + "a\e[K" + "\r\n" + "b\e[K" + "\r\n" + "c\e[K" + "\r\n" + "d\e[K" + "\r\n\e[J")
+		"\e[?25l" + "\e[H" + "a\e[K" + "\r\n" + "b\e[K" + "\r\n" + "c\e[K" + "\r\n" + "d\e[K" + "\r\n\e[J")
 	testing.expect_value(t, r.last_rows, 4)
 }
 
@@ -635,12 +688,14 @@ test_full_screen_omits_el_for_a_line_that_exactly_fills_its_row :: proc(t: ^test
 	// "abcde" is exactly 5 columns at width 5; "xy" is not.
 	renderer_render(&r, "abcde\nxy")
 	testing.expect_value(t, strings.to_string(b),
-		"\e[H" + "abcde" + "\r\n" + "xy\e[K" + "\r\n\e[J")
+		"\e[?25l" + "\e[H" + "abcde" + "\r\n" + "xy\e[K" + "\r\n\e[J")
 
 	// ...and a WRAPPED line that ends flush with the margin is the same case:
 	// "abcdefghij" is 10 columns == 2 full rows at width 5.
 	strings.builder_reset(&b)
 	renderer_render(&r, "abcdefghij")
+	// No \e[?25l: the frame above already hid the caret and this mode leaves it
+	// hidden for as long as it owns the viewport.
 	testing.expect_value(t, strings.to_string(b), "\e[H" + "abcdefghij" + "\r\n\e[J")
 	testing.expect_value(t, r.last_rows, 2)
 }
@@ -736,23 +791,48 @@ test_full_screen_places_no_cursor_when_nothing_was_painted :: proc(t: ^testing.T
 	testing.expect_value(t, strings.to_string(b), "\e[?25l" + "\e[H" + "\e[J" + "\e[?25h")
 }
 
-// A full-screen program that never declares a cursor writes not one DECTCEM
-// byte -- the same opt-in property the inline mode has, and for the same reason
-// (a terminal must never be left in a state this process did not deliberately
-// enter). The caret simply rests wherever the paint left it, which is where the
-// inline renderer's own cursor-less frames leave it too.
+// A full-screen program that never declares a cursor HIDES THE CARET AND LEAVES
+// IT HIDDEN -- once, six bytes, for the life of the session.
+//
+// THIS TEST USED TO ASSERT THE OPPOSITE, under the name
+// test_full_screen_without_a_cursor_writes_no_dectcem, and the rule it pinned
+// ("a terminal must never be left in a state this process did not deliberately
+// enter") was the right rule applied to the wrong mode. .Full_Screen owns the
+// whole viewport; the caret sitting inside it is not the user's caret resting
+// after some output, it is a blinking block parked in the middle of an
+// application's UI -- and every repaint dragged it across all 24 rows, 60 times
+// a second. There was also no way to opt out: Cursor{show = false} is the zero
+// value and reads as "no opinion", and cursor_hide_arm is package-private, so an
+// application that wrote \e[?25l itself got no paired \e[?25h from term_restore
+// and left the user's shell with an invisible caret.
+//
+// The pairing that makes hiding safe is term.odin's, not this file's:
+// cursor_hide_arm() makes term_restore -- and guard.odin's crash handler, and
+// the SIGTSTP path -- write \e[?25h on every exit, including the ones no
+// renderer ever sees. renderer_clear covers the orderly path.
 @(test)
-test_full_screen_without_a_cursor_writes_no_dectcem :: proc(t: ^testing.T) {
+test_full_screen_hides_the_caret_it_owns :: proc(t: ^testing.T) {
 	b := strings.builder_make(); defer strings.builder_destroy(&b)
 	r: Renderer
 	renderer_init(&r, &b, 0, 10, .Full_Screen)
 
 	renderer_render(&r, "a")
 	renderer_render(&r, "b")
+	// ONE hide, on the first frame, and no show at all: the second frame does
+	// not re-hide (the caret is already hidden) and does not reveal it either.
+	// A per-frame hide/show pair would cost 12 bytes a frame and flicker the
+	// caret back into view between repaints.
 	testing.expect_value(t, strings.to_string(b),
-		"\e[H" + "a\e[K" + "\r\n\e[J" + "\e[H" + "b\e[K" + "\r\n\e[J")
-	testing.expect(t, !strings.contains(strings.to_string(b), "\e[?25"),
-		"a cursor-less full-screen frame must not touch DECTCEM")
+		"\e[?25l" + "\e[H" + "a\e[K" + "\r\n\e[J" + "\e[H" + "b\e[K" + "\r\n\e[J")
+	testing.expect_value(t, strings.count(strings.to_string(b), "\e[?25l"), 1)
+	testing.expect(t, !strings.contains(strings.to_string(b), "\e[?25h"),
+		"a frame that declared no cursor must not show the caret again")
+
+	// ...and renderer_clear gives it back, because that is where this mode's
+	// ownership of the viewport ends.
+	strings.builder_reset(&b)
+	renderer_clear(&r)
+	testing.expect_value(t, strings.to_string(b), "\e[?25h" + "\e[H\e[J")
 }
 
 @(test)
@@ -918,4 +998,384 @@ test_inline_with_an_unknown_height_rewinds_every_painted_row :: proc(t: ^testing
 	renderer_render(&r, "x")
 	testing.expect_value(t, strings.to_string(b),
 		"\e[1A\e[2K" + "\e[1A\e[2K" + "\e[1A\e[2K" + "\e[1A\e[2K" + "\e[1A\e[2K" + "x\r\n")
+}
+
+// ============================================================================
+// F03 / F04 / F14 / F24: what a frame leaves behind, and what it measures.
+// ============================================================================
+
+// F03. \e[2K ERASES WITH THE ACTIVE BACKGROUND, so the rewind has to start from
+// the default pen.
+//
+// The failure this pins was the most ordinary hand-written-view mistake there
+// is -- a line that opens a background colour and never closes it -- amplified
+// into a permanently wrong screen by the DEFAULT render mode. The rewind
+// erased every row of the frame region to that colour, the repaint that
+// followed was written in it, and because the next frame's view left the same
+// escape open the flood renewed itself forever. Three rows here; a full-screen
+// app's whole frame region in practice.
+//
+// The reset is CONDITIONAL, and the second half of this test is why that
+// matters more than the four bytes: every byte-exact expectation in this file
+// is a view that closes its styles, and not one of them may move.
+@(test)
+test_inline_resets_sgr_before_its_rewind :: proc(t: ^testing.T) {
+	b := strings.builder_make(); defer strings.builder_destroy(&b)
+	r: Renderer
+	renderer_init(&r, &b, 20)
+
+	leaky :: "one\ntwo\n\e[41mthree"
+	renderer_render(&r, leaky)
+	testing.expect_value(t, strings.to_string(b), "one\r\ntwo\r\n\e[41mthree\r\n")
+	testing.expect(t, r.pen_open, "the view left \\e[41m open; the renderer must know it")
+	strings.builder_reset(&b)
+
+	renderer_render(&r, leaky)
+	// \e[0m BEFORE the first \e[1A. Not after the rewind and not per row: the
+	// erase is what needs the default pen, and one reset covers all three.
+	testing.expect_value(t, strings.to_string(b),
+		"\e[0m" + "\e[1A\e[2K\e[1A\e[2K\e[1A\e[2K" + "one\r\ntwo\r\n\e[41mthree\r\n")
+
+	// A view that closes its own style pays nothing at all.
+	b2 := strings.builder_make(); defer strings.builder_destroy(&b2)
+	r2: Renderer
+	renderer_init(&r2, &b2, 20)
+	tidy :: "one\ntwo\n\e[41mthree\e[0m"
+	renderer_render(&r2, tidy)
+	strings.builder_reset(&b2)
+	renderer_render(&r2, tidy)
+	testing.expect(t, !strings.contains(strings.to_string(b2), "\e[0m\e[1A"),
+		"a view that closes its styles must not gain a reset")
+	testing.expect(t, strings.has_prefix(strings.to_string(b2), "\e[1A\e[2K"),
+		"a tidy view's frame must begin with the rewind, byte for byte as before")
+}
+
+// F03, the other two modes. .Full_Screen's trailing \e[J is the same hazard one
+// scale larger -- it erases everything BELOW the frame, i.e. the rest of the
+// screen -- and renderer_clear is the same hazard at exit.
+@(test)
+test_full_screen_resets_sgr_before_the_trailing_ed :: proc(t: ^testing.T) {
+	b := strings.builder_make(); defer strings.builder_destroy(&b)
+	r: Renderer
+	renderer_init(&r, &b, 10, 6, .Full_Screen)
+
+	renderer_render(&r, "\e[41mbar")
+	got := strings.to_string(b)
+	// The line's OWN \e[K keeps the red -- that is how a view paints a bar out
+	// to the right margin, and both .Full_Screen and .Diff model it that way.
+	// The \e[0m sits between that and the \r\n\e[J, which erases rows the frame
+	// never wrote.
+	testing.expect_value(t, got,
+		"\e[?25l" + "\e[H" + "\e[41mbar" + "\e[K" + "\e[0m" + "\r\n\e[J")
+	testing.expect(t, !r.pen_open, "the pre-ED reset must clear the tracked pen too")
+
+	// And a tidy view is untouched: no reset anywhere.
+	b2 := strings.builder_make(); defer strings.builder_destroy(&b2)
+	r2: Renderer
+	renderer_init(&r2, &b2, 10, 6, .Full_Screen)
+	renderer_render(&r2, "\e[41mbar\e[0m")
+	testing.expect_value(t, strings.to_string(b2),
+		"\e[?25l" + "\e[H" + "\e[41mbar\e[0m" + "\e[K" + "\r\n\e[J")
+}
+
+@(test)
+test_renderer_clear_resets_sgr_before_it_erases :: proc(t: ^testing.T) {
+	// A frame that FILLS the viewport writes no trailing \e[J, so it is the one
+	// frame that can end with the pen still set -- which makes it the frame that
+	// proves renderer_clear owes the reset rather than inheriting it.
+	b := strings.builder_make(); defer strings.builder_destroy(&b)
+	r: Renderer
+	renderer_init(&r, &b, 10, 1, .Full_Screen)
+	renderer_render(&r, "\e[41mbar")
+	testing.expect(t, r.pen_open, "a viewport-filling frame ends with the view's pen still set")
+	strings.builder_reset(&b)
+
+	renderer_clear(&r)
+	testing.expect_value(t, strings.to_string(b), "\e[?25h" + "\e[0m" + "\e[H\e[J")
+
+	// Inline: same rule in front of the same erase.
+	bi := strings.builder_make(); defer strings.builder_destroy(&bi)
+	ri: Renderer
+	renderer_init(&ri, &bi, 20)
+	renderer_render(&ri, "\e[41mbar")
+	strings.builder_reset(&bi)
+	renderer_clear(&ri)
+	testing.expect_value(t, strings.to_string(bi), "\e[0m" + "\e[1A\e[2K")
+}
+
+// F04, the RENDER half. The measurement half landed in width.odin (a \t now
+// advances to the next tab stop instead of measuring 0); this is the assertion
+// that the inline rewind actually consumes it.
+//
+// "col1\tcol2\tcol3\tcol4\tcol5\tcol6" at 40 columns: 24 columns of text, 44
+// columns painted once the six tabs expand, so TWO physical rows. Measured as
+// 24 it was one, last_rows recorded one, the next frame's rewind erased one row
+// too few -- and the whole frame slid one row down the screen, every frame,
+// leaving a complete stale copy of the previous frame above it. Forever: the
+// error is a constant one row per frame, so the steady state is a terminal that
+// scrolls without end with stale rows permanently visible.
+@(test)
+test_inline_rewinds_the_rows_a_tab_actually_painted :: proc(t: ^testing.T) {
+	b := strings.builder_make(); defer strings.builder_destroy(&b)
+	r: Renderer
+	renderer_init(&r, &b, 40)
+
+	line :: "col1\tcol2\tcol3\tcol4\tcol5\tcol6"
+	// The two measurements, side by side, so the test says what the bug was:
+	// tab_stop = -1 restores the pre-fix "a tab is a zero-width control"
+	// reading, which is the number the renderer used to believe.
+	testing.expect_value(t, display_width(line, Width_Options{tab_stop = -1}), 24)
+	testing.expect_value(t, display_width(line), 44)
+	testing.expect_value(t, rows_for_line(line, 40), 2)
+
+	renderer_render(&r, line)
+	testing.expect_value(t, r.last_rows, 2)
+	strings.builder_reset(&b)
+
+	renderer_render(&r, "x")
+	testing.expect_value(t, strings.to_string(b), "\e[1A\e[2K\e[1A\e[2K" + "x\r\n")
+}
+
+// F14. A WIDE CLUSTER THAT STRADDLES THE RIGHT MARGIN MAKES A ROW END SHORT,
+// and the \e[K that clears it must not be skipped.
+//
+// "abcd界efgh" at 5 columns measures 10, and 10 % 5 == 0 -- so the old
+// line_fills_its_rows said "flush with the right margin, nothing to erase" and
+// the trailing EL was dropped. It is not flush. The 界 starts at column 4, the
+// last one, so screen_put writes it THERE and clamps the cursor rather than
+// giving it two columns; "efgh" then wraps and the second row ends at column 4
+// of 5. Column 4 of that row is never written, and under .Diff it keeps the
+// previous frame's character forever, because the model agreed with the
+// omission and no later frame ever repaints it.
+//
+// measure_line answers the real question -- is the last row's final column
+// written -- instead of the arithmetic proxy.
+@(test)
+test_full_screen_emits_el_when_a_wide_cluster_straddles_the_margin :: proc(t: ^testing.T) {
+	view :: "abcd界efgh"
+	testing.expect_value(t, display_width(view), 10)   // a multiple of 5: the old "fills" answer
+	m := measure_line(view, 5)
+	testing.expect_value(t, m.rows, 2)
+	testing.expect_value(t, m.end_col, 4)              // one short of the margin
+	testing.expect(t, !m.fills, "the last row ends at column 4 of 5, so it does not fill")
+
+	b := strings.builder_make(); defer strings.builder_destroy(&b)
+	r: Renderer
+	renderer_init(&r, &b, 5, 4, .Full_Screen)
+	renderer_render(&r, view)
+	testing.expect_value(t, strings.to_string(b),
+		"\e[?25l" + "\e[H" + view + "\e[K" + "\r\n\e[J")
+}
+
+// ============================================================================
+// F53: a terminal that declares no capabilities gets no escape sequences.
+//
+// term_enter_raw's five opt-ins were gated on term_supports_escapes() by the
+// term-guard wave; the RENDERER was not, and the renderer is where the volume
+// is. A TERM=dumb session got no alternate screen and then a wall of \e[H,
+// \e[2J, \e[K, CUP and SGR painted literally on top of its own output.
+//
+// Every mode is exercised, because each one owns a different escape and a gate
+// placed one line too low would let one of them through: .Inline's rewind,
+// .Full_Screen's home/erase, and .Diff's cursor addressing.
+// ============================================================================
+
+@(test)
+test_a_plain_renderer_writes_not_one_escape_in_any_mode :: proc(t: ^testing.T) {
+	for mode in ([?]Render_Mode{.Inline, .Full_Screen, .Diff}) {
+		b := strings.builder_make(); defer strings.builder_destroy(&b)
+		r: Renderer
+		renderer_init(&r, &b, 20, 5, mode)
+		defer renderer_destroy(&r)
+		r.plain = true
+
+		// Two frames, so a rewind or a diff would have something to address,
+		// and a declared cursor, so DECTCEM and CUP would both have a reason to
+		// appear. The view carries its own SGR and a hyperlink -- RuneGloss
+		// still emits attributes under TERM=dumb (it drops only colour), and
+		// nothing downstream of here can remove them.
+		renderer_render(&r, "\e[1mhello\e[0m\nworld", Cursor{line = 1, col = 2, show = true})
+		renderer_render(&r, "\e]8;;https://example.com\e\\link\e]8;;\e\\\nagain")
+
+		got := strings.to_string(b)
+		testing.expectf(t, !strings.contains(got, "\e"),
+			"%v: a terminal that declares no capabilities must see no ESC at all; got %q", mode, got)
+		testing.expectf(t, got == "hello\r\nworld\r\n" + "link\r\nagain\r\n",
+			"%v: the frames are the view's text and nothing else; got %q", mode, got)
+	}
+}
+
+// The gate is on the RENDERER, not on the view: a plain frame must still be a
+// faithful transcript of what the app painted, including every byte an escape
+// happened to sit next to. This is the case a naive "drop everything from ESC
+// to the next letter" strip gets wrong.
+@(test)
+test_a_plain_frame_keeps_every_byte_that_is_not_part_of_an_escape :: proc(t: ^testing.T) {
+	b := strings.builder_make(); defer strings.builder_destroy(&b)
+	r: Renderer
+	renderer_init(&r, &b, 0, 0)
+	r.plain = true
+
+	// [ and m are content here, not escape bytes; the OSC's payload contains a
+	// ';' and a '/' that the terminator scan must not stop early on.
+	renderer_render(&r, "a[b\e[31mc;d\e]8;;https://x/y\e\\e\e[0mf")
+	testing.expect_value(t, strings.to_string(b), "a[bc;def\r\n")
+}
+
+// ---------------------------------------------------------------------------
+// AN APPLICATION'S OWN "HIDE THE CARET FOR THIS PROGRAM" (F24's residual).
+//
+// The mode-owns-the-viewport rule hides the caret for .Full_Screen and .Diff.
+// .Inline deliberately does not take the terminal's cursor state over on its
+// own initiative -- it composes with the shell -- so the only way that mode can
+// lose the blinking block is for the APPLICATION to say so, and until
+// Term_Opts.cursor_hide there was no way to say it that came with a paired
+// show. See term.odin's Term_Opts.cursor_hide for the full argument.
+//
+// What this pins is the half that lives here: .Inline's own hide/show pair is
+// emitted per frame (hide, paint, show), so a declaration this file did not
+// consult would be UNDONE at the end of every frame -- six bytes each way, sixty
+// times a second, with the caret flickering back into view between every pair.
+// ---------------------------------------------------------------------------
+@(test)
+test_an_inline_session_that_declared_cursor_hide_hides_once_and_never_shows :: proc(t: ^testing.T) {
+	pty, ok := open_test_pty()
+	if !testing.expect(t, ok, "could not open a pty") { return }
+	defer close_test_pty(pty)
+
+	// The declaration lives on the TERMINAL, not on the Renderer: it is the
+	// layer that owns the tty that gets to make this call, which for .Inline is
+	// never this file. Frames still go to a Builder, so the pty sees only the
+	// acquire's own hide.
+	if !testing.expect(t, term_enter_raw(pty.slave, {cursor_hide = true}), "term_enter_raw failed") { return }
+	defer term_restore()
+
+	b := strings.builder_make(); defer strings.builder_destroy(&b)
+	r: Renderer
+	renderer_init(&r, &b, 20)
+
+	renderer_render(&r, "one")
+	testing.expect_value(t, strings.to_string(b), "\e[?25l" + "one\r\n")
+
+	strings.builder_reset(&b)
+	renderer_render(&r, "two")
+	got := strings.to_string(b)
+	testing.expectf(t, !strings.contains(got, "\e[?25h"),
+		"the second frame wrote %q -- an .Inline frame must not undo a session-long declaration at the end of every paint", got)
+	testing.expectf(t, !strings.contains(got, "\e[?25l"),
+		"the second frame wrote %q -- the caret is already hidden, so re-hiding it is six wasted bytes per frame", got)
+}
+
+// A frame that DOES declare a cursor still wins: the session-long declaration is
+// a default, not a veto, or an app with a text field could never show its caret.
+// The frame after it hides again, which is the sticky rule the viewport-owning
+// modes have always used.
+@(test)
+test_a_declared_cursor_still_shows_over_a_session_long_cursor_hide :: proc(t: ^testing.T) {
+	pty, ok := open_test_pty()
+	if !testing.expect(t, ok, "could not open a pty") { return }
+	defer close_test_pty(pty)
+	if !testing.expect(t, term_enter_raw(pty.slave, {cursor_hide = true}), "term_enter_raw failed") { return }
+	defer term_restore()
+
+	b := strings.builder_make(); defer strings.builder_destroy(&b)
+	r: Renderer
+	renderer_init(&r, &b, 20)
+
+	renderer_render(&r, "one")
+	strings.builder_reset(&b)
+
+	renderer_render(&r, "one", Cursor{line = 0, col = 2, show = true})
+	got := strings.to_string(b)
+	testing.expectf(t, strings.has_suffix(got, "\e[?25h"),
+		"a frame that declares a cursor wrote %q, want it to end in a show", got)
+
+	strings.builder_reset(&b)
+	renderer_render(&r, "one")
+	got2 := strings.to_string(b)
+	testing.expectf(t, strings.contains(got2, "\e[?25l") && !strings.contains(got2, "\e[?25h"),
+		"the next cursor-less frame wrote %q, want the caret hidden again and left that way", got2)
+}
+
+// ---------------------------------------------------------------------------
+// A REPAINT NOBODY ON THE FRAME PATH CAN ASK FOR (F29's residual).
+//
+// guard.odin's SIGTSTP/SIGCONT handlers rebuild the terminal on resume and kick
+// a synthetic SIGWINCH so the loop renders again. Under .Diff that was not
+// enough: force_repaint is set only when the SIZE actually changed, so a `fg`
+// at an unchanged window size diffed against a cell model that still described
+// the pre-stop frame -- while the user's shell had printed a prompt and a
+// command's output over it. The diff patched the cells it believed had changed
+// and left the shell's text on screen for the rest of the session.
+// ---------------------------------------------------------------------------
+@(test)
+test_a_repaint_request_makes_an_unchanged_diff_frame_repaint :: proc(t: ^testing.T) {
+	b := strings.builder_make(); defer strings.builder_destroy(&b)
+	r: Renderer
+	renderer_init(&r, &b, 10, 3, .Diff)
+	defer renderer_destroy(&r)
+
+	renderer_render(&r, "hi")
+	first := strings.clone(strings.to_string(b)); defer delete(first)
+
+	// The mode's whole point, and the trap: an identical view at an identical
+	// size costs nothing, so nothing in the frame path can notice that the
+	// screen underneath is no longer the one the model describes.
+	strings.builder_reset(&b)
+	renderer_render(&r, "hi")
+	testing.expect_value(t, strings.to_string(b), "")
+
+	strings.builder_reset(&b)
+	request_repaint()
+	renderer_render(&r, "hi")
+	testing.expectf(t, strings.to_string(b) == first,
+		"after a repaint request the frame wrote %q, want the first frame's bytes back %q -- a resume has to resynchronise from a real \\e[2J, not from a model of a screen the shell has written on", strings.to_string(b), first)
+}
+
+// The .Inline half of the same request, and it is not a repaint but its
+// opposite: the rows this renderer painted are not under the cursor any more
+// (the shell's prompt and its command output are), so rewinding over them would
+// erase the USER'S text and paint the frame into the hole. Zero means "paint
+// fresh, right here", which is what every other program resuming from a stop
+// does.
+@(test)
+test_a_repaint_request_stops_the_next_inline_frame_rewinding :: proc(t: ^testing.T) {
+	b := strings.builder_make(); defer strings.builder_destroy(&b)
+	r: Renderer
+	renderer_init(&r, &b, 20)
+
+	renderer_render(&r, "a\nb")
+	strings.builder_reset(&b)
+
+	request_repaint()
+	renderer_render(&r, "a\nb")
+	testing.expect_value(t, strings.to_string(b), "a\r\nb\r\n")
+}
+
+// The third thing the request resets, and the one that is easy to miss: every
+// path that can request a repaint went through term_restore_c first, and
+// term_restore_c writes "\e[?25h". A renderer that still believed the caret was
+// hidden would never re-hide it, so a .Full_Screen or .Diff program would run
+// the rest of the session with the blinking block back in the middle of the
+// viewport it owns.
+@(test)
+test_a_repaint_request_re_hides_the_caret_the_teardown_showed :: proc(t: ^testing.T) {
+	b := strings.builder_make(); defer strings.builder_destroy(&b)
+	r: Renderer
+	renderer_init(&r, &b, 10, 3, .Full_Screen)
+
+	renderer_render(&r, "hi")
+	testing.expect(t, strings.contains(strings.to_string(b), "\e[?25l"),
+		"the first full-screen frame must hide the caret")
+
+	strings.builder_reset(&b)
+	renderer_render(&r, "hi")
+	testing.expect(t, !strings.contains(strings.to_string(b), "\e[?25l"),
+		"it stays hidden across frames -- six bytes once, not twelve per frame")
+
+	strings.builder_reset(&b)
+	request_repaint()
+	renderer_render(&r, "hi")
+	testing.expect(t, strings.contains(strings.to_string(b), "\e[?25l"),
+		"the teardown that preceded the request wrote \\e[?25h, so the frame after it has to hide the caret again")
 }

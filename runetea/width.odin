@@ -33,6 +33,18 @@ import "core:unicode/utf8"
 //     cluster. A combining mark following a real base rune never hits this:
 //     the iterator only adds width for the rune that OPENS a cluster, and a
 //     following Extend rune never opens one.
+//
+// AND ONE DEFECT THAT WAS THIS FILE'S OWN, not core:unicode's: the HORIZONTAL
+// TAB. \t is a C0 control, normalized_east_asian_width returns 0 for every
+// control, and so a tab used to measure ZERO COLUMNS. It does not occupy zero
+// columns; it is the ONE C0 byte with a defined column effect (HT: advance to
+// the next tab stop). The cost of pretending otherwise was not academic: a
+// .Inline view containing one tab measured short, Renderer.last_rows recorded
+// the under-count, and the next frame's rewind erased one row too few -- so the
+// whole frame walked one row down the screen EVERY FRAME, forever, leaving a
+// complete stale copy of the previous frame above it. Reproduced at 40 columns
+// with a line that measured 37 and painted 44. Modelled here instead: see
+// next_tab_stop, Width_Options.tab_stop, and measure_line's margin rule.
 Width_Options :: struct {
 	// East_Asian_Width=Ambiguous runes (curly quotes, box-drawing, Greek,
 	// Cyrillic, circled digits, ...) are 1 or 2 columns depending on the
@@ -47,13 +59,181 @@ Width_Options :: struct {
 	// xterm's own default) unless the target terminal/locale is known to
 	// render Ambiguous-width runes double-wide.
 	ambiguous_is_wide: bool,
+
+	// WHICH TERMINAL FAMILY'S CLUSTER RULE TO MEASURE BY -- see Emoji_Width
+	// below (it sits with TAB_STOP_DEFAULT, the other constant a field of this
+	// struct is defined in terms of) for the measured VTE transcript that makes
+	// this a setting rather than a constant. The zero value is .Grapheme_Cluster, i.e. exactly what this file
+	// answered before the field existed, so no existing measurement moves.
+	emoji_width: Emoji_Width,
+
+	// THE COLUMN THIS STRING STARTS AT, and the reason this field has to
+	// exist at all: a horizontal tab's width is not a property of the tab, it
+	// is a property of WHERE THE TAB IS. "\t" occupies 8 columns at column 0
+	// and 1 column at column 7. So the moment \t is modelled (it must be --
+	// see the file header), display_width stops being a homomorphism:
+	//
+	//     display_width(a) + display_width(b)  !=  display_width(a + b)
+	//
+	// for any `a` whose width is not a multiple of tab_stop and any `b`
+	// beginning with a tab. That is a fact about terminals, not a wart in this
+	// API, and the only honest thing to do with it is to say WHICH column the
+	// measurement assumes. Zero -- "this string starts at the left margin" --
+	// is the default, which is what every caller predating tabs meant and why
+	// none of them had to change. The composition law that DOES hold, and the
+	// one to reach for when concatenating:
+	//
+	//     w  := display_width(a, {start_col = c})
+	//     w2 := display_width(b, {start_col = c + w})
+	//     // w + w2 == display_width(concat(a, b), {start_col = c})
+	//
+	// REJECTED: a separate `display_width_at(s, col)` proc. It would have left
+	// the plain `display_width` silently wrong for tabs (the status quo this
+	// exists to end), and it would have needed a twin for every other measuring
+	// proc in the file. REJECTED: expanding tabs to spaces before measuring.
+	// That allocates, it changes the bytes the renderer writes (so the diff
+	// model and the terminal would disagree about what was sent), and it still
+	// needs the starting column to know how many spaces.
+	//
+	// Nothing but a tab reads this field. For a tab-free string, every result
+	// in this file is exactly what it was before start_col existed.
+	start_col: int,
+
+	// Columns between tab stops. 0 means TAB_STOP_DEFAULT (8), which is what
+	// every terminal ships with and what the DEC VT100 hard-wired; an app whose
+	// content uses a different convention (examples/editor's TAB_WIDTH is 4)
+	// says so here rather than pre-expanding.
+	//
+	// NEGATIVE MEANS "A TAB IS ZERO WIDTH", i.e. this file's pre-fix behaviour,
+	// kept as an escape hatch rather than as a default: a caller measuring a
+	// string that has ALREADY had its tabs expanded elsewhere, or one feeding a
+	// terminal whose tab stops it has itself cleared, can ask for it. It is not
+	// the default because the default has to be right for the caller who has
+	// not thought about tabs at all, and for that caller a tab is 8 columns.
+	tab_stop: int,
 }
 
-// display_width returns the number of terminal columns `s` occupies, summing
+// The tab-stop interval of an unconfigured terminal, and of Width_Options with
+// tab_stop left at 0. Every terminal emulator in circulation starts with stops
+// every 8 columns (VT100 hardware default, preserved by xterm, kitty, Terminal
+// .app, Windows Terminal and pyte alike). RuneTea never emits TBC/HTS, so it
+// never invalidates this -- but an APPLICATION that does is on its own, which is
+// what Width_Options.tab_stop is for.
+TAB_STOP_DEFAULT :: 8
+
+// HOW MANY COLUMNS A TERMINAL ADVANCES FOR A MULTI-RUNE CLUSTER. This is the
+// second question in this file that has no universally correct answer and that
+// the terminal never reports, and it gets the same treatment as the first one
+// (Width_Options.ambiguous_is_wide): a policy the application selects, with the
+// measurements that justify each choice written down next to it.
+//
+// THE TWO MEMBERS ARE NOT TWO GUESSES; THEY ARE THE TWO FAMILIES THAT WERE
+// MEASURED. A live VTE 2.91 (python3-gi Vte.Terminal, 60 columns, offscreen,
+// calibrated first on "abcdefg" -> 7 and "中文" -> 4) was fed one cluster per
+// frame, with get_cursor_position() read back after each:
+//
+//     cluster                   VTE 2.91   .Grapheme_Cluster   .Legacy_Wcwidth
+//     "abc"                          3            3                  3
+//     "中文字"                        6            6                  6
+//     U+1F44D                        2            2                  2
+//     U+1F44D U+1F3FD (skin tone)    4            2  WRONG           4
+//     U+1F1EF U+1F1F5 (RI flag)      2            2                  2
+//     U+1F468 ZWJ U+1F4BB            4            2  WRONG           4
+//     the 4-emoji ZWJ family         8            2  WRONG           8
+//     "1" U+FE0F U+20E3 (keycap)     1            2  WRONG           1
+//     U+2764 U+FE0F                  1            2  WRONG           1
+//     U+2764 (no VS16)               1            1                  1
+//
+// Four of ten wrong on the terminal that ships with GNOME, in BOTH directions:
+// two columns too few for the skin-tone and ZWJ clusters (RuneGloss's right
+// border then hangs two columns outside the frame), one column too many for the
+// keycap and the VS16 heart (the border sits one column inside it). This is not
+// a bug that can be fixed by picking better numbers, because kitty, WezTerm,
+// foot and Ghostty advance ONE cluster width for exactly the inputs VTE splits
+// -- switching to VTE's numbers would simply move the raggedness to those
+// terminals. What was actually missing was any way for an application that
+// KNOWS which terminal it is on to say so, and any way for one that does not to
+// detect that the question is open at all:
+//
+//     // Is this string's width a matter on which terminals disagree?
+//     shaky := rt.display_width(s) !=
+//              rt.display_width(s, rt.Width_Options{emoji_width = .Legacy_Wcwidth})
+//
+// REJECTED: the two independent bools the audit proposed
+// (`emoji_presentation_is_wide` + `zwj_is_single_cluster`). They have four
+// combinations, two of which describe no terminal anyone has measured, and they
+// do not between them name the two clusters that actually moved the most --
+// the skin-tone modifier and the keycap. The disagreement is not a set of
+// separable rules; it is one coherent question -- "does this terminal advance
+// per grapheme cluster, or per character?" -- and an enum keeps the
+// unmeasurable combinations unrepresentable.
+//
+// REJECTED: making .Legacy_Wcwidth the default because it matches the most
+// widely deployed Linux terminal. The default has to be the one that changes no
+// existing frame, and every application that is correct today is correct
+// BECAUSE it pads to these numbers; flipping the default would silently re-rag
+// every box that currently lines up, on the terminals that were already right,
+// in exchange for squaring the ones that are ragged today -- a lateral move
+// made without asking. It is also the answer the UCD's own emoji-presentation
+// rules give. That is the whole of the argument for it being the default: it is
+// NOT a claim that it is right on your terminal.
+Emoji_Width :: enum u8 {
+	// One extended grapheme cluster advances the cursor once, by the width its
+	// emoji presentation implies: VS16 anywhere forces 2, an RI pair is 2, and
+	// everything else (ZWJ sequences, skin-tone modifiers, keycaps) takes the
+	// width of the cluster's base rune. The zero value, and this file's
+	// behaviour since before the option existed.
+	//
+	// Right for terminals that implement grapheme clustering: kitty, WezTerm,
+	// foot, Ghostty, and anything that answers DEC mode 2027.
+	Grapheme_Cluster = 0,
+
+	// The cluster's width is the SUM of its runes' widths -- East_Asian_Width
+	// F/W is 2, a Nonspacing_Mark or Enclosing_Mark is 0 (VS16 and the
+	// combining enclosing keycap are both marks, which is why they add
+	// nothing), ZWJ and the other zero-width formats are 0, everything else is
+	// 1. No cluster folding of any kind: a skin-tone modifier is a second
+	// wide glyph, a ZWJ sequence is N wide glyphs, and VS16 does not widen the
+	// character it follows.
+	//
+	// Right for the per-character terminals, which is most of them: every
+	// VTE-based one (GNOME Terminal, Tilix, Terminator, xfce4-terminal),
+	// alacritty (it measures each char with the unicode-width crate and does
+	// no cluster folding -- alacritty_terminal/src/term/mod.rs:1064), xterm,
+	// tmux and screen.
+	//
+	// A CLUSTER'S WIDTH IS NO LONGER BOUNDED BY 2 under this policy -- the
+	// 4-emoji ZWJ family measures 8 -- and two things follow that are worth
+	// stating rather than leaving to be discovered.
+	//
+	// (1) measure_line still places a cluster as ONE ATOM: an 8-column family
+	// starting 3 columns from the right margin advances to the margin and wraps
+	// the NEXT cluster, where the terminal this policy models would have wrapped
+	// in the MIDDLE of the family, after the second emoji. The row count is
+	// therefore a lower bound in that corner. Placing per rune instead would
+	// mean the iterator yielding sub-cluster spans, which is exactly what
+	// RuneGloss's truncation must never be handed (see render.odin's cut rule),
+	// so the atom stays and the corner is documented.
+	//
+	// (2) a caller that PLACES CELLS must be prepared for a width above 2:
+	// screen.odin's cell model reserves one continuation cell for a width-2
+	// cluster and would leave stale cells under a wider one. Unreachable today
+	// -- the .Diff renderer drives screen_write with a default Width_Options{},
+	// and nothing threads an application's policy into it.
+	Legacy_Wcwidth,
+}
+
+// display_width returns the number of terminal columns `s` occupies WHEN LAID
+// OUT STARTING AT opts.start_col (0 by default, i.e. the left margin), summing
 // each extended grapheme cluster's corrected width. `s` may contain multiple
 // clusters (letters, combining sequences, ZWJ emoji, flags); it must not
 // contain "\n" if the caller wants per-physical-row semantics -- see
 // rows_for_line, which splits on line boundaries itself.
+//
+// The starting column is part of the question rather than an optional extra
+// only because of the tab; see Width_Options.start_col for what it costs and
+// which composition law survives. For a string with no "\t" in it this proc is
+// bit-for-bit what it always was.
 //
 // ANSI ESCAPE SEQUENCES ARE ZERO WIDTH (T2-A). This was a LIVE DEFECT, fixed
 // here, not a feature that was merely missing: every byte of "\e[7mX\e[0m" but
@@ -73,7 +253,7 @@ Width_Options :: struct {
 // branch into that loop would mean recomputing spans around skipped regions --
 // the one thing this file must not get wrong. Instead the string is split at
 // ESC boundaries into escape-free SEGMENTS, and each segment is measured by
-// the untouched cluster loop (plain_width below). This is sound on bytes, not
+// the untouched cluster loop (plain_advance below). This is sound on bytes, not
 // just on runes, because 0x1B can never occur inside a multi-byte UTF-8
 // sequence (every continuation byte is >= 0x80), so a byte-level scan for ESC
 // can never split a rune. It is also allocation-free: segments are subslices,
@@ -84,20 +264,41 @@ Width_Options :: struct {
 // rather than one. That is the right answer anyway here -- the second segment
 // opens with a nonspacing mark, which defect 4's correction forces to 0, so
 // "e\e[0mU+0301" still measures 1, same as "é".
+//
+// TABS ARE MEASURED AGAINST AN INFINITELY WIDE TERMINAL. This proc knows no
+// margin, so a tab here always advances to the next tab stop -- it never clamps
+// and it never wraps. A real terminal's HT does both, at the right margin, and
+// that is measure_line's job (it is the proc that knows term_width). The two
+// therefore disagree, deliberately, for a tab whose stop lies past the margin;
+// display_width is the answer to "how wide is this string", measure_line is the
+// answer to "what does this line do to a 40-column screen", and only the second
+// question has a margin in it. A tab-free string gets identical answers from
+// both, which is every string the renderer saw before this existed.
+//
+// THE RUNNING COLUMN IS THREADED THROUGH THE SEGMENTS, not restarted at each
+// one. It has to be: "a\e[0m\tb" is two segments, and a tab that began its
+// segment's measurement at column 0 rather than at column 1 would answer 8
+// where the terminal advances 7. The escape split must be invisible to the
+// measurement -- that is the whole premise of the pre-pass -- and a per-segment
+// column reset would have made it visible for exactly one byte value.
 @(require_results)
 display_width :: proc(s: string, opts := Width_Options{}) -> int {
 	if len(s) == 0 { return 0 }
 
-	total := 0
+	// A NEGATIVE start_col is nonsense (there is no column left of the left
+	// margin) and is clamped rather than propagated: an unclamped -3 would make
+	// next_tab_stop's arithmetic answer a width larger than tab_stop.
+	start := max(opts.start_col, 0)
+	col   := start
 	seg   := 0   // start of the current escape-free segment
 	i     := 0
 	for i < len(s) {
 		if s[i] != ESC { i += 1; continue }
-		total += plain_width(s[seg:i], opts)
+		col = plain_advance(s[seg:i], opts, col)
 		i = skip_escape(s, i)   // always > i, so this loop always advances
 		seg = i
 	}
-	return total + plain_width(s[seg:], opts)
+	return plain_advance(s[seg:], opts, col) - start
 }
 
 // PACKAGE-PRIVATE, not file-private (T3-A). The cell renderer walks a view line
@@ -180,23 +381,56 @@ skip_escape :: proc(s: string, start: int) -> int {
 	}
 }
 
-// plain_width is display_width's original body, unchanged, over a segment
-// GUARANTEED to contain no ESC. Split out only so the escape pre-pass above
-// can call it once per segment without touching a line of the byte-span
-// reconstruction below.
+// plain_advance is display_width's original body over a segment GUARANTEED to
+// contain no ESC. Split out only so the escape pre-pass above can call it once
+// per segment without touching a line of the byte-span reconstruction below.
+//
+// RETURNS THE ENDING COLUMN, not the width. It used to return the width (it was
+// called plain_width); it cannot any more, because a tab's width depends on the
+// column the segment starts at, so the caller has to hand a column IN as well as
+// take one back. `end - start` is still the width, and display_width is the one
+// line that computes it.
 @(private = "file")
-plain_width :: proc(s: string, opts: Width_Options) -> int {
-	total := 0
+plain_advance :: proc(s: string, opts: Width_Options, col: int) -> int {
 	ci := cluster_iter_make(s, opts)
+	ci.col = col
 	for {
-		_, w, ok := cluster_next(&ci)
+		// The widths are dropped on purpose: cluster_next has already added each
+		// one to ci.col, and that running column -- not a separate sum -- is what
+		// a tab in a LATER cluster has to be measured against.
+		_, _, ok := cluster_next(&ci)
 		if !ok { break }
-		total += w
 	}
-	return total
+	return ci.col
 }
 
-// THE CLUSTER LOOP plain_width used to inline, lifted out verbatim (T3-A) so
+// The column a tab at `col` advances to, given a tab-stop interval of `stop`.
+//
+// `stop <= 0` means "tabs are zero width" (Width_Options.tab_stop's documented
+// negative case, and the arithmetic guard for a 0 that tab_stop_of has already
+// mapped away): return `col` unchanged rather than divide by it.
+@(private = "file")
+next_tab_stop :: proc(col: int, stop: int) -> int {
+	if stop <= 0 { return col }
+	if col < 0   { return stop }
+	return (col / stop + 1) * stop
+}
+
+@(private = "file")
+tab_stop_of :: proc(opts: Width_Options) -> int {
+	return TAB_STOP_DEFAULT if opts.tab_stop == 0 else opts.tab_stop
+}
+
+// A cluster is a tab iff it is the single byte 0x09. There is no need to decode:
+// HT is GCB=Control, so GB4/GB5 force it to be a cluster of its own -- it can
+// never be absorbed into a neighbour's cluster and never carries a combining
+// mark. That is also why this is a byte compare and not a rune compare.
+@(private = "file")
+is_tab :: proc(span: string) -> bool {
+	return len(span) == 1 && span[0] == '\t'
+}
+
+// THE CLUSTER LOOP plain_advance used to inline, lifted out verbatim (T3-A) so
 // the cell renderer can walk the SAME clusters with the SAME corrected widths
 // instead of re-deriving them. This is the single most delicate loop in this
 // file -- the byte-span reconstruction defect 1 forces -- and having two copies
@@ -208,10 +442,46 @@ plain_width :: proc(s: string, opts: Width_Options) -> int {
 // what the renderer needs: it stores those bytes in a cell and writes them back
 // to the terminal unchanged.
 //
+// PUBLIC AS OF THE AUDIT SWEEP, and it was wrong to hide it. RuneGloss ships no
+// wrap and no truncate, so every application has to write its own -- and the
+// only correct grapheme walk in the tree (the one that applies the VS16, RI-pair
+// and leading-mark corrections above) was @(private="package"). The public
+// surface was whole-string display_width and nothing else, so the only correct
+// truncation an application could write was an O(n^2) prefix rescan: measure
+// s[:1], s[:2], ... until it exceeds the budget. The alternative people actually
+// reach for -- slicing at a rune boundary and measuring runes -- corrupts every
+// multi-rune cluster: it drops VS16, splits a flag pair in half, and leaves a
+// dangling ZWJ. The library shipped the fix for all of that in the binary and
+// refused to name it. TRUNCATE-TO-WIDTH, which is what this exists for:
+//
+//     // Longest prefix of `line` that fits in `budget` columns. O(n), and
+//     // it never cuts a cluster in half.
+//     truncate :: proc(line: string, budget: int) -> string {
+//         ci  := rt.cluster_iter_make(line)
+//         col := 0
+//         cut := 0
+//         for {
+//             span, w, ok := rt.cluster_next(&ci)
+//             if !ok { break }
+//             if col + w > budget { break }
+//             col += w
+//             cut += len(span)      // spans are contiguous subslices of `line`
+//         }
+//         return line[:cut]
+//     }
+//
+// Two things that loop is deliberately NOT doing, because they are the caller's
+// policy and not this iterator's: it does not append an ellipsis (which costs
+// columns of its own -- subtract them from `budget` first), and it does not
+// re-open a style the cut discarded (a truncation that lands between "\e[31m"
+// and "\e[0m" leaves the terminal red; append a reset, or truncate the styled
+// string and re-close it yourself).
+//
 // `s` MUST NOT CONTAIN ESC. Callers split on escapes first (display_width's own
 // pre-pass, and the renderer's identical one) -- see display_width for why the
-// split is sound on bytes.
-@(private = "package")
+// split is sound on bytes. An ESC handed to this iterator is measured as a
+// zero-width control and its parameter bytes as content, which is the seven-
+// columns-for-one-glyph over-count T2-A exists to have removed.
 Cluster_Iter :: struct {
 	s:          string,
 	opts:       Width_Options,
@@ -223,20 +493,52 @@ Cluster_Iter :: struct {
 	// been yielded", i.e. the iterator is finished.
 	prev_start: int,
 	prev_width: int,
+
+	// THE COLUMN THE NEXT CLUSTER WILL BE PLACED AT. Seeded from
+	// opts.start_col, advanced by each cluster yielded. Only a tab reads it --
+	// for every other cluster it is bookkeeping the caller may ignore
+	// entirely.
+	//
+	// WRITABLE ON PURPOSE. This iterator models a string laid out on one
+	// unbounded row; it does not know about wrapping, because wrapping is a
+	// function of a terminal width it is never told. A caller that DOES wrap
+	// (measure_line below, or an application laying text into a box) assigns
+	// `col = 0` after each wrap and the next tab is measured from the right
+	// place. The alternative -- passing term_width into the iterator and
+	// wrapping inside it -- was rejected because it would have made every
+	// caller that only wants widths (display_width, screen_write_plain) supply
+	// a width they do not have.
+	col: int,
 }
 
-@(private = "package")
 cluster_iter_make :: proc(s: string, opts := Width_Options{}) -> (ci: Cluster_Iter) {
 	ci.s = s
 	ci.opts = opts
 	ci.it = utf8.decode_grapheme_iterator_make(s)
 	ci.prev_start = -1
+	ci.col = max(opts.start_col, 0)   // see display_width on why this is clamped
 	return
 }
 
-// Yields the next cluster's byte span and its CORRECTED display width (0, 1 or
-// 2). ok=false once the string is exhausted.
-@(private = "package")
+// Yields the next cluster's byte span and its CORRECTED display width, and
+// advances ci.col past it. ok=false once the string is exhausted.
+//
+// TWO CLUSTERS ESCAPE THE 0/1/2 RANGE this used to promise, both of them
+// because the caller asked for it. A TAB is next_tab_stop(ci.col) - ci.col, 1
+// to tab_stop columns, depending entirely on where the tab sits -- see
+// Width_Options.start_col for what that costs the caller and why it is still
+// the right model. And under opts.emoji_width == .Legacy_Wcwidth any cluster is
+// the SUM of its runes' widths, which is 8 for the four-emoji ZWJ family; see
+// Emoji_Width, including what a caller placing cells owes that case. Every
+// cluster is still 0, 1 or 2 under the default options, which is what every
+// caller predating either field is passing.
+//
+// NOTE FOR A CALLER THAT PLACES CELLS (screen_write_plain): keep ci.col in step
+// with the cursor you are placing at, or a tab will be measured from the wrong
+// column. screen.odin does not, because the .Diff cell model rejects tabs
+// outright (contract.odin's Control_Byte) -- a tab is a MOVE, and a move is the
+// one thing a cell grid cannot record. The debug-build assertion now fires on
+// that in a plain `odin build`, which is where it belongs.
 cluster_next :: proc(ci: ^Cluster_Iter) -> (span: string, width: int, ok: bool) {
 	if len(ci.s) == 0 || ci.prev_start == -2 { return "", 0, false }
 	for {
@@ -244,9 +546,10 @@ cluster_next :: proc(ci: ^Cluster_Iter) -> (span: string, width: int, ok: bool) 
 		if !more { break }
 		if ci.prev_start >= 0 {
 			sp := ci.s[ci.prev_start:g.byte_index]
-			w  := corrected_cluster_width(sp, ci.prev_width, ci.opts)
+			w  := cluster_width_at(sp, ci.prev_width, ci.col, ci.opts)
 			ci.prev_start = g.byte_index
 			ci.prev_width = g.width
+			ci.col += w
 			return sp, w, true
 		}
 		ci.prev_start = g.byte_index
@@ -254,12 +557,23 @@ cluster_next :: proc(ci: ^Cluster_Iter) -> (span: string, width: int, ok: bool) 
 	}
 	if ci.prev_start >= 0 {
 		sp := ci.s[ci.prev_start:]
-		w  := corrected_cluster_width(sp, ci.prev_width, ci.opts)
+		w  := cluster_width_at(sp, ci.prev_width, ci.col, ci.opts)
 		ci.prev_start = -2
+		ci.col += w
 		return sp, w, true
 	}
 	ci.prev_start = -2
 	return "", 0, false
+}
+
+// The column-dependent layer over corrected_cluster_width: exactly one cluster
+// in Unicode has a width that is a function of position, and this is where that
+// fact is confined. Everything below this line is position-independent and can
+// stay that way.
+@(private = "file")
+cluster_width_at :: proc(span: string, base_width: int, col: int, opts: Width_Options) -> int {
+	if is_tab(span) { return next_tab_stop(col, tab_stop_of(opts)) - col }
+	return corrected_cluster_width(span, base_width, opts)
 }
 
 // Cap on runes inspected per cluster for the VS16/RI/leading-mark checks
@@ -278,8 +592,17 @@ MAX_INSPECTED_RUNES :: 16
 // grapheme iterator itself already computed for this cluster (correct for
 // every case except these three). `span` is a byte-exact cluster slice from
 // display_width's byte-span reconstruction, never the iterator's `text`.
+//
+// THE POLICY FORK IS THE FIRST LINE OF THE BODY, not a flag threaded through
+// the three overrides, because the two policies do not share a step: under
+// .Legacy_Wcwidth there is no such thing as a cluster-level width to correct --
+// the terminal never formed the cluster in the first place -- so every one of
+// the overrides below is not merely disabled but meaningless. See Emoji_Width
+// for the measurements, and legacy_wcwidth_width for what replaces this.
 @(private = "file")
 corrected_cluster_width :: proc(span: string, base_width: int, opts: Width_Options) -> int {
+	if opts.emoji_width == .Legacy_Wcwidth { return legacy_wcwidth_width(span, opts) }
+
 	runes: [MAX_INSPECTED_RUNES]rune
 	n := 0
 	has_vs16 := false
@@ -316,27 +639,212 @@ corrected_cluster_width :: proc(span: string, base_width: int, opts: Width_Optio
 	return base_width
 }
 
-// rows_for_line returns how many physical terminal rows a single LOGICAL
-// line (no embedded "\n" -- callers split on that first, as render.odin
-// does) occupies once the terminal wraps it at term_width columns.
+// The .Legacy_Wcwidth half of corrected_cluster_width: the width a
+// per-character terminal advances for this cluster, which is just the sum of
+// its runes' widths. Named for what every such terminal is doing internally --
+// a wcwidth() per character and no grapheme table anywhere -- rather than for
+// any one emulator, because the family is large (see Emoji_Width).
 //
-// term_width <= 0 means "unknown" -- term_size() reports ok=false on a pty
-// with no size ever set, and the golden harness and every unit test drive
-// the renderer with no fd at all, so there is no width to query in the first
-// place. Rather than guess, this returns 1: exactly the renderer's pre-fix
-// behavior (one physical row assumed per logical line). That is the only
-// sound default with zero information about the terminal, and it is what
-// makes every existing byte-exact render test -- including the documented
-// 14-byte single-line-frame baseline -- come out unchanged when no width is
-// ever supplied (render_test.odin never calls renderer_set_width).
+// `base_width` IS DELIBERATELY NOT A STARTING POINT HERE. It is not the
+// cluster's width under any rule: core:unicode's grapheme iterator adds
+// normalized_east_asian_width for the rune that OPENED the cluster and for no
+// other (grapheme.odin:149), so base_width is the FIRST TERM of exactly the sum
+// below. Seeding with it and adding the rest would be the same arithmetic with
+// one more way to get it wrong.
+//
+// MAX_INSPECTED_RUNES does not apply. That cap exists to bound a fixed stack
+// array of runes for the three overrides; a running sum needs no array, so a
+// pathological 400-rune cluster is summed rather than truncated -- which is
+// what the terminal being modelled would do to it.
+@(private = "file")
+legacy_wcwidth_width :: proc(span: string, opts: Width_Options) -> int {
+	total := 0
+	b := span
+	for len(b) > 0 {
+		r, n := utf8.decode_rune(b)
+		b = b[n:]   // decode_rune returns size 1 for an invalid byte, so this always advances
+		total += legacy_rune_width(r, opts)
+	}
+	return total
+}
+
+// One rune's column cost to a per-character terminal.
+//
+// THE MARK CHECK CANNOT BE DELEGATED to normalized_east_asian_width, and that
+// is the whole reason this proc exists rather than being one call. That proc
+// early-outs `r <= 0x10FF -> 1` for speed and consults a table of
+// East_Asian_Width above it, and neither branch knows about combining marks:
+// it answers 1 for U+FE0F VARIATION SELECTOR-16 and 1 for U+20E3 COMBINING
+// ENCLOSING KEYCAP (verified by calling it). Summing it raw would make the
+// keycad "1" U+FE0F U+20E3 measure 3 columns where VTE advances 1 -- worse
+// than the cluster policy it exists to correct. Nonspacing_Mark and
+// Enclosing_Mark are therefore zeroed here first; ZWJ, ZWSP, ZWNJ, the word
+// joiner and the C0/C1 controls already come back 0 from the proc itself.
+//
+// Spacing_Mark (Mc) is NOT zeroed: those combining marks are the ones that do
+// occupy a column (Devanagari matras and their kin), which is why they are
+// spacing.
+@(private = "file")
+legacy_rune_width :: proc(r: rune, opts: Width_Options) -> int {
+	if unicode.is_nonspacing_mark(r) || unicode.is_enclosing_mark(r) { return 0 }
+	w := unicode.normalized_east_asian_width(r)
+	// Ambiguous is still the caller's policy, applied per rune here because
+	// under this policy the rune, not the cluster, is what the terminal
+	// measures. Same table and same condition as the cluster path's.
+	if opts.ambiguous_is_wide && w == 1 && is_ambiguous_width(r) { return 2 }
+	return w
+}
+
+// What a single LOGICAL line does to a term_width-column screen: how many
+// physical rows it occupies, which column it leaves the cursor in, and whether
+// it covered every cell of every row it touched.
+//
+// ONE FUNCTION, THREE ANSWERS, because the three used to be computed three
+// different ways and disagreed with each other. rows_for_line divided
+// display_width by term_width; line_fills_its_rows (render.odin) took
+// display_width modulo term_width; the text itself was placed by screen_put and
+// by the terminal's own wrapping. Ceil division is only equal to placement when
+// no cluster straddles the right margin -- and a wide cluster straddling the
+// right margin is exactly the case a terminal treats specially. Two measured
+// consequences of that disagreement, both from the emitted bytes:
+//
+//   * 40x8, line 0 = "x" + 20 CJK, caret on line 1: display_width says 41, ceil
+//     says 2 rows, screen_put places all of it on ONE row (the 20th CJK cluster
+//     is written AT column 39 with no continuation cell and the cursor clamps to
+//     40). The renderer wrote "\e[2;1H" for line 1 and "\e[3;1H" for the caret
+//     -- the caret one row below the line it belongs to.
+//   * 4x2, view "abc界\nXYZ": "abc界" measures 5, ceil says 2 rows, the height
+//     budget is 2, so "XYZ" was judged not to fit and was never emitted. It
+//     fits: "abc界" occupies one row. Replace 界 with "d" and XYZ paints.
+//
+// So this walks the clusters and places them, with screen_put's rule and the
+// terminal's, instead of dividing:
+//
+//   * DECAWM PENDING WRAP. Filling the last column does NOT take a new row; the
+//     NEXT printable cluster does. That is why `col` is allowed to equal
+//     term_width and why the wrap test is at the top of the loop, not the
+//     bottom.
+//   * A WIDE CLUSTER AT THE LAST COLUMN IS WRITTEN THERE, with no continuation
+//     cell, and the cursor clamps to term_width. (xterm-family terminals
+//     instead blank that cell and wrap the whole cluster; screen.odin's header
+//     documents this divergence and pyte -- the difftest oracle -- takes
+//     screen_put's side. Changing it is a screen.odin decision, not a width.odin
+//     one; what matters here is that measurement and placement finally agree.)
+//   * A ZERO-WIDTH CLUSTER folds into the cell to its left and advances nothing.
+//   * A TAB NEVER WRAPS. HT advances to the next tab stop but is clamped to the
+//     right margin -- verified against pyte, which is the emulator the difftest
+//     harness scores this package against: at 10 columns "\tX" puts X at column
+//     8, at 4 columns it puts X at column 3, and at column 9 of a 10-column
+//     screen a tab does not move at all. A tab arriving in the pending-wrap
+//     state (col == term_width) moves the cursor BACKWARDS to term_width-1 and
+//     clears the pending wrap, so the next glyph overwrites the last column
+//     rather than wrapping; pyte does exactly this ("ab\tcd\tef" at 10 columns
+//     ends at row 1 column 1, which this reproduces cluster for cluster).
+//
+// term_width <= 0 means "unknown" -- term_size() reports ok=false on a pty with
+// no size ever set, and the golden harness and every unit test drive the
+// renderer with no fd at all, so there is no width to query in the first place.
+// Rather than guess, rows is 1: exactly the renderer's pre-fix behavior (one
+// physical row assumed per logical line). That is the only sound default with
+// zero information about the terminal, and it is what makes every existing
+// byte-exact render test -- including the documented 14-byte single-line-frame
+// baseline -- come out unchanged when no width is ever supplied (render_test
+// .odin never calls renderer_set_width).
+Line_Metrics :: struct {
+	// Physical rows the line occupies. Always >= 1: an empty line still owns
+	// its own row.
+	rows:    int,
+	// The column the cursor is left in, 0..=term_width. term_width itself is
+	// the PENDING WRAP state, not "column term_width" -- there is no such
+	// column -- and it is the one value that means "the next glyph starts a new
+	// row". With an unknown width this is start_col + display_width, unclamped.
+	end_col: int,
+	// Whether the line covered every cell of every row it occupies, i.e. it
+	// ended flush against the right margin. render_full_screen uses this to
+	// decide whether an EL after the line could erase anything the line did not
+	// itself write; emitting one from the pending-wrap position erases the
+	// WRONG row. False when the width is unknown -- with no margin there is
+	// nothing to be flush with, the same "do not guess" answer `rows` gives.
+	fills:   bool,
+}
+
+@(require_results)
+measure_line :: proc(line: string, term_width: int, opts := Width_Options{}) -> Line_Metrics {
+	if term_width <= 0 {
+		return Line_Metrics{
+			rows    = 1,
+			end_col = max(opts.start_col, 0) + display_width(line, opts),
+			fills   = false,
+		}
+	}
+
+	col  := clamp(opts.start_col, 0, term_width)
+	rows := 1
+	ts   := tab_stop_of(opts)
+
+	// The same ESC pre-pass display_width runs, for the same reason: an escape
+	// is zero width and must not be able to shift a wrap boundary. Sound on
+	// bytes -- 0x1B never occurs inside a multi-byte UTF-8 sequence.
+	seg := 0
+	i   := 0
+	for i < len(line) {
+		if line[i] != ESC { i += 1; continue }
+		measure_segment(line[seg:i], opts, &col, &rows, term_width, ts)
+		i = skip_escape(line, i)   // always > i, so this loop always advances
+		seg = i
+	}
+	measure_segment(line[seg:], opts, &col, &rows, term_width, ts)
+
+	return Line_Metrics{rows = rows, end_col = col, fills = col == term_width}
+}
+
+// One escape-free segment of a line, placed cluster by cluster.
+@(private = "file")
+measure_segment :: proc(seg: string, opts: Width_Options, col: ^int, rows: ^int, term_width, ts: int) {
+	if len(seg) == 0 { return }
+	ci := cluster_iter_make(seg, opts)
+	for {
+		// RESYNC BEFORE EVERY CLUSTER, because wrapping is this proc's business
+		// and not the iterator's: the iterator lays a string out on one
+		// unbounded row, and col^ is the only thing that knows a wrap happened.
+		// Without this a tab on the second physical row of a wrapped line would
+		// be measured from its column in the UNWRAPPED one.
+		ci.col = col^
+		span, w, ok := cluster_next(&ci)
+		if !ok { break }
+		place_cluster(span, w, col, rows, term_width, ts)
+	}
+}
+
+// screen_put's placement rule, plus the terminal's wrap and the tab's margin
+// clamp, over one cluster. THE ONLY PLACE measure_line advances a column.
+@(private = "file")
+place_cluster :: proc(span: string, w: int, col: ^int, rows: ^int, term_width, ts: int) {
+	if is_tab(span) {
+		// Clamped to the last column, never past it, and never into a new row
+		// -- see measure_line's header for the pyte transcript this reproduces.
+		stop := next_tab_stop(col^, ts)
+		if stop > term_width - 1 { stop = term_width - 1 }
+		col^ = max(stop, 0)
+		return
+	}
+	if w <= 0 { return }   // folds into the cell to its left; advances nothing
+	if col^ >= term_width { col^ = 0; rows^ += 1 }   // the pending wrap resolves HERE
+	col^ = min(col^ + w, term_width)
+}
+
+// rows_for_line returns how many physical terminal rows a single LOGICAL line
+// (no embedded "\n" -- callers split on that first, as render.odin does)
+// occupies once the terminal wraps it at term_width columns.
+//
+// KEPT, AND KEPT AT ITS ORIGINAL SIGNATURE, as the one-answer front door onto
+// measure_line: it is what render.odin, examples/editor and the tests all call,
+// the row count is what most of them want, and the audit's finding was that its
+// ANSWER was wrong, not that its shape was. Callers needing end_col or fills
+// call measure_line directly.
 @(require_results)
 rows_for_line :: proc(line: string, term_width: int, opts := Width_Options{}) -> int {
-	if term_width <= 0 { return 1 }
-	w := display_width(line, opts)
-	if w <= 0 { return 1 }   // an empty (or all-zero-width) line still occupies its own row
-	rows := (w + term_width - 1) / term_width   // ceil division
-	if rows < 1 { rows = 1 }
-	return rows
+	return measure_line(line, term_width, opts).rows
 }
 
 // is_ambiguous_width reports whether r has East_Asian_Width=Ambiguous per

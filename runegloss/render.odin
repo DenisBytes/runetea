@@ -7,14 +7,22 @@ import rt "../runetea"
 // THE RENDERER: a Style plus some text, out the other end as a rectangular
 // block of terminal cells.
 //
-// EVERY MEASUREMENT IN THIS FILE GOES THROUGH rt.display_width, and that is the
-// single most important sentence in the package. There is exactly ONE display-
-// width implementation in this repo (runetea/width.odin), it already solves
-// grapheme clustering, the four documented core:unicode defects, and
-// zero-width ANSI escapes, and a styling layer that measured anything any other
-// way -- bytes, runes, or "runes but skipping escapes I recognise" -- would
-// produce ragged blocks on exactly the inputs that matter (CJK, VS16 emoji,
-// flag pairs, already-styled text). That is what the width table pins.
+// EVERY MEASUREMENT IN THIS FILE COMES OUT OF runetea/width.odin, and that is
+// the single most important sentence in the package. There is exactly ONE
+// display-width implementation in this repo, it already solves grapheme
+// clustering, the documented core:unicode defects, tab stops and zero-width ANSI
+// escapes, and a styling layer that measured anything any other way -- bytes,
+// runes, or "runes but skipping escapes I recognise" -- would produce ragged
+// blocks on exactly the inputs that matter (CJK, VS16 emoji, flag pairs,
+// already-styled text). That is what the width table pins.
+//
+// TWO ENTRY POINTS INTO IT, not one, and the difference is a difference of
+// QUESTION rather than of implementation. Whole strings and lines are measured
+// with rt.display_width. Cutting -- which truncation and hard-breaking both have
+// to do -- needs the BOUNDARIES as well as the total, so it drives
+// rt.cluster_iter_make/cluster_next directly: the same loop display_width sums
+// and the same one runetea's cell renderer places cells with. See
+// prefix_fitting. Nothing here re-derives a width from a rune table.
 //
 // WHAT THIS EMITS, and why it is safe to feed straight to runetea's renderers:
 // SGR escapes, printable text, and "\n". Nothing else. runetea's .Diff renderer
@@ -48,12 +56,28 @@ import rt "../runetea"
 // them -- see drop_truncated_escape, which exists because a trailing "\e[3"
 // eats the padding that follows it.
 //
-// SCOPE, stated plainly rather than discovered: no wrapping, no truncation, no
-// layout joins. `width`/`height` are FLOORS. Content wider than `width` widens
-// the block; silently cutting a user's text would be worse than a block that
-// visibly overflows, and re-flowing it is a text-layout problem (word breaking,
-// CJK line-break rules, ANSI-preserving splits) that is deliberately not in
-// this package.
+// SCOPE. `width`/`height` are EXACT (Style.width has the full argument), and the
+// three primitives that makes necessary -- wrap, truncate, and the two joins --
+// live at the bottom of this file. That is a reversal: this file used to say
+// "no wrapping, no truncation, no layout joins, `width`/`height` are FLOORS",
+// and defended it with "silently cutting a user's text would be worse than a
+// block that visibly overflows".
+//
+// The defence was answering the wrong question. A block does not "visibly
+// overflow" -- it SHEARS THE FRAME. The over-wide block runs past the terminal
+// margin, DECAWM wraps its every row onto a second physical row, and every row
+// below it, including rows belonging to panels the offending string has nothing
+// to do with, is displaced; under .Full_Screen and .Diff the doubled row cost is
+// charged against term_height and the bottom of the frame is silently deleted
+// instead. One long branch name in one status line was enough to destroy a
+// two-panel layout. And cutting was never the only alternative to that: the
+// DEFAULT policy is .Wrap, which loses no byte at all.
+//
+// WHAT IS STILL NOT HERE, so it is not discovered later: no CJK line-break
+// rules (UAX-14) -- wrap breaks on ASCII spaces and, failing that, on grapheme
+// cluster boundaries, so a run of Han with no spaces is hard-broken rather than
+// broken at a legal Japanese line-break opportunity. No hyphenation. No
+// bidirectional reordering. Those are a text-layout library, not a styling one.
 
 @(private = "file")
 RESET :: "\e[0m"
@@ -63,21 +87,123 @@ ESC :: 0x1B
 @(private = "file")
 BEL :: 0x07
 
-// The whole API. `alloc` is explicit and required, matching how every `view`
-// proc in this codebase already works (arena.odin's LIFETIME CONTRACT): a
-// runetea application hands this the frame allocator and the result dies with
-// the frame. NOTHING but the returned string is allocated -- the two measuring
-// passes below are subslice arithmetic and the SGR sequences live in
-// fixed-size stack buffers, so this proc makes exactly one allocation family
-// (the builder's) from exactly the allocator it was given.
-@(require_results)
-render :: proc(s: ^Style, text: string, alloc: mem.Allocator) -> string {
-	opts := rt.Width_Options{ambiguous_is_wide = s.ambiguous_wide}
+// THE WHOLE API, in two spellings of the same proc.
+//
+// WHY BOTH. `render` never writes through its Style -- it is a pure function of
+// (Style, text) -- so the pointer was only ever a copy-avoidance device for a
+// 184-byte struct. But an Odin procedure PARAMETER IS NOT ADDRESSABLE, and
+// runetea's view contract passes the model BY VALUE (`view :: proc(m: T, alloc)
+// -> string`), so the pattern docs/API.md itself recommends -- "Style is POD,
+// keep a Theme in your Model" -- could not be called as written:
+//
+//	rg.render(&m.title, text, alloc)
+//	// Error: Cannot take the pointer address of 'm.title'
+//
+// an error that points at Odin addressability rather than at anything the caller
+// did wrong. Every view reading a Style off its model had to open with a line of
+// local copies whose purpose was invisible without a comment
+// (examples/spinner:99, examples/http:249, both of which carry one).
+//
+// DROPPING THE POINTER OUTRIGHT was the finding's proposal and is the wrong
+// trade: it makes the copy MANDATORY at every call site, including the ones that
+// already hold a local (examples/editor builds its palette as a local and takes
+// `&pal.rule`, and pays nothing today). A proc group costs nothing, breaks no
+// call site, and lets each caller spend the copy only where it buys something.
+// `rg.render(&s, ...)` and `rg.render(m.title, ...)` both compile, and they
+// dispatch on the argument, not on a suffix the caller has to remember.
+render :: proc{render_ptr, render_val}
 
-	// --- pass 1: measure the content -------------------------------------
+// The by-value spelling. One 184-byte struct copy, which is noise beside the
+// allocation render is about to make and beside the ~720 cube roots a colour
+// degradation costs.
+@(require_results)
+render_val :: proc(s: Style, text: string, alloc: mem.Allocator) -> string {
+	sc := s
+	return render_ptr(&sc, text, alloc)
+}
+
+// `alloc` is explicit and required, matching how every `view` proc in this
+// codebase already works (arena.odin's LIFETIME CONTRACT): a runetea application
+// hands this the frame allocator and the result dies with the frame.
+//
+// ALLOCATION, restated because it changed. This used to make exactly one
+// allocation family (the builder's). It still does WHENEVER NO CLAMP IS ACTIVE
+// -- the measuring passes are subslice arithmetic and the SGR sequences live in
+// fixed-size stack buffers. A Style with a `width` and an overflow policy of
+// .Wrap or .Truncate makes ONE more, for the re-flowed text, from the same
+// allocator; it is freed by the same frame reset. Nothing reaches the heap
+// behind the caller's back either way, which is the property the leak audit
+// actually pins.
+@(require_results)
+render_ptr :: proc(s: ^Style, text: string, alloc: mem.Allocator) -> string {
+	opts := s.wopts
+
+	// --- border geometry, FIRST ---------------------------------------------
+	//
+	// It moved above the content measurement, and that ordering is the whole
+	// shape of the width change: `width` INCLUDES the border, so the content
+	// area cannot be computed until the border's column cost is known. See
+	// Style.width.
+	//
+	// The column widths themselves live in edge_widths, which style.odin's
+	// border_size also calls -- so an application asking what the border costs
+	// gets the number the renderer pads with rather than a second opinion. The
+	// left border COLUMN is as wide as the widest glyph that can appear in it,
+	// and every glyph is padded out to that width (write_cell_padded). Standard
+	// box-drawing borders are uniformly 1 column so this is a no-op for them; it
+	// exists so that a CUSTOM border whose corners and sides measure differently
+	// still produces a rectangular block instead of a ragged one, which is a
+	// property the width table can then assert unconditionally.
+	has_t := s.bordered && .Top    in s.border_sides
+	has_b := s.bordered && .Bottom in s.border_sides
+
+	lw, rw := edge_widths(s)
+
+	// The non-content cost INSIDE the block: border plus padding. Margin is not
+	// in here, because `width`/`height` do not include margin -- frame_size()
+	// does, and says so.
+	frame_w := lw + rw + s.pad[.Left] + s.pad[.Right]
+	frame_h := s.pad[.Top] + s.pad[.Bottom]
+	if has_t { frame_h += 1 }
+	if has_b { frame_h += 1 }
+
+	// --- fit the content to the box -----------------------------------------
+	//
+	// A width smaller than its own frame clamps the content area to 0 rather
+	// than going negative: the block comes out exactly as wide as its border and
+	// padding, with no content columns. Wrapping to 0 columns cannot terminate,
+	// so that case degrades to a cut, which produces empty content rows.
+	body := text
+	reflowed := false
+	clamp_w := s.width > 0 && s.overflow != .Grow
+	inner_target := 0
+	if clamp_w {
+		inner_target = max(0, s.width - frame_w)
+		if s.overflow == .Truncate || inner_target == 0 {
+			body = truncate(text, inner_target, cell_str(&s.ellipsis), opts, alloc)
+		} else {
+			body = wrap(text, inner_target, opts, alloc)
+		}
+		reflowed = true
+	}
+	// FREED, not left to the frame reset. The reflowed text is an INTERNAL
+	// temporary no caller can see, so nothing else could ever free it; leaving it
+	// for the arena would make render's memory behaviour depend on which
+	// allocator it was handed, and would surface as an unattributable leak the
+	// moment someone passed context.allocator -- which every test in this package
+	// does, and which is how tools/test.sh's leak audit caught it.
+	//
+	// AT PROCEDURE SCOPE, and the `reflowed` flag exists to put it there. An
+	// Odin `defer` runs at the end of its ENCLOSING BLOCK, not of the procedure,
+	// so writing this inside the `if` above frees `body` before a single row is
+	// emitted -- which is not a leak but a use-after-free, and one that reads as
+	// a plausible-looking block full of NUL bytes rather than as a crash.
+	defer if reflowed { delete(body, alloc) }
+
+	// --- pass 1: measure the content -----------------------------------------
 	content_w, nlines := 0, 0
 	{
-		it := line_iter(text)
+		it := line_iter(body)
 		for {
 			line, ok := line_next(&it)
 			if !ok { break }
@@ -86,46 +212,56 @@ render :: proc(s: ^Style, text: string, alloc: mem.Allocator) -> string {
 		}
 	}
 
-	// The content AREA (inside the padding). `width` describes the padded box,
-	// so the area it implies is width - left - right; max() with the real
-	// content width is what makes `width` a floor rather than a clamp.
+	// --- the vertical clamp ---------------------------------------------------
+	//
+	// There is no reflow for rows, so an over-tall block loses rows. WHICH rows
+	// is decided by align_v, and that is the only defensible reading of it: the
+	// alignment already says which end of the box the content is anchored to, so
+	// the rows nearest that anchor are the ones the caller cares about. .Top
+	// keeps the head (drop the tail), .Bottom keeps the tail, .Middle keeps the
+	// middle. Under .Grow this does not run at all and `height` stays a floor.
+	skip_head, keep := 0, nlines
+	if s.height > 0 && s.overflow != .Grow {
+		avail := max(0, s.height - frame_h)
+		if nlines > avail {
+			switch s.align_v {
+			case .Top:    skip_head, keep = 0, avail
+			case .Bottom: skip_head, keep = nlines - avail, avail
+			case .Middle: skip_head, keep = (nlines - avail) / 2, avail
+			}
+			// Re-measure over the surviving window only: a dropped line must not
+			// widen the block it is no longer in.
+			content_w = 0
+			i := 0
+			it := line_iter(body)
+			for {
+				line, ok := line_next(&it)
+				if !ok { break }
+				if i >= skip_head && i < skip_head + keep {
+					content_w = max(content_w, rt.display_width(line, opts))
+				}
+				i += 1
+			}
+			nlines = keep
+		}
+	}
+
+	// The content AREA (inside the border and the padding). Under a clamp this
+	// is inner_target exactly, because wrap/truncate have already guaranteed
+	// every line fits it -- with ONE documented exception: a single grapheme
+	// cluster wider than the whole content area (a fullwidth CJK glyph in a
+	// 1-column box) cannot be broken and is emitted anyway, so the block comes
+	// out one column over rather than dropping the character.
 	inner := content_w
-	if s.width > 0 { inner = max(inner, s.width - s.pad[.Left] - s.pad[.Right]) }
+	if s.width > 0 { inner = max(inner, max(0, s.width - frame_w)) }
 	box_w := s.pad[.Left] + inner + s.pad[.Right]
 
-	rows := s.pad[.Top] + nlines + s.pad[.Bottom]
-	fill := max(0, s.height - rows)
+	fill := max(0, s.height - frame_h - nlines)
 	fill_top, fill_bottom := 0, 0
 	switch s.align_v {
 	case .Top:    fill_top, fill_bottom = 0, fill
 	case .Middle: fill_top, fill_bottom = fill / 2, fill - fill / 2
 	case .Bottom: fill_top, fill_bottom = fill, 0
-	}
-
-	// --- border geometry --------------------------------------------------
-	//
-	// The left border COLUMN is as wide as the widest glyph that can appear in
-	// it, and every glyph is padded out to that width (write_cell_padded).
-	// Standard box-drawing borders are uniformly 1 column so this is a no-op
-	// for them -- it exists so that a CUSTOM border whose corners and sides
-	// measure differently still produces a rectangular block instead of a
-	// ragged one, which is a property the width table can then assert
-	// unconditionally.
-	has_t := s.bordered && .Top    in s.border_sides
-	has_r := s.bordered && .Right  in s.border_sides
-	has_b := s.bordered && .Bottom in s.border_sides
-	has_l := s.bordered && .Left   in s.border_sides
-
-	lw, rw := 0, 0
-	if has_l {
-		lw = rt.display_width(cell_str(&s.border.left), opts)
-		if has_t { lw = max(lw, rt.display_width(cell_str(&s.border.top_left),    opts)) }
-		if has_b { lw = max(lw, rt.display_width(cell_str(&s.border.bottom_left), opts)) }
-	}
-	if has_r {
-		rw = rt.display_width(cell_str(&s.border.right), opts)
-		if has_t { rw = max(rw, rt.display_width(cell_str(&s.border.top_right),    opts)) }
-		if has_b { rw = max(rw, rt.display_width(cell_str(&s.border.bottom_right), opts)) }
 	}
 
 	total_w := s.mar[.Left] + lw + box_w + rw + s.mar[.Right]
@@ -172,15 +308,22 @@ render :: proc(s: ^Style, text: string, alloc: mem.Allocator) -> string {
 	emit_blank_rows(&sb, &nrow, s.pad[.Top],   s, &g)
 
 	{
-		it := line_iter(text)
+		it := line_iter(body)
+		li := -1
 		for {
 			line, ok := line_next(&it)
 			if !ok { break }
+			li += 1
+			if li < skip_head || li >= skip_head + keep { continue }
 			row_break(&sb, &nrow)
 			write_row_open(&sb, s, &g)
 
 			gap := g.inner - rt.display_width(line, opts)
-			if gap < 0 { gap = 0 }   // unreachable: inner >= every line's width
+			// Reachable in exactly one case, and only there: a grapheme cluster
+			// wider than the whole content area, which wrap cannot break and
+			// refuses to delete. Clamping the gap keeps that row one column over
+			// instead of making the builder write a negative run of spaces.
+			if gap < 0 { gap = 0 }
 			lead, trail := 0, 0
 			switch s.align_h {
 			case .Left:   lead, trail = 0, gap
@@ -747,4 +890,496 @@ sgr_color :: proc(g: ^Sgr, c: Color, is_bg: bool) {
 		sgr_int(g, int(c.g)); sgr_put(g, ';')
 		sgr_int(g, int(c.b))
 	}
+}
+
+// ---------------------------------------------------------------------------
+// border geometry, shared with style.odin
+// ---------------------------------------------------------------------------
+
+// The display width of the left and right border COLUMNS. Lifted out of render
+// so that border_size (style.odin) reports the same number the renderer pads
+// with rather than a second opinion -- there was previously no way for an
+// application to reach this at all, which is why frame_size could not be written
+// outside the package and a Lipgloss layout could not be ported without
+// guessing "2".
+//
+// PACKAGE-PRIVATE, not exported: it takes a ^Style and returns a pair with no
+// units in its name. border_size is the public spelling.
+@(private)
+edge_widths :: proc(s: ^Style) -> (lw, rw: int) {
+	if !s.bordered { return 0, 0 }
+	opts := s.wopts
+	has_t := .Top    in s.border_sides
+	has_b := .Bottom in s.border_sides
+	if .Left in s.border_sides {
+		lw = rt.display_width(cell_str(&s.border.left), opts)
+		if has_t { lw = max(lw, rt.display_width(cell_str(&s.border.top_left),    opts)) }
+		if has_b { lw = max(lw, rt.display_width(cell_str(&s.border.bottom_left), opts)) }
+	}
+	if .Right in s.border_sides {
+		rw = rt.display_width(cell_str(&s.border.right), opts)
+		if has_t { rw = max(rw, rt.display_width(cell_str(&s.border.top_right),    opts)) }
+		if has_b { rw = max(rw, rt.display_width(cell_str(&s.border.bottom_right), opts)) }
+	}
+	return
+}
+
+// ---------------------------------------------------------------------------
+// measurement
+// ---------------------------------------------------------------------------
+
+// HOW WIDE AND HOW TALL A BLOCK IS, in the SAME measure render pads with --
+// lipgloss.Width / lipgloss.Height / lipgloss.Size, which had no analogue here.
+// Their absence was not a convenience gap: it is what made a mis-measured block
+// undetectable from the outside. An application that suspects its terminal
+// disagrees with the width layer about an emoji (they do disagree, see
+// Style.wopts) could not previously ask RuneGloss what number it was about to
+// pad to, so it could not tell a raggedness caused by the terminal from one
+// caused by the library.
+//
+// `opts` IS WHAT MAKES THAT DIAGNOSABLE RATHER THAN MERELY VISIBLE, now that
+// the width layer holds more than one answer. Ask it twice:
+//
+//     w_cluster := rg.measure_width(block)
+//     w_legacy  := rg.measure_width(block, rt.Width_Options{emoji_width = .Legacy_Wcwidth})
+//
+// The two agree on every string whose width no terminal argues about. Where
+// they differ, the string itself is the report: it contains a cluster (a ZWJ
+// sequence, a skin-tone modifier, a keycap, a VS16 emoji) whose column count is
+// a property of the terminal and not of Unicode, and `w_legacy - w_cluster` is
+// exactly how far the right edge will be out on the terminals in the other
+// family. rt.Emoji_Width names which those are.
+//
+// `h` COUNTS LINES, so it is 1 for "" and 2 for "a\n" -- a trailing newline
+// yields a trailing EMPTY line, which render paints as a blank row. See
+// Line_Iter for why a block treats that as content rather than a terminator.
+@(require_results)
+measure :: proc(text: string, opts := rt.Width_Options{}) -> (w, h: int) {
+	it := line_iter(text)
+	for {
+		line, ok := line_next(&it)
+		if !ok { break }
+		w = max(w, rt.display_width(line, opts))
+		h += 1
+	}
+	return
+}
+
+@(require_results)
+measure_width :: proc(text: string, opts := rt.Width_Options{}) -> int {
+	w, _ := measure(text, opts)
+	return w
+}
+
+@(require_results)
+measure_height :: proc(text: string, opts := rt.Width_Options{}) -> int {
+	_, h := measure(text, opts)
+	return h
+}
+
+// ---------------------------------------------------------------------------
+// cluster boundaries
+// ---------------------------------------------------------------------------
+
+// THE ONE PLACE THIS PACKAGE NEEDS A BOUNDARY AND NOT A TOTAL. Truncating and
+// hard-breaking both have to cut a string somewhere, and the only legal
+// somewhere is an extended-grapheme-cluster boundary: cutting between a base
+// rune and its combining mark, or inside a ZWJ sequence, produces bytes no
+// terminal can paint back into what the caller wrote.
+//
+// SUMMING PER-RUNE WIDTHS HERE WOULD STILL BE WRONG, even though a per-rune sum
+// is now a TOTAL a caller can legitimately ask for (rt.Emoji_Width
+// .Legacy_Wcwidth, which a measured VTE 2.91 wants: it advances 8 columns for
+// "👨‍👩‍👧‍👦" where kitty advances 2). The two are separate decisions and this is the
+// one about CUTS. Whatever the width policy says the cluster totals, the cut has
+// to land on its boundary: slicing "👨‍👩‍👧‍👦" between the joiners leaves a dangling
+// ZWJ and half a family, which no terminal can paint back and every terminal
+// then measures differently from the number this package padded to -- the row
+// comes out BOTH corrupt and ragged. Hence the boundary is asked of the cluster
+// iterator and the total is asked of Width_Options; the iterator answers 2 or 8
+// for that cluster depending on the policy, and the boundary it reports is the
+// same under both.
+//
+// SO IT GOES THROUGH runetea's OWN CLUSTER ITERATOR, which is the same loop
+// display_width sums and the same one the cell renderer places cells with -- so
+// this package cannot possibly disagree with either about where a cluster starts
+// or how wide it is. That is the file's opening rule applied to a boundary
+// question rather than a total.
+//
+// start_col IS THREADED, and it is not decoration: a TAB's width is
+// next_tab_stop(col) - col, so the same "\t" is 8 columns at column 0 and 1
+// column at column 7. Measuring each escape-free run from column 0 would score
+// every tab after the first one wrong, and a truncation would cut in a place the
+// terminal does not agree is that many columns in. runetea's Width_Options
+// documents the additivity law this relies on
+// (display_width(a, {c}) + display_width(b, {c + that}) == display_width(ab, {c}))
+// and this is the caller that needs it.
+//
+// The equivalence is pinned from the outside anyway:
+// test_per_cluster_widths_sum_to_the_whole_strings_display_width.
+
+// The longest prefix of `s` that fits in `limit` columns, as a byte length plus
+// that prefix's width. Cuts only at cluster boundaries and never inside an
+// escape sequence.
+//
+// ESCAPES BEFORE THE CUT ARE KEPT, escapes after it are not. That is not an
+// arbitrary choice: an escape before the cut is what STYLES the visible prefix,
+// so dropping it would silently unstyle text that survived; an escape after it
+// styles nothing that is still there. The kept ones cost zero columns, so
+// keeping them cannot make the prefix overflow.
+//
+// SPLITTING ON ESC FIRST is required, not an optimisation: runetea's cluster
+// iterator documents that its input must not contain ESC, because a grapheme
+// iterator run over escape bytes would fold them into whatever cluster they
+// abut. Scanning for 0x1B is sound on bytes -- it can never occur inside a
+// multi-byte UTF-8 sequence -- which is the same argument width.odin's own
+// escape pre-pass makes.
+@(private = "file")
+prefix_fitting :: proc(s: string, limit: int, opts: rt.Width_Options) -> (nbytes, w: int) {
+	i := 0
+	for i < len(s) {
+		if s[i] == ESC {
+			next, _ := scan_escape(s, i)
+			i = next   // truncated escapes return len(s) and end the walk
+			continue
+		}
+		run_end := i
+		for run_end < len(s) && s[run_end] != ESC { run_end += 1 }
+
+		o := opts
+		o.start_col = opts.start_col + w
+		ci := rt.cluster_iter_make(s[i:run_end], o)
+		for {
+			span, cw, ok := rt.cluster_next(&ci)
+			if !ok { break }
+			if w + cw > limit { return i, w }
+			w += cw
+			i += len(span)
+		}
+	}
+	return len(s), w
+}
+
+// The first grapheme cluster of an ESCAPE-FREE string, and its width. Only
+// wrap_line's last resort calls it, for the one case prefix_fitting cannot
+// answer: a cluster wider than the entire box, where the honest options are to
+// overflow by a column or to delete a character the caller passed in.
+@(private = "file")
+first_cluster :: proc(s: string, opts: rt.Width_Options) -> (span: string, w: int) {
+	ci := rt.cluster_iter_make(s, opts)
+	span, w, _ = rt.cluster_next(&ci)
+	if len(span) == 0 { return s, rt.display_width(s, opts) }   // unreachable; never loop forever
+	return
+}
+
+// ---------------------------------------------------------------------------
+// truncation
+// ---------------------------------------------------------------------------
+
+// Cuts every line of `text` to at most `max_w` columns, appending `tail` to the
+// lines it actually cut. Multi-line input stays multi-line; a line that already
+// fits is copied byte for byte.
+//
+// THE TAIL IS BUDGETED, not appended on top: a line cut to `max_w` with a
+// 1-column "…" keeps max_w - 1 columns of content, so the RESULT is max_w. A
+// truncate whose output could exceed the width it was given would be useless to
+// the box model that calls it. If the tail is itself wider than max_w the tail
+// is dropped rather than the content -- a row consisting only of ellipsis
+// carries no information at all.
+//
+// "…" IS THE DEFAULT HERE and the empty string is the default on a Style (see
+// Style.ellipsis). The asymmetry is deliberate: calling this proc is asking for
+// a truncation by name and a visible cut mark is what that means, while a Style
+// field must obey the package's zero-value-does-nothing rule.
+//
+// SGR-CORRECT. A cut that lands mid-style-run would leave the run open, which
+// costs runetea's .Diff renderer unbounded growth (see this file's header); so a
+// cut whose surviving prefix leaves the terminal's SGR set is closed with one
+// "\e[0m" after the tail -- placing it AFTER means the ellipsis is painted in
+// the same style as the text it replaced, which is what makes it read as part of
+// the sentence rather than as debris.
+@(require_results)
+truncate :: proc(text: string, max_w: int, tail := "…", opts := rt.Width_Options{}, alloc := context.allocator) -> string {
+	sb := strings.builder_make(alloc)
+	it := line_iter(text)
+	first := true
+	for {
+		line, ok := line_next(&it)
+		if !ok { break }
+		if !first { strings.write_byte(&sb, '\n') }
+		first = false
+		truncate_line(&sb, line, max_w, tail, opts)
+	}
+	return strings.to_string(sb)
+}
+
+@(private = "file")
+truncate_line :: proc(sb: ^strings.Builder, line: string, max_w: int, tail: string, opts: rt.Width_Options) {
+	if max_w <= 0 { return }
+	if rt.display_width(line, opts) <= max_w {
+		strings.write_string(sb, line)
+		return
+	}
+	t := tail
+	budget := max_w - rt.display_width(t, opts)
+	if budget < 0 { budget, t = max_w, "" }
+
+	n, _ := prefix_fitting(line, budget, opts)
+	strings.write_string(sb, line[:n])
+	strings.write_string(sb, t)
+	if content_leaves_sgr_set(line[:n]) { strings.write_string(sb, RESET) }
+}
+
+// ---------------------------------------------------------------------------
+// wrapping
+// ---------------------------------------------------------------------------
+
+// Greedy word wrap to `max_w` columns, width-correct and SGR-preserving. This is
+// the DEFAULT overflow policy, and the reason making `width` exact did not have
+// to mean losing text.
+//
+// THE ALGORITHM, and its two boundaries. Breaks are taken at ASCII spaces, and
+// the spaces at a break are DROPPED (they would otherwise sit at the head of the
+// next row and shift it right by however many there were). A word that does not
+// fit on a line of its own is hard-broken at grapheme-cluster boundaries
+// (prefix_fitting) rather than pushed out -- a 200-character URL in a 40-column
+// panel is the case that has to work, and there is no space in it to break at.
+//
+// A CLUSTER WIDER THAN THE WHOLE BOX is emitted anyway, overflowing by one
+// column, rather than dropped or split. Splitting it would put unpaintable bytes
+// on the wire; dropping it would delete a character the caller passed in. This
+// is the single case in which a clamped block can still come out wider than its
+// `width`, and render says so at the same place.
+//
+// SGR ACROSS A BREAK is the part a naive implementation gets wrong and nobody
+// notices until a coloured paragraph loses its colour halfway down. "\e[31mhello
+// world\e[0m" wrapped at 5 must not become "\e[31mhello" / "world\e[0m", where
+// the second row paints in the default. Every escape seen on the logical line is
+// accumulated into a CARRY (cleared by either canonical reset, the same two
+// spellings write_content and runetea's cell model recognise, and no others);
+// each break closes the row with "\e[0m" when the carry is non-empty and re-opens
+// the next one with the carry. So each produced row is independently correct,
+// which is also exactly the invariant runetea's .Diff renderer needs from every
+// row this package emits.
+//
+// max_w <= 0 CANNOT WRAP -- no finite number of breaks makes a character fit in
+// zero columns -- so it degrades to a cut, producing empty lines. render relies
+// on that for a `width` smaller than its own border.
+@(require_results)
+wrap :: proc(text: string, max_w: int, opts := rt.Width_Options{}, alloc := context.allocator) -> string {
+	if max_w <= 0 { return truncate(text, 0, "", opts, alloc) }
+
+	sb    := strings.builder_make(alloc)
+	carry := strings.builder_make(alloc)
+	defer strings.builder_destroy(&carry)
+
+	it := line_iter(text)
+	first := true
+	for {
+		line, ok := line_next(&it)
+		if !ok { break }
+		if !first { strings.write_byte(&sb, '\n') }
+		first = false
+		strings.builder_reset(&carry)
+		wrap_line(&sb, &carry, line, max_w, opts)
+	}
+	return strings.to_string(sb)
+}
+
+// One logical line. `carry` is reset by the caller and owned by it; it holds the
+// escapes still in effect, so a break can close and re-open the styling.
+@(private = "file")
+wrap_line :: proc(sb, carry: ^strings.Builder, line: string, max_w: int, opts: rt.Width_Options) {
+	if rt.display_width(line, opts) <= max_w {
+		strings.write_string(sb, line)
+		return
+	}
+
+	cur_w   := 0   // visible columns already on the row being built
+	pending := 0   // columns of spaces held back: dropped if a break happens here
+	i       := 0
+
+	break_row :: proc(sb, carry: ^strings.Builder, cur_w, pending: ^int) {
+		if strings.builder_len(carry^) > 0 { strings.write_string(sb, RESET) }
+		strings.write_byte(sb, '\n')
+		strings.write_string(sb, strings.to_string(carry^))
+		cur_w^, pending^ = 0, 0
+	}
+
+	for i < len(line) {
+		// An escape: zero columns, always emitted, never a break opportunity.
+		if line[i] == ESC {
+			next, _ := scan_escape(line, i)
+			esc := line[i:next]
+			strings.write_string(sb, esc)
+			if esc == RESET || esc == "\e[m" {
+				strings.builder_reset(carry)
+			} else {
+				strings.write_string(carry, esc)
+			}
+			i = next
+			continue
+		}
+
+		// A run of spaces: held back rather than written, so that a break taken
+		// immediately after it costs nothing at the head of the next row.
+		if line[i] == ' ' {
+			j := i
+			for j < len(line) && line[j] == ' ' { j += 1 }
+			pending += j - i
+			i = j
+			continue
+		}
+
+		// A word: bytes up to the next space or escape.
+		j := i
+		for j < len(line) && line[j] != ' ' && line[j] != ESC { j += 1 }
+		word := line[i:j]
+		i = j
+		ww := rt.display_width(word, opts)
+
+		if cur_w > 0 && cur_w + pending + ww > max_w {
+			break_row(sb, carry, &cur_w, &pending)
+		}
+		if pending > 0 {
+			write_spaces(sb, pending)
+			cur_w  += pending
+			pending = 0
+		}
+		if cur_w + ww <= max_w {
+			strings.write_string(sb, word)
+			cur_w += ww
+			continue
+		}
+
+		// Hard break: no space to break at, so break at cluster boundaries.
+		rest := word
+		for len(rest) > 0 {
+			n, w := prefix_fitting(rest, max_w - cur_w, opts)
+			if n == 0 {
+				if cur_w > 0 {
+					break_row(sb, carry, &cur_w, &pending)
+					continue
+				}
+				// Nothing fits on an empty row: one cluster is wider than the whole
+				// box. Emit it and overflow by a column rather than delete it.
+				span, sw := first_cluster(rest, opts)
+				n, w = len(span), sw
+			}
+			strings.write_string(sb, rest[:n])
+			cur_w += w
+			rest = rest[n:]
+			if len(rest) > 0 { break_row(sb, carry, &cur_w, &pending) }
+		}
+	}
+
+	// Trailing spaces stay: no break happened after them, so they are content on
+	// this row like any other, and render's alignment fill paints over them.
+	if pending > 0 { write_spaces(sb, pending) }
+}
+
+// ---------------------------------------------------------------------------
+// layout joins
+// ---------------------------------------------------------------------------
+
+// Two blocks side by side, and two blocks stacked. lipgloss.JoinHorizontal /
+// JoinVertical, and the primitive whose absence forced every application to
+// reimplement it -- badly, because doing it right needs exactly the two things
+// an app does not have: a column-correct measure of an already-styled string,
+// and the guarantee that a styled row can be padded without the padding
+// inheriting the row's colour.
+//
+// THEY ARE ONLY CORRECT NOW THAT `width` CLAMPS. A join lays block i's rows at a
+// fixed column offset computed from block i's measured width; if a single long
+// line could widen one block's rows and not the others (which is precisely what
+// the old floor semantics did), every row of the joined result below that point
+// would be offset differently and the whole thing would shear. That is why these
+// arrive in the same change as the clamp and not before it.
+//
+// A ROW IS PADDED ONLY AFTER IT IS CLOSED. Every row this package emits already
+// ends at the terminal default (see write_reset), but a caller may hand in a row
+// that does not -- so a row that leaves SGR set gets one "\e[0m" before its
+// padding. Without that, the padding of a red row paints red and the join grows
+// a coloured notch exactly where the blocks meet.
+//
+// `pos` IS THE CROSS-AXIS ALIGNMENT: for join_horizontal, where a short block
+// sits vertically against a taller one; for join_vertical, where a narrow block
+// sits horizontally against a wider one.
+@(require_results)
+join_horizontal :: proc(pos: Align_V, blocks: []string, opts := rt.Width_Options{}, alloc := context.allocator) -> string {
+	if len(blocks) == 0 { return "" }
+
+	Blk :: struct { it: Line_Iter, w, h, top: int }
+	bs := make([]Blk, len(blocks), alloc)
+	defer delete(bs, alloc)
+
+	rows := 0
+	for b, i in blocks {
+		w, h := measure(b, opts)
+		bs[i] = Blk{it = line_iter(b), w = w, h = h}
+		rows = max(rows, h)
+	}
+	for &b in bs {
+		switch pos {
+		case .Top:    b.top = 0
+		case .Middle: b.top = (rows - b.h) / 2
+		case .Bottom: b.top = rows - b.h
+		}
+	}
+
+	sb := strings.builder_make(alloc)
+	for r in 0 ..< rows {
+		if r > 0 { strings.write_byte(&sb, '\n') }
+		for &b in bs {
+			// The iterators advance in lockstep with `r`, so each block's lines are
+			// consumed in order and no block is ever re-scanned. Re-iterating from
+			// the start for every output row would make this quadratic in the
+			// joined text, which for a full-screen two-panel layout is the hot path.
+			if r < b.top || r >= b.top + b.h {
+				write_spaces(&sb, b.w)
+				continue
+			}
+			line, _ := line_next(&b.it)
+			strings.write_string(&sb, line)
+			if content_leaves_sgr_set(line) { strings.write_string(&sb, RESET) }
+			write_spaces(&sb, b.w - rt.display_width(line, opts))
+		}
+	}
+	return strings.to_string(sb)
+}
+
+@(require_results)
+join_vertical :: proc(pos: Align_H, blocks: []string, opts := rt.Width_Options{}, alloc := context.allocator) -> string {
+	if len(blocks) == 0 { return "" }
+
+	width_max := 0
+	for b in blocks { width_max = max(width_max, measure_width(b, opts)) }
+
+	sb   := strings.builder_make(alloc)
+	nrow := 0
+	for b in blocks {
+		it := line_iter(b)
+		for {
+			line, ok := line_next(&it)
+			if !ok { break }
+			if nrow > 0 { strings.write_byte(&sb, '\n') }
+			nrow += 1
+
+			gap := width_max - rt.display_width(line, opts)
+			lead, trail := 0, gap
+			switch pos {
+			// Odd remainder goes RIGHT, the same arbitrary-but-fixed choice
+			// render's own centring makes, so a centred block and a centred join
+			// cannot disagree about a column.
+			case .Left:   lead, trail = 0, gap
+			case .Center: lead, trail = gap / 2, gap - gap / 2
+			case .Right:  lead, trail = gap, 0
+			}
+			write_spaces(&sb, lead)
+			strings.write_string(&sb, line)
+			if content_leaves_sgr_set(line) { strings.write_string(&sb, RESET) }
+			write_spaces(&sb, trail)
+		}
+	}
+	return strings.to_string(sb)
 }
