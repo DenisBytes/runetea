@@ -9,6 +9,7 @@ package runetea
 import "core:c/libc"
 import "core:fmt"
 import "core:mem"
+import "core:mem/virtual"
 import "core:strings"
 import "core:sync"
 import "core:sys/posix"
@@ -1518,6 +1519,63 @@ test_the_frame_arena_is_reclaimed_once_per_frame_not_once_per_message :: proc(t:
 }
 
 // ============================================================================
+// LIMITATIONS 2.17: the mailbox capacity -- which is also the coalescing budget
+// -- was MAILBOX_CAP :: 256, package-private, with no way for an application to
+// choose another number.
+// ============================================================================
+
+@(test)
+test_mailbox_cap_resolves_and_clamps :: proc(t: ^testing.T) {
+	p: Program(Counter)
+
+	// The zero value is what every program written before the field existed
+	// has, and it must keep meaning exactly what it used to.
+	testing.expect_value(t, program_mailbox_cap(&p), MAILBOX_CAP)
+
+	p.mailbox_cap = 1024
+	testing.expect_value(t, program_mailbox_cap(&p), 1024)
+
+	// CLAMPED UP, not rejected: a one-slot mailbox turns every burst into a
+	// producer stall and a zero-slot one cannot be constructed at all, so
+	// honouring either literally would be worse than the floor. Negative is
+	// treated as "unset" rather than clamped, because the only way to write it
+	// is a bug in the caller's own arithmetic and the default is the safer
+	// reading of it.
+	p.mailbox_cap = 1
+	testing.expect_value(t, program_mailbox_cap(&p), MAILBOX_CAP_MIN)
+	p.mailbox_cap = -5
+	testing.expect_value(t, program_mailbox_cap(&p), MAILBOX_CAP)
+}
+
+// A capacity far below the burst it has to carry must cost LATENCY, never
+// messages: the back-pressure policy is retry-forever (2.15), and shrinking the
+// queue does not quietly turn it into a drop policy. This is the assertion that
+// makes the knob safe to expose -- N is 40x the mailbox, so every message in
+// this run crosses a full queue.
+@(test)
+test_a_small_mailbox_still_delivers_every_message_in_order :: proc(t: ^testing.T) {
+	N :: 320
+	script := make([]u8, N + 1); defer delete(script)
+	for i in 0 ..< N { script[i] = 'a' }
+	script[N] = 'q'
+
+	src := input_source_from_bytes(script)
+	defer input_close(&src)
+	b := strings.builder_make(); defer strings.builder_destroy(&b)
+
+	p: Program(Arena_Lifetime_Model)
+	program_init(&p, Arena_Lifetime_Model{}, arena_lifetime_update, arena_lifetime_view)
+	p.mailbox_cap = MAILBOX_CAP_MIN   // 8
+	testing.expect(t, run(&p, &src, &b) == nil, "the session should end cleanly")
+
+	testing.expect_value(t, p.model.msgs, N)
+	// The budget followed the capacity, so a burst this size cannot have been
+	// folded into one frame -- it takes at least N/8 of them.
+	testing.expectf(t, p.model.resets > 0,
+		"the arena was never reclaimed across %d messages at a mailbox of %d", N, MAILBOX_CAP_MIN)
+}
+
+// ============================================================================
 // F15, THE HALF THE FIRST WAVE MISSED: the three thread.create sites that are
 // not Cmds.
 //
@@ -1636,4 +1694,176 @@ test_a_cmd_from_given_context_allocator_inside_update_still_runs :: proc(t: ^tes
 	err := run(&p, &src, &b)
 	testing.expect(t, err == nil, "a correctly-allocated Cmd must still run: the guard compares the ARENA, not the allocator kind")
 	testing.expect_value(t, p.model.n, 1)
+}
+
+// ============================================================================
+// LIMITATIONS 3.15: a `view` that omits `allocator = alloc` leaks one string
+// per frame, and the document's conclusion was that "there is no type
+// distinction between a correct view and a leaking one, so nothing at the
+// boundary can detect it."
+//
+// That conclusion followed from watching the wrong thing. The check that was
+// proposed and rightly rejected watched the frame ARENA's high-water mark,
+// which a correct constant-string view never moves. The property that actually
+// defines the bug is that context.allocator DID move. See viewleak.odin.
+// ============================================================================
+
+@(private = "file")
+Leaky_Model :: struct { n: int }
+
+@(private = "file")
+leaky_update :: proc(m: ^Leaky_Model, msg: any, alloc: mem.Allocator) -> Cmd {
+	if k, is_key := msg.(Key_Msg); is_key {
+		if k.r == 'q' { return quit_cmd() }
+		m.n += 1
+	}
+	return cmd_nil()
+}
+
+// THE BUG, verbatim: fmt.aprintf with no `allocator = alloc`. This is the exact
+// line a newcomer writes, and it compiles, renders identically, and leaks.
+@(private = "file")
+leaky_view :: proc(m: Leaky_Model, alloc: mem.Allocator) -> string {
+	return fmt.aprintf("n=%d\n", m.n)
+}
+
+// The same view, correct.
+@(private = "file")
+clean_view :: proc(m: Leaky_Model, alloc: mem.Allocator) -> string {
+	return fmt.aprintf("n=%d\n", m.n, allocator = alloc)
+}
+
+// A correct view that allocates NOTHING -- the case that made the rejected
+// arena check unsound, and which must stay silent here.
+@(private = "file")
+constant_view :: proc(m: Leaky_Model, alloc: mem.Allocator) -> string {
+	return "constant\n"
+}
+
+@(test)
+test_a_leaking_view_is_detected :: proc(t: ^testing.T) {
+	// THE DELIBERATE LEAK IS CONTAINED IN AN ARENA THIS TEST DESTROYS. The whole
+	// point of this program is to abandon memory on context.allocator, so under
+	// odin test's own Tracking_Allocator it would report a `+++ leak` at
+	// builder.odin and fail tools/test.sh's leak audit -- a test that proves a
+	// detector works must not become the one leak the detector cannot explain.
+	// A growing arena swapped in for the duration reclaims it wholesale, and
+	// reclaiming it is sound because a byte-source session with no Cmds tears
+	// down fully synchronously (p.reaper_pending is asserted false below).
+	arena: virtual.Arena
+	testing.expect(t, virtual.arena_init_growing(&arena) == nil, "arena init")
+	defer virtual.arena_destroy(&arena)
+
+	p: Program(Leaky_Model)
+	{
+		context.allocator = virtual.arena_allocator(&arena)
+
+		src := input_source_from_bytes(transmute([]u8)string("aaaq"))
+		defer input_close(&src)
+		b := strings.builder_make(); defer strings.builder_destroy(&b)
+
+		program_init(&p, Leaky_Model{}, leaky_update, leaky_view)
+		testing.expect(t, run(&p, &src, &b) == nil, "the session should end cleanly")
+	}
+	testing.expect(t, !p.reaper_pending,
+		"this session must tear down synchronously, or destroying the arena below races the reaper")
+
+	testing.expectf(t, p.view_leak_frames >= 2,
+		"a view() calling fmt.aprintf without `allocator = alloc` must be detected; leaked in %d frames",
+		p.view_leak_frames)
+	testing.expectf(t, p.view_leak_blocks >= p.view_leak_frames,
+		"at least one block per leaking frame; got %d blocks over %d frames",
+		p.view_leak_blocks, p.view_leak_frames)
+
+	// The detector does not FIX the leak -- it reports it. Freeing what the
+	// view abandoned is not possible from here (nothing holds the pointer), so
+	// the leak this test deliberately creates is real, and the tracking
+	// allocator will report it. That is the point.
+	//
+	// This is also why the assertion is on the FIELDS and not on the stderr
+	// line: a test cannot see the terminal.
+}
+
+@(test)
+test_a_correct_view_is_not_reported :: proc(t: ^testing.T) {
+	// Threading `alloc` through: nothing to report.
+	{
+		src := input_source_from_bytes(transmute([]u8)string("aaaq"))
+		defer input_close(&src)
+		b := strings.builder_make(); defer strings.builder_destroy(&b)
+
+		p: Program(Leaky_Model)
+		program_init(&p, Leaky_Model{}, leaky_update, clean_view)
+		testing.expect(t, run(&p, &src, &b) == nil, "the session should end cleanly")
+		testing.expectf(t, p.view_leak_frames == 0,
+			"a view that threads `alloc` must not be reported; got %d frames / %d blocks",
+			p.view_leak_frames, p.view_leak_blocks)
+	}
+
+	// Allocating nothing at all: also nothing to report. THIS IS THE CASE THAT
+	// SANK THE ARENA-BASED CHECK -- the arena's high-water mark never moves for
+	// this view, so an "the arena must have grown" assertion would have failed
+	// a perfectly correct program.
+	{
+		src := input_source_from_bytes(transmute([]u8)string("aaaq"))
+		defer input_close(&src)
+		b := strings.builder_make(); defer strings.builder_destroy(&b)
+
+		p: Program(Leaky_Model)
+		program_init(&p, Leaky_Model{}, leaky_update, constant_view)
+		testing.expect(t, run(&p, &src, &b) == nil, "the session should end cleanly")
+		testing.expectf(t, p.view_leak_frames == 0,
+			"a view that allocates nothing must not be reported; got %d frames / %d blocks",
+			p.view_leak_frames, p.view_leak_blocks)
+	}
+}
+
+// The other enforced lever (LIMITATIONS 11.2). $RUNETEA_INLINE has to beat the
+// application's own render_mode, or it is advice rather than a lever -- and it
+// is separate from no-alt precisely because suppressing the alternate screen
+// does NOT stop a full-screen renderer owning the terminal: .Full_Screen
+// addresses rows absolutely and clears the screen, so on the normal buffer it
+// overwrites the user's scrollback in place.
+@(test)
+test_inline_only_overrides_the_applications_render_mode :: proc(t: ^testing.T) {
+	defer clear_a11y_prefs()
+
+	// The control first: the same program, same script, with no preference set,
+	// must still get the full-screen renderer it asked for. Without this the
+	// assertion below could pass because the program never painted at all.
+	full: string
+	{
+		set_a11y_prefs(A11y_Prefs{})
+		src := input_source_from_bytes(transmute([]u8)string("aq"))
+		defer input_close(&src)
+		b := strings.builder_make(); defer strings.builder_destroy(&b)
+
+		p: Program(Leaky_Model)
+		program_init(&p, Leaky_Model{}, leaky_update, clean_view)
+		p.render_mode = .Full_Screen
+		testing.expect(t, run(&p, &src, &b) == nil, "the session should end cleanly")
+		full = strings.clone(strings.to_string(b)); defer delete(full)
+		testing.expectf(t, strings.contains(full, "\e[H"),
+			"the control must actually use the full-screen renderer; got %q", full)
+	}
+
+	{
+		set_a11y_prefs(A11y_Prefs{inline_only = true, no_alt = true})
+		src := input_source_from_bytes(transmute([]u8)string("aq"))
+		defer input_close(&src)
+		b := strings.builder_make(); defer strings.builder_destroy(&b)
+
+		p: Program(Leaky_Model)
+		program_init(&p, Leaky_Model{}, leaky_update, clean_view)
+		p.render_mode = .Full_Screen
+		testing.expect(t, run(&p, &src, &b) == nil, "the session should end cleanly")
+
+		got := strings.to_string(b)
+		testing.expectf(t, !strings.contains(got, "\e[H") && !strings.contains(got, "\e[2J"),
+			"$RUNETEA_INLINE must suppress absolute addressing and the screen clear; got %q", got)
+		// And the application's own Program is NOT rewritten under it -- the
+		// override is resolved at renderer construction, so a caller can still
+		// inspect what the APPLICATION wanted.
+		testing.expect_value(t, p.render_mode, Render_Mode.Full_Screen)
+	}
 }

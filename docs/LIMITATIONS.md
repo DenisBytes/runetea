@@ -192,11 +192,39 @@ unfixable cases: `net.dial_tcp_*` (`core:net` has no timeout), a child-process
 **What to do instead:** write Cmds as bounded retry loops that poll the token.
 `examples/http` shows the shape.
 
-### 2.6 `run()` bounds quit at 100 ms; `run_nbio()` does not — **NOT-YET-BUILT**
+### 2.6 Both hosts bound quit at 100 ms — **FIXED** in v1.0-final
 
-`QUIT_GRACE = 100ms` applies to `run()` only (`runetea/tea.odin, run`'s `QUIT_GRACE`).
-`run_nbio` keeps a fully synchronous teardown and blocks on the slowest Cmd
-(`docs/superpowers/cancellation-decision.md:557-560`).
+`QUIT_GRACE` is now package scope (`runetea/tea.odin, QUIT_GRACE`) and **both**
+hosts use it. `run_nbio` used to tear down with a blocking `dispatcher_destroy`,
+so quitting took as long as the slowest Cmd still running: press `q` against a
+Cmd sleeping 1 s and the shell prompt came back 1 s later, with the frame
+already gone and nothing on screen to explain the wait.
+
+**What the fix cost, stated rather than buried.** `run_nbio`'s `Mailbox` and
+`Dispatcher` were stack locals, and a bounded quit is not possible with stack
+locals -- a Cmd still running when the loop returns may keep touching both. They
+now live in the same heap `Reap_Ctx` `run()` has always used. The consequence is
+that `run_nbio` inherits `run()`'s allocator-lifetime obligation too: it can now
+return with a detached reaper still freeing through the caller's
+`context.allocator`, and it sets `Program.reaper_pending` to say so. That field's
+own comment used to end *"run_nbio() never sets it"*; it does now, and a caller
+that scopes an allocator to the call must read it.
+
+It is not theoretical. The first run of the suite after this change **SIGSEGV'd**
+-- `test_run_nbio_closes_the_mailbox_before_tearing_the_dispatcher_down` drives
+exactly this shape, and `odin test`'s per-task `Tracking_Allocator` is the
+shortest-lived caller there is. That test now waits, the way `run()`'s slow-Cmd
+tests always have.
+
+Pinned by `test_run_nbio_returns_promptly_with_a_slow_cmd_still_in_flight`,
+which asserts both halves: the call returns in well under 500 ms against a 1 s
+Cmd, **and** `reaper_pending` is true.
+
+**Also fixed here, and previously undocumented:** `run_nbio` discarded
+`signal_watcher_start`'s return value, which `run()` has always checked. A failed
+`pthread_create` left a program that looked fine and answered no `SIGINT`, no
+`SIGTERM` and no `SIGWINCH` for the rest of its life -- the resize half being
+invisible until the user resized. Both hosts now fail identically at that point.
 
 ### 2.7 A Cmd that panics leaks whatever it had allocated — **INTRINSIC**
 
@@ -228,12 +256,42 @@ finishes in microseconds — which is what `batch()`/`sequence()` coordinators d
 composed sub-batches spawns hundreds of threads
 (`docs/superpowers/batch-sequence-decision.md:428-437`).
 
-### 2.11 A `Tick`/`Every` inside `batch()`/`sequence()` gates nothing — **NOT-YET-BUILT**
+### 2.11 A `Tick`/`Every` inside `batch()`/`sequence()` is refused — **FIXED** in v1.0-final
 
-`sequence([step_a, tick(1s), step_b])` does **not** pause for a second; the tick
-step signals `done` immediately (`runetea/cmd.odin, dispatch_ex`'s Tick/Every note). There is no
-correct semantics for a nested `Every` at all
-(`docs/superpowers/batch-sequence-decision.md:404-419`).
+`sequence([step_a, tick(1s), step_b])` reads as "do a, wait a second, do b" and
+did **not** wait: a timer child signals `done` to the coordinator's Wait_Group
+the moment it is handed to the timer thread, not when it fires
+(`runetea/cmd.odin, dispatch_ex`'s Tick/Every note), so the sequence stepped
+straight past it. The Tick still fired a second later and still delivered its
+message, so nothing failed, nothing leaked, and the only symptom was a program
+whose timing was wrong — the worst shape a bug can have in a library whose whole
+discipline is that a broken contract says so.
+
+`compose` (`runetea/batch.odin`) now refuses a `c.timer != nil` child with the
+same panic marker the frame-allocator refusal uses, so it ends the session
+through `apply_msg` rather than landing in a `case Panicked_Msg` the canonical
+update switch leaves empty (2.24).
+
+**Refused rather than implemented, both halves.** For a nested `Every` there is
+no correct semantics to implement at all: an `Every` never completes, so a
+composite that waited for it would never complete either, and one that did not
+wait is what we already had (`docs/superpowers/batch-sequence-decision.md:404-419`).
+For a nested `Tick` a meaning *could* be invented — have the coordinator sleep —
+but inventing one half of a pair while refusing the other would leave
+`batch([tick, every])` doing two different things with two constructors that look
+identical at the call site.
+
+**What to do instead** is in the diagnostic itself, because a refusal that does
+not say what to write is just a different way to lose an afternoon: issue the
+timer from `update`, and dispatch the next step when its message arrives. That is
+the same reissue-from-`update` pattern every animated RuneTea program already
+uses, and unlike a nested Tick it is cancellable — you simply stop responding.
+
+The refusal **reclaims the children before it panics**: `guarded()` recovers by
+`longjmp`, which runs no `defer`, so 136 B of timer handle per refusal would
+otherwise leak — and a diagnostic that leaks is one people learn to route around.
+Pinned by `test_a_nested_timer_in_a_sequence_is_refused` and
+`test_a_nested_timer_in_a_batch_is_refused`.
 
 ### 2.12 `batch()` takes a slice, not a variadic — **INTRINSIC**
 
@@ -324,18 +382,31 @@ onto unrelated comments before the citation gate existed; `:678-686` in
 particular resolved correctly at the commit that introduced this document and was
 pointing at a `Timer_Unavailable_Msg` comment one commit later.
 
-### 2.17 Mailbox capacity is hard-coded at 256 — **NOT-YET-BUILT**
+### 2.17 Mailbox capacity is an application's to choose — **FIXED** in v1.0-final
 
-`MAILBOX_CAP :: 256`, package-private, with no way for an application to choose
-another number (`runetea/tea.odin`, `runetea/loop_nbio.odin`). A paste longer
-than that still fills it and the reader still waits — the waiting is now the
-bounded spin-then-sleep of 2.15 rather than a hot loop, but the capacity itself
-is unchanged.
+`Program.mailbox_cap` (`runetea/tea.odin`). Zero -- the value every program
+written before the field existed has -- still means `MAILBOX_CAP :: 256`, so
+nothing changes without being asked to. Values below `MAILBOX_CAP_MIN` (8) are
+**clamped up, not rejected**: a one-slot mailbox turns every burst into a
+producer stall and a zero-slot one cannot be constructed at all, so honouring
+either literally would be worse than the floor. A negative value reads as
+"unset", because the only way to write one is a bug in the caller's arithmetic.
 
-**It is also `COALESCE_BUDGET`**, the most messages either host applies before it
-stops and paints, which is deliberate: the drain must be bounded or a producer
-faster than the loop starves rendering entirely, which is exactly the shape
-`run_nbio` used to fail in (2.21).
+**It is also the coalescing budget**, the most messages either host applies
+before it stops and paints, and that identity is deliberate rather than an
+implementation detail leaking: whatever the capacity is, no more than that many
+messages can be queued when a batch starts, so the budget never truncates a batch
+coalescing was meant to fold. The drain must be bounded or a producer faster than
+the loop starves rendering entirely, which is exactly the shape `run_nbio` used
+to fail in (2.21). One knob, not two.
+
+**Raising it** helps a program whose producers legitimately burst wider than 256
+between paints. **Lowering it** bounds the worst-case work of a single coalesced
+batch. Neither can lose a message: the back-pressure policy is retry-forever
+(2.15), and shrinking the queue costs latency, not delivery -- pinned by
+`test_a_small_mailbox_still_delivers_every_message_in_order`, which drives 320
+messages through an 8-slot mailbox and asserts all 320 arrive in order.
+`test_mailbox_cap_resolves_and_clamps` pins the resolution rules.
 
 ### 2.18 The mailbox is single-consumer, and `try_recv`'s `ok=false` is ambiguous — **INTRINSIC**
 
@@ -374,13 +445,31 @@ forever. Pinned by `test_redispatching_a_cmd_from_is_refused_with_a_diagnostic`,
 `test_redispatching_a_sequence_is_refused_with_a_diagnostic` and
 `test_redispatching_a_tick_is_refused_with_a_diagnostic`.
 
-**Residual, and real:** the refusal travels to `update` through the Mailbox, so a
-re-dispatch that happens *after* the mailbox has closed is silently dropped.
-"Fails loudly" means "fails loudly while the loop is running". Measured: the same
-probe reports `refused=2` under a real pty and `refused=0` when driven from a
-finite `input_source_from_bytes`, which closes the mailbox at EOF.
+**The residual is closed** (v1.0-final). The refusal travels to `update` through
+the Mailbox, so a re-dispatch happening *after* the mailbox has closed used to be
+box-freed in silence: "fails loudly" meant "fails loudly while the loop is
+running". Measured at the time, the same probe reported `refused=2` under a real
+pty and `refused=0` when driven from a finite `input_source_from_bytes`, which
+closes the mailbox at EOF -- so a scripted test could not see a violation a real
+session would have shouted about.
 
-### 2.20 Passing `update`'s own `alloc` to a Cmd constructor — **FIXED** in v1.0-audit for `cmd_from`/`tick`/`every`, **NOT-YET-BUILT** for `batch`/`sequence`
+`deliver_report` (`runetea/cmd.odin`) now falls back to **stderr** on both of the
+paths where the mailbox is not a channel: `.Closed`, and a queue that stayed
+`.Full` for the whole retry window. Stderr is a strictly worse channel and that is
+why it is the fallback rather than the mechanism -- a program on the alternate
+screen has its stderr painted into a buffer `\e[?1049l` is about to discard, which
+is the whole reason these reports go through the mailbox in the first place. But
+against *nothing*, a message the default `.Inline` renderer shows perfectly and
+the alternate screen may swallow is strictly better, and it costs a correct
+program exactly nothing, because a correct program never produces one.
+
+### 2.20 Passing `update`'s own `alloc` to a Cmd constructor — **FIXED** in v1.0-audit
+
+*(This heading used to end "**NOT-YET-BUILT** for `batch`/`sequence`". Those two
+were closed by `cmd_alloc_contract_check` in `runetea/batch.odin`, ahead of the
+nil-filter and the n==0/n==1 early returns so a one-element batch cannot slip
+past; the heading simply had not caught up. Pinned by
+`test_a_batch_given_updates_own_frame_allocator_is_refused`.)*
 
 `update` is handed one allocator, spelled `alloc`, and it is the **frame arena**.
 Every Cmd constructor takes an allocator as its last argument. Passing the one
@@ -492,21 +581,44 @@ consumer that dropped its in-hand message on a `.Closed` send rather than in the
 ring, `test_the_reader_frees_the_message_it_still_holds_when_the_mailbox_closes`
 — one 12-byte box per session, which no leak audit noticed because it was one.
 
-### 2.24 A non-POD `Msg` returned from a `Cmd` is a no-op you can ignore — **NOT-YET-BUILT**
+### 2.24 A non-POD `Msg` returned from a `Cmd` ends the session — **FIXED**
+
+*(This entry described the escalation as missing. It was already half wrong when
+it was written and is now wrong in the other half too; both halves are corrected
+here rather than the entry being deleted, because what it warned about is exactly
+the first mistake a new user makes.)*
 
 `box()` panics naming the offending type, the panic is recovered, and the
-resulting `Panicked_Msg` reaches `update()`. If `update` has no
-`case rt.Panicked_Msg:`, **nothing else happens**: no stderr, no non-zero exit,
-no `Panicked_Error`. The Cmd simply never delivers, forever, and the program
-looks like one whose Cmd is slow.
+resulting `Panicked_Msg` reaches `apply_msg`. Two things happen there, and
+neither of them is "nothing":
 
-What was fixed is the *content* of the report: `box()` now puts both the
-offending `typeid` and the `box()` call site into the message text, leading with
-them so both survive `Msg_Text`'s 255-byte truncation. What was not fixed is the
-escalation — `apply_msg` delivers the message and does nothing further when no
-case matches. **What to do instead:** give every `update` a real
-`case rt.Panicked_Msg:` body, and call `box()` on every Msg type you define once,
-in a test (2.2).
+1. **A MESSAGE-CONTRACT VIOLATION ENDS THE SESSION.** `apply_msg`
+   (`runetea/tea.odin`) tests the report for `box()`'s marker and for
+   `dispatch_ex`'s frame-allocator marker, and converts either into a
+   `Panicked_Error` returned from `run()` -- the one channel that outlives the
+   alternate screen, which the caller prints after its own `term_restore()` and
+   which `exit_code` turns into a non-zero status. It does this **before**
+   `update()`, deliberately: there is no way to observe whether an app's `switch`
+   matched a case, so "escalate only what `update` ignored" is not implementable,
+   and a rule the program will break identically on the next attempt is the
+   loop's business rather than the model's. Pinned by
+   `test_a_cmd_that_boxes_a_non_pod_msg_ends_the_session_loudly`.
+2. **The report names the type and the call site.** `box()` leads the message
+   text with the offending `typeid` and the `box()` `file:line`, so both survive
+   `Msg_Text`'s 255-byte truncation.
+
+An **ordinary** Cmd panic -- one where the Cmd's own body failed rather than the
+program breaking a framework rule -- still arrives as an ordinary
+`Panicked_Msg`, the session still continues, and the app still decides. That is
+not the gap; that is the design (`test_program_survives_a_panicking_cmd`).
+
+**The gap that was real is closed too** (v1.0-final): a report that never reached
+the mailbox never reached `apply_msg`, and `deliver_report` used to drop it in
+silence. It now falls back to stderr -- see 2.19 for the measurement and for why
+stderr is the fallback rather than the mechanism.
+
+**What to do anyway:** give every `update` a real `case rt.Panicked_Msg:` body,
+and call `box()` on every Msg type you define once, in a test (2.2).
 
 ### 2.25 Reading a `Msg_Text` out of a type switch does not compile — **TOOLCHAIN**, with a one-line workaround
 
@@ -767,7 +879,7 @@ Bubble Tea v2's per-frame declaration of alt-screen / mouse mode / focus / paste
 (`docs/superpowers/specs/2026-07-25-runetea-design.md:409-417`). All terminal
 modes are set once at `term_enter_raw`.
 
-### 3.15 `view` must hand-thread its allocator into every allocation — **NOT-YET-BUILT**, and an API trap
+### 3.15 `view` must hand-thread its allocator into every allocation — **INTRINSIC** (the trap) / **FIXED** in v1.0-final (the silence)
 
 `view` is handed a frame arena as a parameter named `alloc`, and everything
 allocated from it is reclaimed wholesale when the frame ends. But every
@@ -779,7 +891,7 @@ by nobody: the loop resets the arena, and the arena never held it
 
 It compiles, it renders identically, and it leaks **one view per frame** for the
 life of the process. There is no type distinction between a correct view and a
-leaking one, so nothing at the boundary can detect it.
+leaking one --- but there *is* an observable one, and RuneTea now observes it.
 
 **What you get is a warning on a passing test.** `odin test` on a package with
 any test that drives `run()` prints `+++ leak` lines for it — measured on a
@@ -787,10 +899,46 @@ any test that drives `run()` prints `+++ leak` lines for it — measured on a
 gate only if you copy this repository's own `tools/test.sh` leak audit, which is
 a repo tool a downstream user does not get.
 
-A proposed automatic check — "assert in debug builds that the frame arena's
-high-water mark moved" — was **rejected as unsound**: a view that legitimately
-returns a constant string, or one built entirely from `strings.to_string` on a
-builder the model owns, allocates nothing from the arena and is correct.
+**IT IS DETECTED** (v1.0-final), and the reason it was thought undetectable is
+worth stating, because the earlier reasoning was sound and the conclusion was
+still wrong. The check that was proposed and **rightly rejected as unsound** was
+*"assert in debug builds that the frame arena's high-water mark moved"*: a view
+that legitimately returns a constant string, or one built entirely from
+`strings.to_string` on a builder the model owns, allocates nothing from the arena
+and is perfectly correct.
+
+But the arena is the wrong thing to watch. The property that defines the bug is
+not "the arena did not grow" -- it is "**`context.allocator` did**". A correct
+view allocates from `alloc`, or from nothing; a leaking view allocates from
+`context.allocator` and abandons it. Those are distinguishable at the boundary.
+
+`guarded_render` installs a counting allocator over `context.allocator` for the
+duration of `view` and `cursor` -- and for nothing else, so the renderer's own
+legitimate allocations are outside it -- and counts **blocks, not bytes**. That
+detail is what makes it exact rather than nearly-exact: Odin's `free(ptr)` reaches
+an allocator with `old_size = 0`, so a byte counter would turn every such free
+into a phantom leak, while every allocation has exactly one matching free
+regardless of what any caller knew about sizes.
+
+It reports; it never panics and never fails a frame. A false positive that turned
+a working program into a crashing one over a diagnostic would be far worse than
+the leak. The one real false-positive class -- a view that lazily initialises
+something process-lifetime on its first call -- is filtered by requiring the leak
+to occur in **more than one frame**: a one-shot initialisation shows as 1 frame
+out of however many the session painted, while the actual bug leaks in every
+frame and cannot get under the threshold.
+
+You get `Program.view_leak_frames` / `view_leak_blocks` / `view_leak_bytes`, which
+are the reliable channel, plus a summary line on stderr on the way out, which is
+best-effort for the alternate-screen reason 2.19 gives. Pinned by
+`test_a_leaking_view_is_detected` (which drives the exact `fmt.aprintf` a newcomer
+writes) and `test_a_correct_view_is_not_reported` (which covers **both** correct
+shapes, including the constant-string view that sank the arena-based check).
+`runetea/viewleak.odin` carries the full argument.
+
+Note what this does **not** do: it does not free what the view abandoned --
+nothing holds the pointer -- and it does not make the leak impossible. It makes
+it impossible to *not notice*.
 
 **What to do instead:** pass `alloc` explicitly at every allocating call in
 `view`, in `cursor`, and in anything they call. Read the leak warnings your own
@@ -1280,17 +1428,67 @@ terminfo measurement. Pinned by `test_shift_tab_decodes_from_csi_z`,
 `test_shift_tab_keeps_its_shift_when_another_modifier_is_present` and
 `test_shift_tab_agrees_between_the_legacy_and_kitty_encodings`.
 
-### 5.7 Modifier bits above bit 8 are masked off — **NOT-YET-BUILT**
+### 5.7 Every modifier bit the wire has is decoded — **FIXED** in v1.0-final
 
-`Modifiers` has no Super, Hyper, CapsLock, or NumLock member, so `CSI 1;33A`
-decodes as plain `Up` and Kitty's Ctrl+Super+a decodes as Ctrl+a
-(`runetea/input.odin, xterm_mods` and `kitty_mods`). *"Lossy but honest."*
-**When it bites:** any application wanting a Super-key binding.
+`Modifier` now has all eight -- `Ctrl, Alt, Shift, Meta, Super, Hyper, Caps_Lock,
+Num_Lock` -- which is exactly the number of bits the encoding carries, and
+exactly fills the `u8` the `bit_set` is backed by. There is no masking left to
+document. Before this, `CSI 1;33A` decoded as a plain, unmodified `Up` and
+Kitty's Ctrl+Super+a decoded as Ctrl+a: an application simply could not bind a
+Super key.
 
-### 5.8 A Kitty event with more than one associated codepoint drops its text — **NOT-YET-BUILT**
+`kitty_mods` reads the full Kitty table (8 Super, 16 Hyper, 32 Meta, 64 Caps
+Lock, 128 Num Lock). `xterm_mods` now reads bits 16/32/64/128 using **Kitty's**
+meanings, and that is safe rather than a guess: xterm's own table stops at bit 8,
+so no terminal driving that path under xterm's rules can set one of them, and a
+set bit up there is therefore proof of which table is in use. Decoding it can add
+information that was being thrown away; it cannot mis-name anything, because
+there is no competing meaning to mis-name it as.
 
-`runetea/input.odin, `kitty_decode`'s associated-text field`. Needs a POD-safe multi-rune field.
-**When it bites:** IME and dead-key composition under the Kitty protocol.
+**Bit 8 is the one place that argument does not hold, and it stays Meta.** xterm
+says Meta, Kitty says Super, both send it in this same sequence shape, and
+nothing in the bytes distinguishes them. Meta is kept because it is what xterm --
+the encoding that path is named for -- defines. **What it costs:** a
+Super-modified arrow from a Kitty-protocol terminal that chose the legacy
+sequence shape reports as `{.Meta}`. An application wanting an unambiguous Super
+binding should enable the Kitty keyboard protocol, where `kitty_mods` reads the
+same bit correctly.
+
+**Caps Lock and Num Lock are LOCK STATES, not held keys**: they report what the
+keyboard's latches were at the moment of the press, so an application matching on
+`mods == {.Ctrl}` should mask them out rather than expect them absent. Pinned by
+`test_modifier_edges` and `test_decode_key_table`, both of which previously
+asserted the *dropping*.
+
+### 5.8 A Kitty event's associated text is delivered in full — **FIXED** in v1.0-final
+
+`kitty_decode`'s field-2 guard used to be `nsub[2] == 1`, so a text field with
+more than one codepoint -- which is exactly what IME and dead-key composition
+produce -- failed the test and the **whole field was discarded**, with `r`
+falling back to the key code. The user typed `é` and the application received
+`a`. That was the largest correctness gap left in the decoder for anyone typing a
+language that needs composition.
+
+**Every codepoint is emitted, as extra `Key_Msg`s** -- not as a multi-rune field
+on `Key_Msg`, which is what this entry used to assume the fix would be. A
+`text: [8]rune` field would be POD-safe and would work, but every application
+would have to learn about it: `case .Rune: insert_rune(k.r)` -- the shape every
+example, the README and `docs/API.md` all teach -- would still insert only the
+first codepoint, so the bug would move out of the decoder and into every program
+written against it. Emitting the tail as ordinary `.Rune` presses means an
+application that already handles typing handles composition with no edit. It is
+also not a new idea here: bracketed paste has delivered its content as ordinary
+keypresses for precisely this reason since T1-L.
+
+The first `Key_Msg` keeps the full key semantics (code, modifiers, kind) so an
+existing binding still matches; **the tail is bare text** -- no modifiers, no
+kind, and not marked `pasted`, since a composition is not a paste. A non-scalar
+codepoint truncates the tail rather than being emitted as a garbage rune.
+
+`KITTY_MAX_SUBS` went from 3 to 8, which bounds how much text one event can
+carry: a dead key or IME commit is one to three codepoints and the longest
+realistic case is a ZWJ emoji sequence. Longer than that truncates rather than
+dropping the lot. Pinned by `test_kitty_associated_text_emits_every_codepoint`.
 
 ### 5.9 `Key_Msg.kind == .Repeat` only exists under Kitty — **INTRINSIC**
 
@@ -1835,10 +2033,41 @@ the escapes unless the app calls `set_default_profile(.None)` itself.
 
 `runegloss/color.odin, set_default_profile`.
 
-### 7.9 24-bit → 256 conversion is uncached — **NOT-YET-BUILT**
+### 7.9 24-bit → 256 conversion is cached — **FIXED** in v1.0-final
 
-~720 cube roots per coloured Style per `render()` call
-(`runegloss/color.odin, convert`). Free on `.True_Color`. Width is also measured twice per
+It used to cost ~720 cube roots per coloured Style per `render()` call:
+`nearest_256` called `to_lab` on all 240 palette entries every time, and `to_lab`
+is three cube roots. The palette is a compile-time constant and `to_lab` is a
+pure function of it, so every one of those computed exactly the number it had
+computed on the previous frame. `nearest_16`'s twin check paid the same tax on
+its own 16.
+
+`g_palette_lab` (`runegloss/color.odin`) is filled once by an `@(init)` proc --
+not a lazy `if !known` flag, which would be a data race the moment two threads
+down-converted at once. `@(init)` runs before `main` and before the test runner,
+single-threaded, so the table is simply already there.
+
+**Measured, `-o:speed`, 20,000 renders of one `#7D56F4` Style at
+`Profile.ANSI256`: 29.287 µs per render before, 955 ns after — 30.7×.** At 60 fps
+that is the difference between 1.8 ms and 57 µs of every frame's budget spent
+re-deriving a constant, and it matters most where it is least affordable: a
+`.Diff` repaint converts every distinct style it interns. Still free on
+`.True_Color`, which returns before any of this.
+
+**The risk a cache introduces is not speed but AGREEMENT** -- a table filled in
+the wrong order, or before `BASE16`'s own initialiser ran, would down-convert
+every colour slightly differently and most existing expectations would still
+pass. Pinned by `test_the_palette_lab_cache_agrees_with_computing_it_on_the_spot`
+(all 256 entries, bit-identical to computing them on the spot) and
+`test_down_conversion_is_unchanged_by_the_cache` (216 grid points plus the
+colours this project's own docs name). `to_lab`, `lab_dist2`, `nearest_256`,
+`palette_rgb` and the table were widened from file-private to `@(private)` for
+exactly that -- still out of `odin doc`, so the public surface is unchanged.
+
+Width is still measured twice per line, once per pass (`runegloss/render.odin`),
+and a `render` with an active clamp makes **two** allocations from the supplied
+allocator instead of one — the reflowed text is a temporary, freed before return.
+Nothing reaches the heap behind the caller's back either way. Width is also measured twice per
 line, once per pass (`runegloss/render.odin`), and a `render` with an active clamp
 now makes **two** allocations from the supplied allocator instead of one — the
 reflowed text is a temporary, freed before return. Nothing reaches the heap behind
@@ -1972,6 +2201,34 @@ occurring in both* (`tools/test.sh`'s `tsan)` case and its WARNING, verified
 `tools/racecheck` as a standalone program under TSan. helgrind is not a
 substitute: Odin's `sync.Mutex`/`Sema` are raw futex syscalls, invisible to it
 (`tools/test.sh`'s header).
+
+### 9.1a The job-control test failed under the gate and passed on its own — **FIXED** in v1.0-final
+
+`test_a_job_control_stop_restores_the_tty_and_a_resume_re_acquires_it` failed
+every single run of `./tools/test.sh` and passed 6/6 when run by name. It reported
+its own *"the child must actually STOP -- a handler that restores and returns
+swallows the stop"*, which reads like a bug in `guard.odin`'s SIGTSTP handler and
+was nothing of the kind.
+
+**POSIX discards a stop signal sent to a process in an ORPHANED process group**,
+and a group is orphaned when no member has a parent in a different group of the
+same session. The forked child inherited the test runner's process group, so
+whether SIGTSTP was delivered or dropped depended entirely on how the runner had
+been invoked — and `tools/test.sh` runs the binary as the left-hand side of a
+`| tee` pipeline inside a shell function with job control off. The child never
+stopped, the test correctly reported that it never stopped, and the cause was in
+neither the handler nor the test's assertions.
+
+The child now calls `setpgid(0, 0)` before anything else, making it the sole
+member of a new group whose parent is in a different group in the same session —
+which can never be orphaned. `waitpid` and `kill` are unaffected, and the pty is
+`O_NOCTTY` and claimed by nobody, so a background group still cannot raise
+SIGTTOU on the handler's writes. Green 3/3 under the full gate afterwards.
+
+**Worth keeping as a general warning:** any test that forks and expects job
+control to work must own its process group. This one had been intermittently
+red across several earlier waves and was repeatedly recorded as "pre-existing,
+not mine" — which was true every time and closed nothing.
 
 ### 9.2 The pyte cross-check IS on the gate — **changed** in v1.0-audit
 
@@ -2250,51 +2507,124 @@ default for anything that is not a full-screen editor; `.Full_Screen` without
 `alt` at least leaves the final screen behind. Neither `run()` nor
 `term_enter_raw` reads any environment variable for this.
 
-### 11.2 There is no `--no-alt` lever, and RuneTea provides none — **NOT-YET-BUILT**
+### 11.2 The end user has three levers, and two of them are enforced — **FIXED** in v1.0-final
 
-Nothing in `runetea` consults the environment for an accessibility preference.
-`term_enter_raw` reads exactly one environment variable, `TERM`, and only to
-decide whether escapes are supported at all (5.15). There is no
-`RUNETEA_NO_ALT`, no reduced-motion flag, no high-contrast flag. An end user of
-an application built on RuneTea has **no lever at all** unless the application
-author wrote one; none of the five examples does.
+`runetea/a11y.odin`. Nothing in `runetea` used to consult the environment for an
+accessibility preference at all: `term_enter_raw` read exactly one variable,
+`TERM`, and only to decide whether escapes were supported (5.15). An end user had
+**no lever** -- not a bad default they could override, but no override -- unless
+the application's author had written one, and none of the five examples had.
 
-**What to do instead:** read your own environment variable or command-line flag
-in `main` and pass the result into `Term_Opts.alt` and `p.render_mode`. It is
-four lines, and nobody will do it unless it is written down.
+| Variable | Effect | Enforced? |
+|---|---|---|
+| `RUNETEA_NO_ALT` | never enter the alternate screen | **yes**, in `term_enter_raw` |
+| `RUNETEA_INLINE` | force `Render_Mode.Inline` (implies no-alt) | **yes**, at renderer construction in both hosts |
+| `RUNETEA_REDUCE_MOTION` | `rt.reduce_motion()` returns true | advisory |
 
-### 11.3 Animation runs forever with no way to slow or stop it — **NOT-YET-BUILT**, and a WCAG 2.2.2 concern
+**The levers are the user's, not the application's**, and that is the whole
+design. `no_alt` is applied *after* the application has stated its `Term_Opts`, so
+an app that asks for the alternate screen does not get it when the user has said
+no. An accessibility preference an application can quietly ignore is not a
+preference; it is a suggestion, and suggestions were all that existed.
 
-`examples/spinner` reissues a 100 ms `tick` from `update` on every fire, for the
-life of the process. There is no pause key, no reduced-motion check, and no
-interval setting — `q`, `Ctrl+C` and Escape quit the program, which is the only
-way to stop the motion. That pattern is the one this project's own README and
-`docs/API.md` §4 present as *the* way to animate, so it is what gets copied.
+**Only in the safe direction.** Nothing in the environment can hand an
+application a terminal mode it never asked for -- these can turn the alternate
+screen off, never on. Pinned by
+`test_no_alt_overrides_an_application_that_asked_for_the_alt_screen` (which also
+asserts `g_term.alt_active` is false, so a `Ctrl+Z` / `fg` resume does not
+re-enter it), `test_a11y_can_only_take_the_alt_screen_away_never_give_it` and
+`test_inline_only_overrides_the_applications_render_mode` — which carries its own
+control, so it cannot pass by the program never having painted. The policy itself
+is `test_a11y_env_policy`.
 
-WCAG 2.2.2 (Pause, Stop, Hide) asks that any automatically-moving content lasting
-more than five seconds be pausable. A spinner is arguably decorative, but the
-same reissue-from-`update` loop is what a progress bar, a live log tail and a
-clock are built from, and those are not.
+**`RUNETEA_INLINE` is separate from `RUNETEA_NO_ALT` on purpose.** Suppressing the
+alternate screen does not by itself stop a full-screen renderer owning the
+terminal: `.Full_Screen` and `.Diff` address rows absolutely and clear the screen,
+so on the *normal* buffer they overwrite the user's scrollback in place, which is
+worse than the alternate screen rather than better.
 
-**What to do instead:** keep the tick interval in your model rather than in a
-constant, and bind a key that stops reissuing. Stopping is free — `tick` hands
-back no handle precisely so that not reissuing it leaks nothing.
+**`reduce_motion` is advisory, and cannot honestly be anything else.** RuneTea
+does not own the application's animation -- a spinner is an app-scheduled `tick`
+reissued from `update`, and a clock, a progress bar and a live log tail are the
+same loop. Silently slowing or dropping timer fires would break a program that is
+*counting* them (2.16 is explicit that `every` never bursts catch-up fires for
+exactly this reason). So the library reads the preference, exposes it, and uses it
+in its own examples; what "less motion" means for a given animation stays with the
+code that wrote the animation.
 
-### 11.4 `rg.blink` is exported with no warning, and `.None` does not remove it — **API hazard**
+**Value convention is `$NO_COLOR`'s**: set and non-empty means on, whatever the
+value, so `RUNETEA_NO_ALT=0` turns it **on**. That reads wrong and is right --
+it is the convention the ecosystem already has, and the alternative means a user
+who typed `RUNETEA_NO_ALT=off` gets the opposite of what they asked for.
+`set_a11y_prefs` is the override for an application offering its own `--no-alt`
+flag, so a command line can reach the same lever the environment does.
+
+### 11.3 Animation is pausable, and starts paused under reduced motion — **FIXED** in v1.0-final
+
+`examples/spinner` used to reissue a 100 ms `tick` from `update` on every fire for
+the life of the process, with no pause key, no reduced-motion check and no
+interval setting: `q`, `Ctrl+C` and Escape quit the program, which was the only
+way to stop the motion. That mattered beyond one example, because the pattern is
+the one this project's own README and `docs/API.md` §4 present as *the* way to
+animate, so it is what gets copied.
+
+WCAG 2.2.2 (Pause, Stop, Hide) asks that automatically-moving content lasting
+more than five seconds be pausable. A spinner is arguably decorative; the same
+reissue-from-`update` loop underneath a progress bar, a live log tail or a clock
+is not.
+
+The example now has all three things it was missing, and they are the three any
+animated RuneTea program should copy:
+
+- **A pause control**, on `p` and space, named on screen in both states -- a
+  control nobody can find is not a control. `Model.paused` is a **separate field
+  from `Model.animating`**, deliberately: `animating` is the animation's own
+  invariant ("exactly one Tick outstanding") and the minimum-height guard clears
+  it for a reason the user did not choose. If the two shared a field, a resize
+  would silently restart an animation the user had deliberately stopped, which is
+  the specific way a Pause control usually breaks.
+- **The interval in the model, not in a constant** (`Model.interval`), so it can
+  be slowed without an edit. "Slow it down" is the accommodation most people
+  actually want when "stop it" is too much.
+- **`rt.reduce_motion()` honoured before the first frame**: the example takes the
+  strongest reading and **starts paused**, at a quarter frame rate if resumed.
+  Nothing moves until the user asks it to, which is what 2.2.2 is about.
+
+**Stopping is free and leaks nothing** -- `tick` hands back no handle precisely
+so that not reissuing it is the whole of stopping. There is no timer to cancel and
+no handle to get wrong.
+
+Pinned by `test_the_pause_key_stops_and_restarts_the_animation`,
+`test_a_resize_does_not_resume_an_animation_the_user_paused` (the separate-field
+argument above, as an assertion) and `test_pasted_text_never_pauses_the_spinner`.
+
+### 11.4 `rg.blink` carries a warning, and `.None` removes it — **FIXED** in v1.0-final
 
 `rg.blink(&s, on)` emits SGR 5. WCAG 2.3.1 (Three Flashes or Below Threshold) is
 a **Level A** criterion, and blinking text is also a documented migraine and
 vestibular trigger. Nothing in the API or the documentation said so.
 
-It is worse than an ordinary attribute for one specific reason: **`Profile.None`
-does not remove it.** `$NO_COLOR` and `TERM=dumb` drop colour and nothing else
-(7.11), so a user who has set `NO_COLOR` — which is the closest thing to an
-accessibility preference this library reads — still gets the blink. `TERM=dumb`
-is the one case where something downstream saves them, and only inside `run()`:
-`render_plain` strips every escape in the frame, blink included (5.15). `NO_COLOR`
-at a capable terminal has nothing downstream of it at all.
+It used to be worse than an ordinary attribute for one specific reason:
+`Profile.None` did not remove it. `$NO_COLOR` and `TERM=dumb` drop colour and
+nothing else (7.11), so a user who had set `NO_COLOR` -- the closest thing to an
+accessibility preference this library reads -- still got the blink, with nothing
+downstream to save them except `TERM=dumb`, where `render_plain` strips every
+escape in the frame (5.15).
 
-**What to do instead:** do not use it. If you must, gate it on your own setting,
+**`build_sgr` now strips `.Blink` under `.None`** (`runegloss/render.odin`), and
+it is the *only* attribute the profile degrades. That is not an inconsistency
+with "attributes are not profile-degraded"; it is that rule applied to something
+which is not emphasis. Bold degrading to nothing costs a reader emphasis. Blink
+not degrading costs some readers the whole application. A style whose only
+attribute was blink degrades to no escape at all rather than to an empty `\e[m`
+that would still cost bytes and intern as a distinct style in `.Diff`. Pinned by
+`test_blink_is_stripped_under_the_none_profile`, which also asserts bold survives.
+
+`blink()` now carries the only warning comment in the package, saying all of the
+above at the call site.
+
+**What to do instead:** do not use it. On a capable terminal with colour enabled,
+nothing downstream will save a user from this call. If you must, gate it on your own setting,
 and note that many terminal emulators ignore SGR 5 outright, which means the
 attribute mostly costs you bytes and reaches only the subset of users whose
 terminal honours it — the subset it can harm.
@@ -2398,11 +2728,58 @@ bug because it is the document a reader is told to trust:
 | "No wrapping, no truncation, no layout joins" and "`width` is a floor" (7.1) | All of them exist, and `width` is an exact clamp that includes the border |
 | Nothing, anywhere, about the absence of a component library (8.5) | Thirteen Bubbles components do not exist here, and now the README says so on its front page |
 
-**What was not fixed, and is now written down instead:** passing `update`'s frame
-allocator to a Cmd constructor is still an undetected use-after-free (2.20); a
-non-POD Msg from a Cmd is still a no-op an application can ignore (2.24); a
-`view` that forgets to thread its allocator still leaks a frame per frame with
-only a warning on a passing test (3.15); the renderer still emits escapes under
-`TERM=dumb` (5.15); the diff fuzz corpus's resize prong does not reach the
-third-party oracle (9.4); and accessibility (11) is a whole section of gaps, none
-of which was even named before.
+**What that sweep did not fix, and wrote down instead:** passing `update`'s frame
+allocator to a Cmd constructor (2.20); a non-POD Msg from a Cmd (2.24); a `view`
+that forgets to thread its allocator (3.15); the renderer's escapes under
+`TERM=dumb` (5.15); the diff fuzz corpus's resize prong not reaching the
+third-party oracle (9.4); and accessibility (11), a whole section of gaps none of
+which had even been named before.
+
+Every one of those except 9.4 was closed by the sweep below.
+
+---
+
+## v1.0-final — closing the open items, for Linux
+
+Scoped deliberately: **Linux, and the terminals named in 5.5 and 9.2.** macOS,
+BSD and Windows are 1.1 and are not claimed. What follows was open when the
+adversarial sweep ended and is open no longer.
+
+| Was | Now | § |
+|---|---|---|
+| `run_nbio` blocked at quit until the slowest Cmd finished — press `q` against a 1 s Cmd and the prompt came back 1 s later | Both hosts bound quit at `QUIT_GRACE`, and both report `reaper_pending` | 2.6 |
+| A `Tick`/`Every` nested in `batch`/`sequence` silently gated nothing, so `sequence([a, tick(1s), b])` did not wait | Refused, with a diagnostic naming what to write instead | 2.11 |
+| The mailbox was 256, package-private, with no way to choose | `Program.mailbox_cap`, clamped at 8, still retry-forever | 2.17 |
+| A contract violation raised after the mailbox closed was dropped in silence — "fails loudly" meant "while the loop runs" | Falls back to stderr on both `.Closed` and a full retry window | 2.19, 2.24 |
+| A `view` that forgot `allocator = alloc` leaked a string per frame, and the document said nothing could detect it | Detected — by watching `context.allocator`, not the arena | 3.15 |
+| `CSI 1;33A` decoded as a plain `Up`; Kitty's Ctrl+Super+a as Ctrl+a | All eight modifier bits the wire carries | 5.7 |
+| A Kitty event with multi-codepoint text dropped the text entirely — IME and dead-key composition were unusable | Every codepoint delivered, as ordinary `.Rune` presses | 5.8 |
+| ~720 cube roots per coloured Style per `render()` | Precomputed once: **29.287 µs → 955 ns**, 30.7× | 7.9 |
+| No `RUNETEA_NO_ALT`, no reduced-motion flag — an end user had no lever at all | Three variables, two of them enforced over the application's own request | 11.2 |
+| `examples/spinner` animated forever with no way to stop it, and it is the pattern the README teaches | A pause key, the interval in the model, and starts paused under reduced motion | 11.3 |
+| `rg.blink` exported with no warning, and `Profile.None` did not remove it | `.None` strips it; the call site carries the only warning in the package | 11.4 |
+| The job-control test failed **every** gate run and passed on its own, and had been logged as "pre-existing, not mine" across several waves | The forked child owns its process group, so its stop signal cannot be discarded | 9.1a |
+
+**Two things this sweep found that nobody had raised.** `run_nbio` discarded
+`signal_watcher_start`'s return value, so a failed `pthread_create` left a program
+that looked fine and answered no `SIGINT`, no `SIGTERM` and no `SIGWINCH` for the
+rest of its life (2.6). And the job-control failure above was never a handler bug
+at all — POSIX discards a stop signal sent to an **orphaned process group**, and
+whether the group was orphaned depended entirely on how the gate had been
+invoked (9.1a).
+
+**What it cost, stated rather than buried.** Bounding `run_nbio`'s quit moved its
+mailbox and dispatcher to the heap and gave it `run()`'s allocator-lifetime
+obligation; the first suite run afterwards **SIGSEGV'd**, which is exactly the
+hazard `reaper_pending` exists to warn about, arriving in the shortest-lived
+caller there is (2.6).
+
+**What is still open, for Linux.** The `.Inline` geometry residuals (3.3, 3.8,
+3.20) and the emoji-width disagreement (4.2a) are terminal disagreements with no
+correct answer to pick, not unfinished work. Render mode is still fixed at
+construction (3.11); back-pressure is still retry-forever with no "drop me"
+(2.15); terminal replies are still consumed without being surfaced as Msgs
+(5.13), which is what blocks adaptive light/dark theming (8.1); the diff fuzz
+corpus's resize prong still does not reach the pyte oracle (9.4); there is still
+no component library (8.5); and **nothing here has ever been tested with a screen
+reader** (11.6) — which is a gap no amount of reasoning closes.

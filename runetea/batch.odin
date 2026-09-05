@@ -1,5 +1,6 @@
 package runetea
 
+import "core:fmt"
 import "base:runtime"
 import "core:mem"
 import "core:sync"
@@ -212,7 +213,63 @@ sequence :: proc(cmds: []Cmd, alloc: mem.Allocator, loc := #caller_location) -> 
 // ---------------------------------------------------------------------------
 @(private = "file")
 compose :: proc(cmds: []Cmd, kind: Compose_Kind, alloc: mem.Allocator, loc: runtime.Source_Code_Location) -> Cmd {
-	cmd_alloc_contract_check(kind == .Batch ? "batch()" : "sequence()", alloc, loc)
+	what := kind == .Batch ? "batch()" : "sequence()"
+	cmd_alloc_contract_check(what, alloc, loc)
+
+	// A NESTED Tick/Every IS REFUSED, LOUDLY, RATHER THAN SILENTLY GATING
+	// NOTHING (LIMITATIONS 2.11).
+	//
+	// WHAT IT USED TO DO. `sequence([step_a, tick(1s), step_b])` reads as "do
+	// a, wait a second, do b" and did not wait: a timer child signals `done` to
+	// the coordinator's Wait_Group the moment it is handed to the timer thread,
+	// not when it FIRES, so the sequence stepped straight past it and `step_b`
+	// ran immediately. The Tick still fired a second later and still delivered
+	// its message -- so nothing failed, nothing leaked, and the only symptom was
+	// a program whose timing was wrong. That is the worst shape a bug can have
+	// in a library whose entire discipline is that a broken contract says so.
+	//
+	// WHY REFUSE RATHER THAN IMPLEMENT IT. For a nested `Every` there is no
+	// correct semantics to implement at all: an `Every` never completes, so a
+	// composite that waited for it would never complete either, and one that did
+	// not wait is what we already had. For a nested `Tick` a meaning could be
+	// invented -- have the coordinator sleep -- but inventing one half of a pair
+	// while refusing the other would leave `batch([tick, every])` doing two
+	// different things with two constructors that look identical at the call
+	// site. Refusing both is the answer that has no surprising corner.
+	//
+	// WHAT TO DO INSTEAD is in the diagnostic, because a refusal that does not
+	// say what to write is just a different way to lose an afternoon: issue the
+	// Tick from `update`, and dispatch the next step when its message arrives.
+	// That is the same reissue-from-update pattern every animated RuneTea
+	// program already uses, and unlike a nested Tick it is cancellable -- you
+	// simply stop responding.
+	//
+	// SAME PANIC MARKER as the frame-allocator refusal, deliberately: both are
+	// contract violations that will recur identically on the next attempt, so
+	// both must end the session through apply_msg rather than be handed to a
+	// `case Panicked_Msg` that the canonical update switch leaves empty.
+	for c in cmds {
+		if cmd_is_nil(c) { continue }
+		if c.timer != nil {
+			// RECLAIM THE CHILDREN BEFORE PANICKING. A panic here is caught by
+			// guarded() via longjmp, which runs no defer, so anything not freed
+			// on this line is never freed: measured as 136 B of timer handle
+			// per refusal at timer.odin's timer_new, which tools/test.sh's leak
+			// audit fails the whole run on -- correctly, since a diagnostic that
+			// leaks is a diagnostic people learn to route around.
+			//
+			// compose_free_unrun is exactly the right helper: its entire job is
+			// "these children will never run, release what they hold", which is
+			// precisely the situation. The children's Cmd values in the CALLER's
+			// slice are dangling after this, which is the same orphaning the
+			// frame-allocator refusal above already accepts, and is harmless for
+			// the same reason -- the session is over either way.
+			compose_free_unrun(cmds)
+			fmt.panicf(
+				CMD_ALLOC_CONTRACT_PANIC + "%s at %v was given a tick()/every() Cmd as a child. A timer child signals completion when it is HANDED to the timer thread, not when it fires, so it gates nothing: sequence([a, tick(1s), b]) does not wait a second, and a nested every() can never complete at all. Issue the timer from update() instead and dispatch the next step when its message arrives.",
+				what, loc)
+		}
+	}
 
 	n := 0
 	only: Cmd

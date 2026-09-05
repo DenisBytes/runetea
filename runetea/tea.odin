@@ -223,6 +223,28 @@ Program :: struct($T: typeid) {
 	// experience asks for both. See term_enter_raw for why they are not coupled.
 	render_mode: Render_Mode,
 
+	// OPTIONAL. How many messages the mailbox holds, and -- because the two are
+	// the same number for the reason COALESCE_BUDGET's comment gives -- the most
+	// messages either host applies to the model before it stops and paints.
+	//
+	// ZERO MEANS MAILBOX_CAP (256), so nothing written before this field existed
+	// changes. Read ONCE, at mailbox construction; changing it mid-session does
+	// nothing. Values below MAILBOX_CAP_MIN (8) are raised to it rather than
+	// rejected: a mailbox of 1 turns every burst into a producer stall, and a
+	// mailbox of 0 does not work at all, so silently honouring either would be
+	// worse than the clamp. There is no upper clamp -- the memory is one
+	// allocation of `cap` slots, and a caller who asks for a million knows.
+	//
+	// WHEN TO RAISE IT: a program whose producers legitimately burst wider than
+	// 256 between paints -- a fast `every()` feeding an expensive `update`, or a
+	// paste on a terminal that delivers more than 256 keys per read. The cost of
+	// leaving it low is not lost messages (the back-pressure policy is
+	// retry-forever, 2.15) but latency: the producer waits.
+	//
+	// WHEN TO LOWER IT: to bound the worst-case work of one coalesced batch, on
+	// a program whose `update` is expensive and whose input can burst.
+	mailbox_cap: int,
+
 	init_cmd: Cmd,
 	quit:     bool,
 
@@ -256,10 +278,40 @@ Program :: struct($T: typeid) {
 	// itself ENDED FINE, and a caller's `if err != nil` is the wrong place to
 	// learn about an allocator-lifetime obligation -- turning a clean quit into
 	// a non-nil error would make every correct program start reporting a
-	// failure it did not have. run_nbio() never sets it: it tears the
-	// Dispatcher down synchronously (dispatcher_destroy, not dispatcher_reap)
-	// and so has nothing outstanding when it returns.
+	// failure it did not have.
+	//
+	// BOTH HOSTS SET IT. This used to end "run_nbio() never sets it: it tears
+	// the Dispatcher down synchronously (dispatcher_destroy, not
+	// dispatcher_reap) and so has nothing outstanding when it returns" -- which
+	// was true, and was the same sentence as LIMITATIONS 2.6's complaint that
+	// run_nbio's quit was unbounded. Bounding it is what gives run_nbio the same
+	// obligation to report, and this field is how it reports.
 	reaper_pending: bool,
+
+	// SET BY BOTH HOSTS ON THE WAY OUT, never read by them. How many frames
+	// left at least one allocation behind on context.allocator inside view()
+	// or cursor(), and how many blocks and (best-effort) bytes that came to.
+	//
+	// A NON-ZERO view_leak_frames MEANS THE VIEW LEAKED (docs/LIMITATIONS.md
+	// 3.15): it called something whose allocator argument defaults to
+	// context.allocator -- fmt.aprintf, strings.clone, strings.builder_make,
+	// rg.render -- without passing the `alloc` it was handed, so the frame
+	// arena never held the memory and the arena reset cannot reclaim it. The
+	// fix is always the same: pass `alloc` explicitly at every allocating call
+	// in view, in cursor, and in anything they call.
+	//
+	// READ THESE AFTER YOUR OWN term_restore(), which is the reliable way to
+	// see them: the library also prints a summary to stderr on the way out
+	// (view_leak_report), but a program on the alternate screen has its stderr
+	// painted into a buffer `\e[?1049l` discards. The fields survive that; the
+	// print may not.
+	//
+	// ONE FRAME IS NOT A LEAK REPORT -- see view_leak_report for why a lazily
+	// initialised cache inside a view is filtered out and a per-frame leak
+	// cannot be.
+	view_leak_frames: int,
+	view_leak_blocks: int,
+	view_leak_bytes:  int,
 	// Which side of each legacy C0 collision this program wants (see
 	// Legacy_Key in input.odin). The zero value is the sane default, so no
 	// existing program has to say anything. Bubble Tea does NOT expose this --
@@ -314,13 +366,48 @@ Step :: struct($T: typeid) {
 	cmd:   Cmd,
 }
 
-// The mailbox both hosts run on. Named rather than repeated as a literal in
-// two files because COALESCE_BUDGET below is defined in terms of it.
+// The DEFAULT capacity of the mailbox both hosts run on, used whenever
+// `Program.mailbox_cap` is left at its zero value. Named rather than repeated
+// as a literal in two files because the coalescing budget below is defined in terms
+// of it.
 @(private = "package")
 MAILBOX_CAP :: 256
 
-// The most messages either host will apply to the model before it stops and
-// paints. It is the mailbox's own capacity, and that number is not arbitrary:
+// The floor `Program.mailbox_cap` is clamped up to. A one-slot mailbox turns
+// every burst into a producer stall and a zero-slot one cannot be constructed
+// at all, so an application that asks for either gets this instead -- see
+// Program.mailbox_cap for why a clamp rather than an error.
+@(private = "package")
+MAILBOX_CAP_MIN :: 8
+
+// How long either host waits, at quit, for a Cmd that is still running before
+// it returns anyway and leaves a detached reaper thread to finish the teardown.
+// Package scope because BOTH hosts use it: run() always did, and run_nbio()
+// does since it stopped blocking on `dispatcher_destroy` outright. The full
+// argument for a SHORT bounded wait rather than grace=0 lives at run()'s own
+// use of it below; the argument for it being the same number in both hosts is
+// simply that "how long does quitting take" should not depend on which loop an
+// application happens to have chosen.
+@(private = "package")
+QUIT_GRACE :: 100 * time.Millisecond
+
+// Resolves Program.mailbox_cap to the number both hosts actually build the
+// mailbox with, and bound their coalescing drain by. One proc so the two hosts
+// cannot drift, and so the clamp is stated exactly once.
+@(private = "package")
+program_mailbox_cap :: proc(p: ^Program($T)) -> int {
+	if p.mailbox_cap <= 0 { return MAILBOX_CAP }
+	return max(p.mailbox_cap, MAILBOX_CAP_MIN)
+}
+
+// THE COALESCING BUDGET -- the most messages either host will apply to the
+// model before it stops and paints -- is not a constant of its own: it is
+// whatever program_mailbox_cap resolved to for this session, read into a local
+// at the top of each host's loop. This comment is where the reasoning lives,
+// because the number is the mailbox's own capacity and that identity is the
+// whole argument.
+//
+// It is the mailbox's own capacity, and that number is not arbitrary:
 // everything that was ALREADY QUEUED when a batch started is by construction
 // at most MAILBOX_CAP messages, so this budget never truncates a batch that
 // coalescing was supposed to fold into one frame. What it bounds is the other
@@ -342,8 +429,11 @@ MAILBOX_CAP :: 256
 // batch ends the moment the queue is empty, which for the single-keystroke
 // case is after exactly one message -- so the interactive path costs one extra
 // non-blocking mailbox_try_recv per frame and nothing else.
-@(private = "package")
-COALESCE_BUDGET :: MAILBOX_CAP
+//
+// (The identity holds for a caller-chosen capacity exactly as it did for the
+// constant: whatever `cap` is, no more than `cap` messages can be queued when
+// a batch starts, so the budget still never truncates a batch coalescing was
+// meant to fold. That is why it is the SAME number and not a second knob.)
 
 // Maps a finished session onto a process exit status, so that `os.exit` is one
 // call rather than a switch every program has to write (and, as every example
@@ -401,11 +491,16 @@ run :: proc(p: ^Program($T), src: ^Input_Source, out: ^strings.Builder, flush_fd
 	// docs/superpowers/cancellation-decision.md) -- so rc.disp and rc.mbox
 	// must both outlive run()'s own stack frame, which a plain `mbox: Mailbox`
 	// / `disp: Dispatcher` local could never do.
+	// Resolved ONCE here and used for both the mailbox's capacity and this
+	// host's coalescing budget -- the two are the same number by construction
+	// (see the coalescing-budget comment above Program.mailbox_cap's own).
+	mbox_cap := program_mailbox_cap(p)
+
 	rc := new(Reap_Ctx, context.allocator)
 	if rc == nil {
 		return Terminal_Error{detail = "dispatcher/mailbox allocation failed"}
 	}
-	if err := mailbox_init(&rc.mbox, MAILBOX_CAP); err != nil {
+	if err := mailbox_init(&rc.mbox, mbox_cap); err != nil {
 		free(rc, context.allocator)
 		return Terminal_Error{detail = "mailbox init failed"}
 	}
@@ -495,7 +590,12 @@ run :: proc(p: ^Program($T), src: ^Input_Source, out: ^strings.Builder, flush_fd
 	// context.allocator does not outlive this call by much -- odin test's own
 	// per-task allocator is exactly such a caller, rotated to a different
 	// test the moment THIS test's run() call returns.
-	QUIT_GRACE :: 100 * time.Millisecond
+	//
+	// (QUIT_GRACE itself is declared at package scope, above, because
+	// run_nbio() now bounds its own teardown with the SAME number -- see
+	// loop_nbio.odin. It used to be a local here, and run_nbio's teardown used
+	// to be unbounded, which is precisely what made the two hosts disagree
+	// about how long quitting takes.)
 	// The bool is RECORDED, not discarded. `defer dispatcher_reap(rc,
 	// QUIT_GRACE)` threw away the one fact a caller cannot recover any other
 	// way -- that this call is returning while a detached reaper thread still
@@ -505,6 +605,10 @@ run :: proc(p: ^Program($T), src: ^Input_Source, out: ^strings.Builder, flush_fd
 	// embedder that reclaims a scoped allocator on the next line) and for what
 	// a caller is expected to do about a `true`.
 	defer { p.reaper_pending = !dispatcher_reap(rc, QUIT_GRACE) }
+	// The view-leak summary, on the way out of every exit path this proc has
+	// (there are several, and one of them is a recovered panic). Declared here
+	// so LIFO puts it AFTER the loop and before nothing that matters.
+	defer view_leak_report(p.view_leak_frames, p.view_leak_blocks, p.view_leak_bytes)
 	defer signal_watcher_stop(&sw)
 
 	r: Renderer
@@ -529,7 +633,16 @@ run :: proc(p: ^Program($T), src: ^Input_Source, out: ^strings.Builder, flush_fd
 	if flush_fd >= 0 {
 		if w, h, ok := term_size(flush_fd); ok { initial_w, initial_h = w, h }
 	}
-	renderer_init(&r, out, initial_w, initial_h, p.render_mode)
+	// THE USER'S RENDER-MODE PREFERENCE OVERRIDES THE APPLICATION'S, and only
+	// in the direction that gives the terminal back: $RUNETEA_INLINE can force
+	// .Inline, nothing can force a viewport-owning mode on an application that
+	// did not ask for one. Resolved here rather than by mutating p.render_mode,
+	// so the Program a caller handed in is not rewritten under it and can still
+	// be inspected for what the APPLICATION wanted. See A11y_Prefs.inline_only
+	// for why this is separate from no_alt (LIMITATIONS 11.2).
+	mode := p.render_mode
+	if a11y_prefs().inline_only { mode = .Inline }
+	renderer_init(&r, out, initial_w, initial_h, mode)
 	// T3-A: .Diff allocates two cell grids on its first sized frame; the
 	// other two modes allocate nothing and this is a no-op for them. Deferred
 	// right at construction so no early return -- and there are several, on
@@ -646,7 +759,7 @@ run :: proc(p: ^Program($T), src: ^Input_Source, out: ^strings.Builder, flush_fd
 			if updated { dirty = true }
 			if e != nil { return e }
 			if p.quit { break }
-			if n + 1 >= COALESCE_BUDGET { break }
+			if n + 1 >= mbox_cap { break }
 			next, more := mailbox_try_recv(&rc.mbox)
 			if !more { break }
 			msg = next
@@ -1221,12 +1334,42 @@ guarded_render :: proc(p: ^Program($T), fa: ^Frame_Arena, r: ^Renderer, out: ^st
 	prev_frame_guard := frame_guard_arm(frame_allocator(fa))
 	defer frame_guard_disarm(prev_frame_guard)
 
+	// WATCH context.allocator ACROSS THE VIEW, and only across the view. This
+	// is the whole of the leak detector 3.15 said could not exist -- see
+	// viewleak.odin for why watching context.allocator is sound where watching
+	// the ARENA is not, and for why it counts blocks rather than bytes.
+	//
+	// SCOPED TIGHTLY TO USER CODE. The renderer below this point legitimately
+	// allocates from context.allocator (the .Diff cell grids), and the reader
+	// thread and Dispatcher do too; none of that is a view leak and none of it
+	// is inside these three lines. What IS inside them is p.view and p.cursor,
+	// which is exactly the boundary the contract is about.
+	//
+	// RESTORED UNCONDITIONALLY, including on the panic path: guarded() recovers
+	// internally and RETURNS rather than propagating, so the assignment below it
+	// always runs. A longjmp that skipped the restore would leave the rest of
+	// the loop allocating through a counter whose Program may outlive it.
+	watch := View_Leak_Watch{backing = context.allocator}
+	real_allocator := context.allocator
+	context.allocator = view_leak_watch_allocator(&watch)
+
 	vs := View_Step(T){p = p, alloc = frame_allocator(fa)}
 	info := guarded(proc(ud: rawptr) {
 		s := cast(^View_Step(T))ud
 		s.view = s.p.view(s.p.model, s.alloc)
 		if s.p.cursor != nil { s.cur = s.p.cursor(s.p.model, s.alloc) }
 	}, &vs)
+
+	context.allocator = real_allocator
+	// A frame that left blocks behind on context.allocator leaked them: the
+	// arena reset that follows cannot reclaim what the arena never held.
+	// Counted, not acted on -- see view_leak_report for what is done with it
+	// and why nothing is done for a single frame.
+	if watch.blocks > 0 {
+		p.view_leak_frames += 1
+		p.view_leak_blocks += watch.blocks
+		p.view_leak_bytes  += watch.bytes
+	}
 
 	if info.recovered {
 		// longjmp ran no defers: reclaim whatever the failed view() call

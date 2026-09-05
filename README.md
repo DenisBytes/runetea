@@ -8,7 +8,7 @@
 <p align="center">
   <a href="https://github.com/DenisBytes/runetea/blob/main/LICENSE"><img alt="MIT licence" src="https://img.shields.io/badge/licence-MIT-blue.svg"></a>
   <a href="https://odin-lang.org"><img alt="Odin dev-2026-07" src="https://img.shields.io/badge/Odin-dev--2026--07-6699cc.svg"></a>
-  <img alt="513 tests" src="https://img.shields.io/badge/tests-513%20passing-brightgreen.svg">
+  <img alt="531 tests" src="https://img.shields.io/badge/tests-531%20passing-brightgreen.svg">
   <img alt="Linux verified" src="https://img.shields.io/badge/Linux-verified-brightgreen.svg">
   <img alt="macOS and BSD unverified" src="https://img.shields.io/badge/macOS%20%7C%20BSD-unverified-orange.svg">
   <a href="docs/API.md"><img alt="API docs" src="https://img.shields.io/badge/docs-API-informational.svg"></a>
@@ -451,11 +451,13 @@ Keys pressed: 4
 <br>
 
 ```text
-⠼ Loading forever... press 'q' to quit
+⠼ Loading... 'p' pauses, 'q' quits
 ```
 
 One frame of ten; the capture caught it mid-cycle. Braille frames advanced by a
-`tick` reissued from `update` on every fire — the same pattern Bubble Tea's
+`tick` reissued from `update` on every fire, and stoppable with `p` or space —
+WCAG 2.2.2 asks that automatically-moving content be pausable, and
+`$RUNETEA_REDUCE_MOTION` makes this one start paused — the same pattern Bubble Tea's
 `bubbles/spinner` uses, and the reason `tick` hands back no handle to leak.
 (There is no RuneTea equivalent of `bubbles/spinner`, or of any other Bubble —
 see [What you get](#what-you-get). Note also that this animates at 10 Hz for as
@@ -667,13 +669,25 @@ BSD; `.Diff` and full-screen truncation both depend on it. **If you run RuneTea
 on either, a bug report — or a green test run — is the single most valuable
 contribution available right now.**
 
-**Accessibility has not been designed for, and one default works against it.**
-`$NO_COLOR` is honoured and `rg.contrast_ratio` exists, but the alternate screen
-plus `.Diff` — the combination `examples/editor` uses and the one this README
-recommends for full-screen apps — puts nothing in scrollback, which is where a
-screen reader's review mode, the terminal's own search, and copy-out all look.
-RuneTea ships no `--no-alt` lever for a user who needs one; if your users might,
-make `alt` and `render_mode` settings rather than constants.
+**Accessibility: the user has levers now, and one default still works against
+them.** The alternate screen plus `.Diff` — the combination `examples/editor`
+uses and the one this README recommends for full-screen apps — puts nothing in
+scrollback, which is where a screen reader's review mode, the terminal's own
+search, and copy-out all look. So RuneTea reads three environment variables on
+your behalf, and **you do not have to do anything for the first two to work**:
+
+| Variable | Effect | Enforced |
+|---|---|---|
+| `RUNETEA_NO_ALT` | never enter the alternate screen | **yes**, over the application's own request |
+| `RUNETEA_INLINE` | force `Render_Mode.Inline` | **yes** |
+| `RUNETEA_REDUCE_MOTION` | `rt.reduce_motion()` returns true | advisory — `examples/spinner` starts paused |
+
+They can only take a terminal mode *away*, never grant one. `$NO_COLOR` is
+honoured, now strips `rg.blink` (WCAG 2.3.1 is Level A), and `rg.contrast_ratio`
+exists. If your application has its own `--no-alt` flag, route it through
+`rt.set_a11y_prefs` rather than inventing a parallel lever only you honour.
+
+What none of that fixes: **nothing here has ever been run with a screen reader.**
 [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) section 11 is the full, honest list.
 
 ## Limitations
@@ -694,7 +708,7 @@ pointing at a line that has moved is a build failure.
 | **2.5** | Cancellation is polling, never preemption. |
 | **2.19** | A `Cmd` value is single-use; re-dispatching one is refused. |
 | **3.2** | What a `.Diff` view may and may not contain. |
-| **3.15** | `view` gets an allocator it must hand-thread; forget and you leak a frame. |
+| **3.15** | `view` gets an allocator it must hand-thread; forget and you leak a frame — detected and reported since v1.0-final, but still yours to fix. |
 | **5.5** | No terminfo consultation — measured against 40 installed entries. |
 | **6.5** | Bounds violations and nil derefs are *not* recoverable. |
 | **6.6** | A recovered `update` panic leaves your model half-mutated. |
@@ -704,13 +718,13 @@ pointing at a line that has moved is a build failure.
 ## Tests and gates
 
 ```console
-$ ./tools/test.sh          # 513 tests, seven packages, + leak audit + doc gate + pyte
+$ ./tools/test.sh          # 531 tests, seven packages, + leak audit + doc gate + pyte
 $ ./tools/test.sh race     # the real race gate: ThreadSanitizer over tools/racecheck
 $ ./tools/difftest/run.sh  # the diff renderer cross-checked against pyte, on its own
 ```
 
-513 is `runetea` 392 + `examples/editor/edit` 41 + `runegloss` 66 +
-`examples/{quickstart,simple,spinner,http}` 3 + 3 + 4 + 4. The four single-file
+531 is `runetea` 404 + `examples/editor/edit` 41 + `runegloss` 69 +
+`examples/{quickstart,simple,spinner,http}` 3 + 3 + 7 + 4. The four single-file
 examples joined the gate last: `odin test` works on a `package main` (the
 generated runner supplies its own entry point), and until they were on it the
 only thing checking them was a build — which is how four minimum-size guards

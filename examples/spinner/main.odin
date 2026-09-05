@@ -23,8 +23,18 @@ FRAME_INTERVAL :: 100 * time.Millisecond
 // The hint, and the width it needs: one column of spinner, one space, and the
 // hint itself. A named constant so view()'s guard cannot drift from the string
 // it is guarding.
-HINT      :: "Loading forever... press 'q' to quit"
-HINT_COLS :: 2 + len(HINT)
+// TWO hints, because the program now has two states and a hint that lies about
+// which one you are in is worse than no hint. WCAG 2.2.2 (Pause, Stop, Hide)
+// asks that automatically-moving content lasting more than five seconds be
+// pausable; a control nobody can find is not one, so the key is named on screen
+// in both states rather than documented in a README.
+//
+// HINT_COLS is measured from the LONGER of the two, so view()'s width guard
+// cannot pass in one state and wrap in the other -- under .Inline a frame that
+// wraps costs a physical row the rewind does not know about.
+HINT       :: "Loading... 'p' pauses, 'q' quits"
+HINT_PAUSE :: "Paused.    'p' resumes, 'q' quits"
+HINT_COLS  :: 2 + max(len(HINT), len(HINT_PAUSE))
 
 // Go: `type spinTickMsg time.Time` -- a closure-friendly single-field wrapper.
 // RuneTea: time.Tick, per spec §9 (CLOCK_MONOTONIC_RAW, not CLOCK_REALTIME --
@@ -49,8 +59,13 @@ spin_tick_fn :: proc(env: rawptr, t: time.Tick) -> any {
 // two-line proc, called ~12 times a second for the whole session, allocation-
 // neutral -- see timer.odin's own comment on tick() for what it looked like
 // when it wasn't.
-spin_tick_cmd :: proc() -> rt.Cmd {
-	return rt.tick(FRAME_INTERVAL, spin_tick_fn, struct{}{}, context.allocator)
+// THE INTERVAL IS A PARAMETER, NOT A CONSTANT, and that is the shape
+// docs/LIMITATIONS.md 11.3 asks an animated program to have: an app that hard-
+// codes its frame interval has no way to offer a slower one, and "slow it down"
+// is the accommodation most people actually want when "stop it" is too much.
+// Model.interval is what is passed here, seeded from rt.reduce_motion().
+spin_tick_cmd :: proc(interval: time.Duration) -> rt.Cmd {
+	return rt.tick(interval, spin_tick_fn, struct{}{}, context.allocator)
 }
 
 // THE STYLES LIVE IN THE MODEL, and that is the point of writing them here
@@ -86,6 +101,18 @@ Model :: struct {
 	// one-row terminal puts this program into, and a resize back up is the
 	// only thing that clears it.
 	animating: bool,
+
+	// PAUSED BY THE USER, which is a different fact from `animating` and must
+	// not share a field with it. `animating` is the animation's own invariant
+	// -- "exactly one Tick is outstanding" -- and the height guard clears it
+	// for a reason the user did not choose. If the two were one flag, a resize
+	// would silently restart an animation the user had deliberately stopped,
+	// which is the specific way a Pause control usually breaks.
+	paused: bool,
+
+	// The frame interval, in the model rather than in a constant, so it can be
+	// slowed without an edit. See spin_tick_cmd.
+	interval: time.Duration,
 }
 
 // THE MINIMUM HEIGHT IS TWO ROWS FOR A ONE-ROW VIEW, and the extra row is not
@@ -130,9 +157,11 @@ update :: proc(m: ^Model, msg: any, alloc: mem.Allocator) -> rt.Cmd {
 		// ONE Tick: the animation's invariant is one Spin_Tick_Msg outstanding
 		// at a time (each firing reissues its own successor), so an unguarded
 		// restart here would double the frame rate on every SIGWINCH.
-		if !m.animating && m.term_h >= MIN_ROWS {
+		// `!m.paused` is the new half: a resize must not restart an animation
+		// the USER stopped, only one the height guard stopped.
+		if !m.animating && !m.paused && m.term_h >= MIN_ROWS {
 			m.animating = true
-			return spin_tick_cmd()
+			return spin_tick_cmd(m.interval)
 		}
 	case rt.Key_Msg:
 		// PASTED TEXT IS NOT KEYSTROKES (F37). main enables bracketed paste, so
@@ -143,6 +172,31 @@ update :: proc(m: ^Model, msg: any, alloc: mem.Allocator) -> rt.Cmd {
 			return rt.quit_cmd()
 		}
 		if v.code == .Escape { return rt.quit_cmd() }
+		// THE PAUSE CONTROL (WCAG 2.2.2). Space is bound alongside 'p' because
+		// it is what a media control is expected to be, and 'p' because space
+		// is easy to hit by accident; both are cheap.
+		//
+		// PAUSING IS FREE AND LEAKS NOTHING: rt.tick hands back no handle
+		// precisely so that not reissuing it is the whole of stopping. There is
+		// no timer to cancel, no handle to get wrong, and nothing outstanding
+		// once the last Tick has fired.
+		if v.code == .Rune && (v.r == 'p' || v.r == ' ') {
+			m.paused = !m.paused
+			if m.paused {
+				// Do NOT clear m.animating here. The Tick that is already in
+				// flight will still arrive; the Spin_Tick_Msg branch below is
+				// what declines to reissue it, and it is also what sets
+				// animating = false, so the "exactly one outstanding" invariant
+				// is maintained in one place rather than two.
+				return rt.cmd_nil()
+			}
+			// Resuming issues exactly one Tick, and only if the height guard
+			// is not independently holding the animation down.
+			if !m.animating && (m.term_h == 0 || m.term_h >= MIN_ROWS) {
+				m.animating = true
+				return spin_tick_cmd(m.interval)
+			}
+		}
 	case Spin_Tick_Msg:
 		// F47's height half. Stop reissuing rather than animate into a window
 		// that provably shows nothing (MIN_ROWS). Checked HERE and not in
@@ -157,8 +211,16 @@ update :: proc(m: ^Model, msg: any, alloc: mem.Allocator) -> rt.Cmd {
 			m.animating = false
 			return rt.cmd_nil()
 		}
+		// The user asked it to stop. Same shape as the height guard directly
+		// above, and deliberately so: both are "stop reissuing", and the frame
+		// counter is NOT advanced on the way out either, so resuming picks the
+		// glyph up where it stopped instead of jumping.
+		if m.paused {
+			m.animating = false
+			return rt.cmd_nil()
+		}
 		m.frame = (m.frame + 1) % len(FRAMES)
-		return spin_tick_cmd() // reissue -- see spin_tick_cmd's own comment
+		return spin_tick_cmd(m.interval) // reissue -- see spin_tick_cmd's own comment
 	}
 	return rt.cmd_nil()
 }
@@ -194,9 +256,14 @@ view :: proc(m: Model, alloc: mem.Allocator) -> string {
 	if m.term_w > 0 && m.term_w < HINT_COLS {
 		return fmt.aprintf("%s\n", rg.render(m.spin, glyph, alloc), allocator = alloc)
 	}
+	// The hint names the control AND reports the state, so "is it paused or is
+	// it just slow?" is answerable from the screen. Colour is not carrying that
+	// distinction -- the words are (LIMITATIONS 11.5: never carry meaning in
+	// colour alone).
+	hint := HINT_PAUSE if m.paused else HINT
 	return fmt.aprintf("%s %s\n",
 		rg.render(m.spin, glyph, alloc),
-		rg.render(m.hint, HINT, alloc),
+		rg.render(m.hint, hint, alloc),
 		allocator = alloc)
 }
 
@@ -255,7 +322,7 @@ main :: proc() {
 	// $NO_COLOR it really does come out as the bare glyph. m.hint is
 	// rg.faint(), which is SGR 2 -- an attribute, not a colour -- and it
 	// survives. Captured on a real pty with NO_COLOR=1 set, every frame:
-	//     ⠋ \e[2mLoading forever... press 'q' to quit\e[0m
+	//     ⠋ \e[2mLoading... 'p' pauses, 'q' quits\e[0m
 	// That is 8 bytes of SGR per frame, ~10 times a second, on a terminal that
 	// was asked for no styling. It is the documented behaviour rather than a
 	// bug -- an app that wants genuinely plain text must not set attributes --
@@ -277,7 +344,27 @@ main :: proc() {
 	// so a Model that said false here would let the very first
 	// Window_Size_Msg issue a second one and double the frame rate.
 	m.animating = true
-	rt.program_init(&p, m, update, view, spin_tick_cmd())
+
+	// THE USER'S MOTION PREFERENCE, honoured before the first frame rather than
+	// after it. $RUNETEA_REDUCE_MOTION is advisory -- rt cannot know what less
+	// motion means for a given animation (see rt.A11y_Prefs) -- so this program
+	// decides, and it decides the strongest reading: START PAUSED, at a quarter
+	// of the frame rate if resumed. Nothing moves until the user asks it to,
+	// which is what WCAG 2.2.2 is actually about, and the hint on screen tells
+	// them the key.
+	//
+	// NOTE that the init Cmd is issued either way. It fires once, the
+	// Spin_Tick_Msg branch sees m.paused and declines to reissue, and the
+	// program settles at frame 1 having moved exactly one step. Suppressing the
+	// init Cmd instead would leave the program with NOTHING outstanding and no
+	// first paint until a keypress, which is worse.
+	m.interval = FRAME_INTERVAL
+	if rt.reduce_motion() {
+		m.paused   = true
+		m.interval = 4 * FRAME_INTERVAL
+	}
+
+	rt.program_init(&p, m, update, view, spin_tick_cmd(m.interval))
 	// A Window_Size_Msg only ever arrives on a SIGWINCH, so without this seed a
 	// program that is never resized would never learn its own size.
 	if w, h, ok := rt.term_size(fd); ok { p.model.term_w, p.model.term_h = w, h }

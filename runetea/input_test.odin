@@ -342,10 +342,17 @@ key_cases := [?]Key_Case{
 	// (Meta in xterm) and bit 32 is Meta in Kitty (nothing in xterm). Decode
 	// these with xterm_mods and both lines below flip: ;9u would gain .Meta
 	// and ;33u would lose it. That is the non-vacuity lever for kitty_mods.
-	{"\e[97;9u",  {{code = .Rune, r = 'a'}, {}}, 1, 0},            // Super: no member, dropped
+	//
+	// All four used to drop their modifier for want of a member to put it in
+	// (LIMITATIONS 5.7); Modifiers now has all eight of the wire's bits.
+	{"\e[97;9u",  {{code = .Rune, r = 'a', mods = {.Super}}, {}}, 1, 0},
+	{"\e[97;17u", {{code = .Rune, r = 'a', mods = {.Hyper}}, {}}, 1, 0},
 	{"\e[97;33u", {{code = .Rune, r = 'a', mods = {.Meta}}, {}}, 1, 0},
-	{"\e[97;65u", {{code = .Rune, r = 'a'}, {}}, 1, 0},            // CapsLock: dropped
-	{"\e[97;129u",{{code = .Rune, r = 'a'}, {}}, 1, 0},            // NumLock: dropped
+	{"\e[97;65u", {{code = .Rune, r = 'a', mods = {.Caps_Lock}}, {}}, 1, 0},
+	{"\e[97;129u",{{code = .Rune, r = 'a', mods = {.Num_Lock}}, {}}, 1, 0},
+	// Ctrl+Super+a -- the exact combination 5.7 named as decoding to a plain
+	// Ctrl+a. Mask 4|8 = 12, so the parameter is 13.
+	{"\e[97;13u", {{code = .Rune, r = 'a', mods = {.Ctrl, .Super}}, {}}, 1, 0},
 
 	// Event types (the ':' sub-parameter on the modifier field).
 	{"\e[97;1:1u", {{kind = .Press,   code = .Rune, r = 'a'}, {}}, 1, 0},
@@ -383,10 +390,11 @@ key_cases := [?]Key_Case{
 	// Text-as-codepoints, the third field. One codepoint populates `r`.
 	{"\e[97;;98u",   {{code = .Rune, r = 'b'}, {}}, 1, 0},
 	{"\e[97;1:1;98u",{{code = .Rune, r = 'b'}, {}}, 1, 0},
-	// ...several do not: Key_Msg.r is ONE rune and there is nowhere to put the
-	// rest, so the text field is ignored wholesale and `r` falls back to the
-	// key code. Documented in kitty_decode; deliberately not a silent truncation.
-	{"\e[97;;98:99u", {{code = .Rune, r = 'a'}, {}}, 1, 0},
+	// ...and several become several keys (LIMITATIONS 5.8). This used to assert
+	// one key with r = 'a' -- the text field discarded whole and `r` falling
+	// back to the key code -- which is what made IME and dead-key composition
+	// unusable. See test_kitty_associated_text_emits_every_codepoint.
+	{"\e[97;;98:99u", {{code = .Rune, r = 'b'}, {code = .Rune, r = 'c'}}, 2, 0},
 
 	// -- T1-L: bracketed paste -------------------------------------------
 	//
@@ -1063,11 +1071,15 @@ test_kitty_parameter_edges :: proc(t: ^testing.T) {
 		// Surrogates and out-of-range codepoints are not scalar values.
 		{"\e[55296u", 0, {}},
 		{"\e[1114112u", 0, {}},
-		// More sub-parameters than Kitty_Params can store. The count still has
-		// to be right -- that is what tells a one-codepoint text field from a
-		// multi-codepoint one -- even though the values past the third are
-		// dropped on the floor.
-		{"\e[97;;98:99:100:101u", 1, {code = .Rune, r = 'a'}},
+		// A FOUR-CODEPOINT ASSOCIATED-TEXT FIELD, emitted as four keys
+		// (LIMITATIONS 5.8). This case used to assert 1 key with r = 'a' -- the
+		// whole text field discarded and `r` falling back to the key code --
+		// because Key_Msg.r is one rune and there was nowhere to put the rest.
+		// The tail is delivered as ordinary .Rune presses instead; see
+		// kitty_decode's field-2 comment for why that beats a multi-rune field.
+		// Only out[0] is value-checked by this harness; the per-codepoint
+		// assertion is test_kitty_associated_text_emits_every_codepoint below.
+		{"\e[97;;98:99:100:101u", 4, {code = .Rune, r = 'b'}},
 		{"\e[97:65:97:98;2u",     1, {code = .Rune, r = 'A', mods = {.Shift}}},
 		// Non-ASCII text keys survive intact.
 		{"\e[233u", 1, {code = .Rune, r = 'é'}},
@@ -1078,7 +1090,10 @@ test_kitty_parameter_edges :: proc(t: ^testing.T) {
 		testing.expectf(t, n == len(c.seq), "%q: consumed %d, want %d", c.seq, n, len(c.seq))
 		if !testing.expectf(t, len(out) == c.nwant, "%q: emitted %d keys, want %d (%v)",
 			c.seq, len(out), c.nwant, out[:]) { continue }
-		if c.nwant == 1 {
+		// out[0] is checked for every case that emitted anything -- it used to
+		// be checked only when exactly one key came out, which meant a case
+		// asserting a multi-key result verified nothing but the count.
+		if c.nwant >= 1 {
 			testing.expectf(t, out[0] == c.want, "%q: got %v, want %v", c.seq, out[0], c.want)
 		}
 	}
@@ -1086,9 +1101,14 @@ test_kitty_parameter_edges :: proc(t: ^testing.T) {
 
 // A modifier parameter out of range must not be forced into a modifier set:
 // the sequence is complete, so it is consumed, but nothing is emitted.
-// Bits above 8 are masked off rather than mis-reported: this is the LEGACY
-// xterm parameter, whose defined bits stop at 8 (Meta), so CSI 1;33A is Up
-// with some modifier xterm never named and decodes as plain Up.
+//
+// BITS ABOVE 8 ARE NO LONGER MASKED OFF (LIMITATIONS 5.7). They used to be, and
+// this test used to assert it: CSI 1;33A came back as a plain, unmodified Up.
+// xterm's own table stops at bit 8, so a terminal that sets bit 32 in this
+// sequence shape is speaking Kitty's table, where 32 is Meta -- and since no
+// xterm-table terminal can ever set it, decoding it cannot mis-name anything.
+// See xterm_mods for the bit-by-bit argument and for the one bit (8) where it
+// does not hold.
 //
 // (The comment here used to call bit 32 "Kitty's CapsLock". That was wrong on
 // both counts -- Kitty's CapsLock is bit 64, its bit 32 is Meta -- and this is
@@ -1110,12 +1130,27 @@ test_modifier_edges :: proc(t: ^testing.T) {
 	testing.expect_value(t, n, 6)
 	testing.expect_value(t, len(out), 0)
 
-	// A bit xterm never defined, masked off rather than mis-reported.
+	// A bit xterm never defined, and therefore one only a Kitty-table terminal
+	// can have set: decoded as Meta rather than thrown away.
 	clear(&out)
 	n = decode_keys(transmute([]u8)string("\e[1;33A"), &out)
 	testing.expect_value(t, n, 7)
 	testing.expect_value(t, len(out), 1)
-	testing.expect_value(t, out[0], Key_Msg{code = .Up})
+	testing.expect_value(t, out[0], Key_Msg{code = .Up, mods = {.Meta}})
+
+	// Bit 8 is the ambiguous one and keeps xterm's meaning -- see xterm_mods.
+	// Pinned so that a future change to that resolution has to be deliberate.
+	clear(&out)
+	n = decode_keys(transmute([]u8)string("\e[1;9A"), &out)
+	testing.expect_value(t, len(out), 1)
+	testing.expect_value(t, out[0], Key_Msg{code = .Up, mods = {.Meta}})
+
+	// The lock states ride along with whatever else is set: Ctrl+Up with Caps
+	// Lock latched is mask 4|64 = 68, so the parameter is 69.
+	clear(&out)
+	n = decode_keys(transmute([]u8)string("\e[1;69A"), &out)
+	testing.expect_value(t, len(out), 1)
+	testing.expect_value(t, out[0], Key_Msg{code = .Up, mods = {.Ctrl, .Caps_Lock}})
 
 	// A non-1 first parameter on a letter-final CSI is not a key we know.
 	clear(&out)
@@ -2385,4 +2420,53 @@ test_modify_other_keys_reports_decode :: proc(t: ^testing.T) {
 		testing.expectf(t, n == len(seq), "%q: consumed %d, want %d", seq, n, len(seq))
 		testing.expectf(t, len(out) == 0, "%q: emitted %d keys, want 0 (%v)", seq, len(out), out[:])
 	}
+}
+
+// ============================================================================
+// LIMITATIONS 5.8: a Kitty event with more than one associated codepoint used
+// to drop its text entirely.
+//
+// `\e[97;;233:769u` is what a terminal sends when a dead-key or IME sequence
+// commits two codepoints against the physical `a` key. The old decoder tested
+// `nsub[2] == 1`, failed, ignored the whole field and reported `r = 'a'` -- so
+// the user typed one thing and the application received another. The tail is
+// now emitted as ordinary .Rune presses, which is what makes an application
+// written against `case .Rune:` handle composition with no edit at all.
+// ============================================================================
+@(test)
+test_kitty_associated_text_emits_every_codepoint :: proc(t: ^testing.T) {
+	out := make([dynamic]Key_Msg); defer delete(out)
+
+	// Two codepoints: 'é' (U+00E9) then a combining acute (U+0301).
+	n := decode_keys(transmute([]u8)string("\e[97;;233:769u"), &out)
+	testing.expect_value(t, n, 14)
+	if !testing.expectf(t, len(out) == 2, "want 2 keys, got %d: %v", len(out), out[:]) { return }
+
+	// The FIRST key keeps the full key semantics, so an existing binding on it
+	// still matches; only `r` is replaced by the text's first codepoint.
+	testing.expect_value(t, out[0], Key_Msg{code = .Rune, r = 'é'})
+	// The tail is bare TEXT: no modifiers, no kind, not marked pasted.
+	testing.expect_value(t, out[1], Key_Msg{code = .Rune, r = '́'})
+
+	// Modifiers ride on the first key only. Ctrl (mask 4, param 5) + two
+	// codepoints of text.
+	clear(&out)
+	n = decode_keys(transmute([]u8)string("\e[97;5;98:99u"), &out)
+	if !testing.expectf(t, len(out) == 2, "want 2 keys, got %d: %v", len(out), out[:]) { return }
+	testing.expect_value(t, out[0], Key_Msg{code = .Rune, r = 'b', mods = {.Ctrl}})
+	testing.expect_value(t, out[1], Key_Msg{code = .Rune, r = 'c'})
+
+	// A NON-SCALAR CODEPOINT IN THE TAIL STOPS IT rather than being emitted as
+	// a garbage rune: 0xD800 is a UTF-16 surrogate. The first codepoint still
+	// arrives, because it was already validated for `r`.
+	clear(&out)
+	n = decode_keys(transmute([]u8)string("\e[97;;98:55296:99u"), &out)
+	testing.expectf(t, len(out) == 1, "a surrogate must truncate the tail, got %v", out[:])
+
+	// The single-codepoint case is unchanged -- this is the regression guard
+	// for the overwhelmingly common path.
+	clear(&out)
+	n = decode_keys(transmute([]u8)string("\e[97;;98u"), &out)
+	testing.expect_value(t, len(out), 1)
+	testing.expect_value(t, out[0], Key_Msg{code = .Rune, r = 'b'})
 }

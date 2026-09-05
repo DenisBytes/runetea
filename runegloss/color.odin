@@ -1,5 +1,6 @@
 package runegloss
 
+import "base:runtime"
 import "core:math"
 import "core:os"
 import "core:strings"
@@ -264,7 +265,7 @@ CUBE_LEVELS := [6]u8{0, 95, 135, 175, 215, 255}
 // cube in strict r,g,b major order, 232-255 is the 24-step grey ramp at
 // 8 + 10*i. A 256-row table would be 768 hand-typed bytes with 768 chances to
 // contain a typo that no test would ever catch.
-@(private = "file")
+@(private)
 palette_rgb :: proc(idx: u8) -> (r, g, b: u8) {
 	if idx < 16 {
 		c := BASE16[idx]
@@ -337,7 +338,13 @@ convert :: proc(c: Color, p: Profile) -> Color {
 @(private = "file")
 Lab :: [3]f64
 
-@(private = "file")
+// WIDENED FROM `private = "file"` TO PACKAGE-PRIVATE so color_test.odin can
+// reach it. The reason is specific rather than convenience: the risk the
+// g_palette_lab cache introduces is not speed but AGREEMENT, and the only
+// test that can prove agreement is one that computes the same value both
+// ways. `@(private)` still keeps it out of `odin doc`, so the public surface
+// README.md points a newcomer at is unchanged.
+@(private)
 to_lab :: proc(r8, g8, b8: u8) -> Lab {
 	r := srgb_linear(r8)
 	g := srgb_linear(g8)
@@ -373,7 +380,13 @@ lab_f :: proc(t: f64) -> f64 {
 	return (841.0 / 108.0) * t + 4.0 / 29.0
 }
 
-@(private = "file")
+// WIDENED FROM `private = "file"` TO PACKAGE-PRIVATE so color_test.odin can
+// reach it. The reason is specific rather than convenience: the risk the
+// g_palette_lab cache introduces is not speed but AGREEMENT, and the only
+// test that can prove agreement is one that computes the same value both
+// ways. `@(private)` still keeps it out of `odin doc`, so the public surface
+// README.md points a newcomer at is unchanged.
+@(private)
 lab_dist2 :: proc(a, b: Lab) -> f64 {
 	dl := a[0] - b[0]
 	da := a[1] - b[1]
@@ -387,13 +400,67 @@ lab_dist2 :: proc(a, b: Lab) -> f64 {
 // a different colour on two terminals that both claim 256-colour support. The
 // cube and the ramp are fixed by the palette specification, so the answer is
 // theme-independent. termenv makes the same choice for the same reason.
+
+// THE PALETTE'S LAB VALUES, COMPUTED ONCE FOR THE PROCESS.
+//
+// This table is what closes LIMITATIONS 7.9. nearest_256 used to call to_lab on
+// every one of the 240 palette entries on every call -- and to_lab is three cube
+// roots, so a single down-converted colour cost ~720 of them, per coloured Style,
+// per render(). nearest_16's twin check paid the same tax twice over on its own
+// 16. The palette is a compile-time constant and to_lab is a pure function of it,
+// so every one of those cube roots computed exactly the same number it had
+// computed on the previous frame.
+//
+// MEASURED, -o:speed, 20,000 renders of one #7D56F4 Style at Profile.ANSI256:
+// 29.287 us per render before, 955 ns after -- 30.7x, and 585 ms of the
+// benchmark's 605 ms was this. At 60 fps that is the difference between 1.8 ms
+// and 57 us of every frame's budget spent re-deriving a constant. It matters
+// most exactly where it is least affordable: a .Diff repaint converts every
+// distinct style it interns.
+//
+// AN @(init) PROC RATHER THAN A LAZY FLAG, deliberately. A `if !known { fill }`
+// guard inside nearest_256 would be a data race the moment two threads
+// down-converted at once -- benign in the sense that both would write identical
+// values, but a race ThreadSanitizer would report and a reader would have to
+// re-derive the harmlessness of every time. @(init) runs before main (and before
+// the test runner), single-threaded, so the table is simply already there. It
+// costs 256 to_lab calls at startup, once, and it depends on nothing but
+// palette_rgb, which is a pure function of a constant.
+//
+// 256 ENTRIES, NOT 240: entries 0-15 are indexed by nearest_16's own loop below,
+// and one table indexed by the same numbers the rest of this file uses beats two
+// tables with an offset to remember.
+@(private)
+g_palette_lab: [256][3]f64
+
+// `contextless` is required of every @(init) proc by the toolchain, and costs
+// nothing here: this fills a table from a constant and touches no allocator.
+@(init)
 @(private = "file")
+init_palette_lab :: proc "contextless" () {
+	// to_lab is an ordinary (context-carrying) proc, and an @(init) proc must be
+	// contextless, so one is established here. Nothing below allocates, so the
+	// default context's allocator is never reached -- this only satisfies the
+	// calling convention.
+	context = runtime.default_context()
+	for i in 0 ..< 256 {
+		r, g, b := palette_rgb(u8(i))
+		g_palette_lab[i] = to_lab(r, g, b)
+	}
+}
+
+// WIDENED FROM `private = "file"` TO PACKAGE-PRIVATE so color_test.odin can
+// reach it. The reason is specific rather than convenience: the risk the
+// g_palette_lab cache introduces is not speed but AGREEMENT, and the only
+// test that can prove agreement is one that computes the same value both
+// ways. `@(private)` still keeps it out of `odin doc`, so the public surface
+// README.md points a newcomer at is unchanged.
+@(private)
 nearest_256 :: proc(r, g, b: u8) -> int {
 	target := to_lab(r, g, b)
 	best, best_d := 16, max(f64)
 	for i in 16 ..= 255 {
-		pr, pg, pb := palette_rgb(u8(i))
-		if d := lab_dist2(target, to_lab(pr, pg, pb)); d < best_d {
+		if d := lab_dist2(target, g_palette_lab[i]); d < best_d {
 			best, best_d = i, d
 		}
 	}
@@ -453,17 +520,19 @@ nearest_256 :: proc(r, g, b: u8) -> int {
 nearest_16 :: proc(r, g, b: u8) -> int {
 	target := to_lab(r, g, b)
 
+	// g_palette_lab[0..15] IS to_lab(BASE16[0..15]) -- palette_rgb returns
+	// BASE16 verbatim below 16 -- so the same precomputed table serves both
+	// searches and there is no second one to keep in step. See its comment for
+	// what this replaced (LIMITATIONS 7.9).
 	best, best_d := 0, max(f64)
 	for i in 0 ..< 16 {
-		c := BASE16[i]
-		if d := lab_dist2(target, to_lab(c[0], c[1], c[2])); d < best_d {
+		if d := lab_dist2(target, g_palette_lab[i]); d < best_d {
 			best, best_d = i, d
 		}
 	}
 
 	twin := best ~ 8
-	wc, tc := BASE16[best], BASE16[twin]
-	if abs(to_lab(tc[0], tc[1], tc[2])[0] - target[0]) < abs(to_lab(wc[0], wc[1], wc[2])[0] - target[0]) {
+	if abs(g_palette_lab[twin][0] - target[0]) < abs(g_palette_lab[best][0] - target[0]) {
 		return twin
 	}
 	return best

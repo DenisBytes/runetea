@@ -272,6 +272,31 @@ test_run_nbio_coalesces_a_burst_into_one_frame :: proc(t: ^testing.T) {
 // Nbio_Overflow_Harness is: a regression has to FAIL this test within seconds,
 // not wedge the whole suite.
 // ============================================================================
+// HOW LONG TO WAIT FOR A DETACHED REAPER, and why this is 750 ms rather than the
+// 150 ms tea_test.odin's slow-Cmd tests use.
+//
+// `slow_done` is posted from INSIDE the Cmd body, just before it returns. What
+// still has to happen after that is the pool worker delivering and signalling,
+// the reaper's thread.pool_finish joining four workers, the timer service
+// stopping, mailbox_destroy, free(rc), and finally grace_signal_release freeing
+// the Grace_Signal -- all through this task's Tracking_Allocator, which odin
+// test snapshots the moment the test proc returns.
+//
+// MEASURED: normally single-digit milliseconds, so 150 ms looks like ample
+// headroom, and is, on an idle machine. It is not on a loaded one. Running two
+// full gates concurrently produced exactly one unexplained
+// `+++ leak 16B @ cmd.odin:dispatcher_reap()` and failed the leak audit -- the
+// Grace_Signal, not leaked at all, just not yet freed when the snapshot was
+// taken. CI is a loaded machine by definition, so the margin is sized for one.
+//
+// This is a WAIT, not a synchronisation point, and nothing here can make it one:
+// the reaper is detached precisely so that no caller has to wait for it, so there
+// is no handle to join and nothing to poll. 750 ms is roughly 100x the observed
+// teardown, which is the right shape of answer for "how long until a thing that
+// normally takes 7 ms has certainly finished".
+@(private = "file")
+REAPER_MARGIN :: 750 * time.Millisecond
+
 Nbio_Teardown_Tick :: struct {}
 
 Nbio_Teardown_Ctx :: struct {
@@ -360,11 +385,23 @@ test_run_nbio_closes_the_mailbox_before_tearing_the_dispatcher_down :: proc(t: ^
 
 	testing.expect(t, c.err == nil, "run_nbio should exit cleanly")
 
-	// Let the 1 s Cmd finish before this test's Tracking_Allocator rotates --
-	// same trailing-wait discipline tea_test.odin's slow-Cmd test documents.
-	// It has almost certainly already fired (dispatcher_destroy waited for it),
-	// so this is a no-op in the normal case.
+	// Let the 1 s Cmd AND the background reaper finish before this test's
+	// Tracking_Allocator rotates -- the same trailing-wait discipline
+	// test_run_reports_a_pending_reaper_when_a_cmd_outlives_the_grace
+	// (tea_test.odin) documents, and for the identical reason.
+	//
+	// THIS USED TO BE A NO-OP AND IS NOT ANY MORE. run_nbio tore down with a
+	// blocking dispatcher_destroy, so by the time it returned the 1 s Cmd had
+	// already finished and there was nothing left running. It now tears down
+	// with the same bounded dispatcher_reap run() uses, so it returns after
+	// QUIT_GRACE (100 ms) with the Cmd still in flight and a DETACHED reaper
+	// thread still freeing through this task's allocator. Without the sleep
+	// below this test crashed the suite with a SIGSEGV -- not a flake, and
+	// not a phantom leak report, but exactly the hazard Program.reaper_pending
+	// exists to warn a caller about, arriving here first because odin test's
+	// per-task Tracking_Allocator is the shortest-lived caller there is.
 	sync.sema_wait(&c.slow_done)
+	time.sleep(REAPER_MARGIN)
 }
 
 // An Odin thread proc is a plain `proc(^thread.Thread)` with no closure, and
@@ -375,6 +412,100 @@ test_run_nbio_closes_the_mailbox_before_tearing_the_dispatcher_down :: proc(t: ^
 // happens-before edge and it needs no atomics.
 @(private = "file")
 g_nbio_teardown_init_cmd: Cmd
+
+// ============================================================================
+// LIMITATIONS 2.6: run() bounded quit at QUIT_GRACE and run_nbio() did not.
+//
+// The two hosts are meant to differ in plumbing, not in how long it takes to
+// leave a program. run_nbio tore down with a blocking dispatcher_destroy, so
+// quitting took as long as the slowest Cmd still running: press q against a
+// Cmd sleeping 1 s and run_nbio returned 1 s later, with the frame already
+// gone and nothing on screen to explain the wait. run() has been bounded since
+// the cancellation work; this pins that run_nbio now is too, with the SAME
+// number and the same reaper_pending obligation on the caller.
+//
+// The harness is the F02 one directly above -- an every(1 ms) that dispatches
+// a 1 s Cmd on its first fire and quits on its second -- reused rather than
+// rebuilt, so the two tests cannot drift on what "a slow Cmd in flight at
+// quit" means. What differs is only what is measured.
+// ============================================================================
+@(private = "file")
+Nbio_Grace_Ctx :: struct {
+	using base:     Nbio_Teardown_Ctx,
+	elapsed:        time.Duration,
+	reaper_pending: bool,
+}
+
+@(test)
+test_run_nbio_returns_promptly_with_a_slow_cmd_still_in_flight :: proc(t: ^testing.T) {
+	fds: [2]posix.FD
+	testing.expect(t, posix.pipe(&fds) == .OK, "pipe should succeed")
+	read_fd, write_fd := fds[0], fds[1]
+	defer posix.close(write_fd)
+
+	c := new(Nbio_Grace_Ctx); defer free(c)
+	c.read_fd = read_fd
+	c.b = strings.builder_make()
+
+	every_cmd, handle := every(1 * time.Millisecond, nbio_teardown_tick_fn, 0, context.allocator)
+
+	th := thread.create(proc(th: ^thread.Thread) {
+		c := cast(^Nbio_Grace_Ctx)th.data
+		p: Program(Nbio_Teardown_Model)
+		program_init(&p, Nbio_Teardown_Model{ctx = &c.base}, nbio_teardown_update, nbio_teardown_view,
+			g_nbio_teardown_init_cmd)
+		// Timed around run_nbio ITSELF, not around the whole thread: what is
+		// under test is how long the call takes to return once the program has
+		// asked to quit, which is exactly what a user experiences as "the
+		// shell prompt came back".
+		start := time.now()
+		c.err = run_nbio(&p, c.read_fd, &c.b)
+		c.elapsed = time.since(start)
+		c.reaper_pending = p.reaper_pending
+		sync.atomic_store(&c.done, true)
+	})
+	g_nbio_teardown_init_cmd = every_cmd
+	th.data = c
+	th.init_context = context
+	thread.start(th)
+
+	start := time.now()
+	timeout :: 10 * time.Second
+	for !sync.atomic_load(&c.done) {
+		if time.since(start) > timeout {
+			testing.expect(t, false, "run_nbio did not return within 10s")
+			timer_stop(handle)
+			return
+		}
+		time.sleep(20 * time.Millisecond)
+	}
+
+	thread.join(th)
+	thread.destroy(th)
+	timer_stop(handle)
+	posix.close(read_fd)
+	strings.builder_destroy(&c.b)
+
+	testing.expect(t, c.err == nil, "run_nbio should exit cleanly")
+
+	// The whole session is two 1 ms timer fires plus the teardown, so anything
+	// approaching the Cmd's own 1 s means the teardown blocked on it. The bound
+	// is deliberately loose (500 ms against a 100 ms grace and a 1 s Cmd): this
+	// asserts "it did not wait for the Cmd", which is the actual claim, rather
+	// than pinning a scheduler's timing.
+	testing.expectf(t, c.elapsed < 500 * time.Millisecond,
+		"run_nbio should return well before its 1 s Cmd finishes (QUIT_GRACE is 100 ms) -- took %v", c.elapsed)
+
+	// And the caller must be TOLD, for the same reason run() tells it: the
+	// detached reaper is still freeing through this test's own allocator.
+	testing.expect(t, c.reaper_pending,
+		"run_nbio returned with a 1 s Cmd still in flight past the 100 ms grace -- reaper_pending must say so, "+
+		"or the caller has no way to know its allocator is still in use")
+
+	// Trailing wait, same discipline and same reason as the F02 test above.
+	sync.sema_wait(&c.slow_done)
+	time.sleep(REAPER_MARGIN)
+}
 
 // ============================================================================
 // F16: while the mailbox stayed non-empty, run_nbio's drain never fell through

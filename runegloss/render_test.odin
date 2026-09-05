@@ -1040,3 +1040,39 @@ test_a_tab_is_measured_from_the_column_it_actually_lands_in :: proc(t: ^testing.
 	defer delete(got, context.allocator)
 	testing.expect_value(t, got, "a\tb\tc")
 }
+
+// ============================================================================
+// LIMITATIONS 11.4: rg.blink emitted SGR 5 with no warning anywhere, and
+// Profile.None did not remove it -- so a user who had set $NO_COLOR, the
+// closest thing to an accessibility preference this library reads, still got
+// the blink.
+// ============================================================================
+@(test)
+test_blink_is_stripped_under_the_none_profile :: proc(t: ^testing.T) {
+	// On a capable terminal the attribute is still emitted: this is a
+	// degradation rule, not a removal of the feature.
+	s := new_style_profile(.True_Color)
+	blink(&s, true)
+	out := render(&s, "hi", context.allocator); defer delete(out, context.allocator)
+	testing.expectf(t, strings.contains(out, "\e[5m"), "a capable profile must still emit SGR 5; got %q", out)
+
+	// Under .None it is gone, and gone WITHOUT taking the rest of the style
+	// with it -- bold is emphasis, not motion, and still degrades to itself.
+	n := new_style_profile(.None)
+	blink(&n, true)
+	bold(&n, true)
+	nout := render(&n, "hi", context.allocator); defer delete(nout, context.allocator)
+	testing.expectf(t, !strings.contains(nout, "\e[5m") && !strings.contains(nout, ";5m") &&
+		!strings.contains(nout, "\e[5;"),
+		"Profile.None must not emit SGR 5; got %q", nout)
+	testing.expectf(t, strings.contains(nout, "\e[1m"),
+		"Profile.None must keep bold -- only blink degrades; got %q", nout)
+
+	// A style whose ONLY attribute was blink degrades to no escape at all,
+	// rather than to an empty "\e[m" that would still cost bytes and would
+	// intern as a distinct style in runetea's .Diff renderer.
+	b := new_style_profile(.None)
+	blink(&b, true)
+	bout := render(&b, "hi", context.allocator); defer delete(bout, context.allocator)
+	testing.expectf(t, bout == "hi", "a blink-only style under .None must render bare text; got %q", bout)
+}

@@ -368,9 +368,22 @@ term_supports_escapes :: proc() -> bool {
 // other. Nothing in this package writes `?1049h` anywhere else, so this
 // field is the ONE place the alt screen can be entered from.
 term_enter_raw :: proc(fd: posix.FD, opts := Term_Opts{}) -> bool {
-	// The ONE place TERM is consulted. Everything below this line runs in
-	// signal context too (SIGCONT resume), where getenv(3) is not safe to call.
-	return term_acquire(fd, opts, term_supports_escapes())
+	// The ONE place the environment is consulted. Everything below this line
+	// runs in signal context too (SIGCONT resume), where getenv(3) is not safe
+	// to call -- which is exactly why the accessibility lookup happens HERE and
+	// the RESOLVED opts are what term_acquire records. On a resume, guard.odin
+	// replays g_term.opts, so the user's preference comes back with the rest of
+	// the terminal instead of being re-derived in a handler that must not
+	// derive it.
+	//
+	// THE USER'S PREFERENCE OVERRIDES THE APPLICATION'S REQUEST, and only in
+	// the safe direction: it can turn the alternate screen OFF, never on. An
+	// application that never asked for it cannot be given it by an environment
+	// variable. See A11y_Prefs for why an accessibility lever an application
+	// can ignore is not a lever (LIMITATIONS 11.2).
+	eff := opts
+	if a11y_prefs().no_alt { eff.alt = false }
+	return term_acquire(fd, eff, term_supports_escapes())
 }
 
 // The whole of term_enter_raw, minus the environment lookup, and callable from a

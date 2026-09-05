@@ -827,13 +827,32 @@ ATTR_CODE := [Attr]int{
 // would make an unchanged cell compare unequal and repaint forever. Fixed
 // order, one sequence.
 //
-// ATTRIBUTES ARE NOT PROFILE-DEGRADED. $NO_COLOR and TERM=dumb are about
-// COLOUR; bold, italic and underline are not colour, and stripping them under
-// .None would leave a no-colour terminal with no emphasis at all -- strictly
-// worse than what the user asked for. Only the two Colors go through convert().
+// ATTRIBUTES ARE NOT PROFILE-DEGRADED, WITH ONE EXCEPTION. $NO_COLOR and
+// TERM=dumb are about COLOUR; bold, italic and underline are not colour, and
+// stripping them under .None would leave a no-colour terminal with no emphasis
+// at all -- strictly worse than what the user asked for. Only the two Colors go
+// through convert().
+//
+// THE EXCEPTION IS BLINK, and it is not an inconsistency -- it is the rule
+// applied to something that is not emphasis. SGR 5 is a WCAG 2.3.1 (Three
+// Flashes or Below Threshold) concern at LEVEL A, and a documented migraine and
+// vestibular trigger; it conveys no information that its absence does not, and
+// a reader who cannot tolerate it cannot read the screen at all. Bold degrading
+// to nothing costs a reader emphasis. Blink not degrading costs some readers
+// the whole application.
+//
+// $NO_COLOR is the closest thing to an accessibility preference this library
+// reads, and LIMITATIONS 11.4 was precisely that it did not act like one here:
+// a user who had set it still got the blink, with nothing downstream to save
+// them except TERM=dumb (where runetea's render_plain strips every escape in
+// the frame). That is the gap this closes. It is NOT a claim that blink is
+// unreachable -- an application on a capable terminal that asks for it still
+// gets it, and blink()'s own doc comment (style.odin) says why it should not.
 @(private = "file")
-build_sgr :: proc(fgc, bgc: Color, attrs: Attrs, p: Profile) -> Sgr {
+build_sgr :: proc(fgc, bgc: Color, attrs_in: Attrs, p: Profile) -> Sgr {
 	g: Sgr
+	attrs := attrs_in
+	if p == .None { attrs -= {.Blink} }
 	f := convert(fgc, p)
 	b := convert(bgc, p)
 	if attrs == {} && f.kind == .None && b.kind == .None { return g }

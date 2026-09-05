@@ -235,6 +235,25 @@ bold          :: proc(s: ^Style, on: bool) { attr(s, .Bold,      on) }
 faint         :: proc(s: ^Style, on: bool) { attr(s, .Faint,     on) }
 italic        :: proc(s: ^Style, on: bool) { attr(s, .Italic,    on) }
 underline     :: proc(s: ^Style, on: bool) { attr(s, .Underline, on) }
+// DO NOT USE THIS. It is exported for completeness of the SGR set and for
+// nothing else, and it is the only proc in this package with a warning on it.
+//
+// SGR 5 is a WCAG 2.3.1 (Three Flashes or Below Threshold) concern at LEVEL A
+// -- the strictest tier -- and blinking text is a documented migraine and
+// vestibular trigger. It also carries no information: anything you would blink
+// can be said with a word, a glyph, reverse video or bold, all of which every
+// reader can perceive and none of which can hurt one.
+//
+// What it costs even when it does no harm: many terminal emulators ignore SGR 5
+// outright, so the attribute mostly buys you bytes on the wire and reaches only
+// the subset of users whose terminal honours it -- which is exactly the subset
+// it can harm. There is no configuration in which it is the best available
+// choice.
+//
+// It is REMOVED under Profile.None ($NO_COLOR, TERM=dumb) -- see build_sgr in
+// render.odin for why blink is the one attribute the profile degrades. On a
+// capable terminal with colour enabled, nothing downstream will save a user
+// from this call, so gate it on your own setting if you make it at all.
 blink         :: proc(s: ^Style, on: bool) { attr(s, .Blink,     on) }
 reverse       :: proc(s: ^Style, on: bool) { attr(s, .Reverse,   on) }
 strikethrough :: proc(s: ^Style, on: bool) { attr(s, .Strike,    on) }

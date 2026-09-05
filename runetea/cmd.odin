@@ -1003,9 +1003,46 @@ BACKPRESSURE_MAX_SLEEP :: time.Millisecond
 // hidden: it can only happen when the mailbox has been full for the whole
 // attempt window, at which point the app is already in trouble for a
 // different reason.
+//
+// WHEN THE MAILBOX CANNOT TAKE IT, THE REPORT GOES TO STDERR RATHER THAN
+// NOWHERE. This is the gap apply_msg's own KNOWN GAP note (tea.odin) named and
+// left open, and it is the residual LIMITATIONS 2.19 and 2.24 both recorded:
+// "fail loudly" meant "fail loudly WHILE THE LOOP IS RUNNING", because a
+// violation detected after run() began tearing the mailbox down was box_freed
+// in silence. It is reachable without contriving anything -- an
+// input_source_from_bytes session closes the mailbox at EOF, so a re-dispatched
+// Cmd in a scripted test never reported at all, while the same program on a pty
+// did. Measured that way during the audit: refused = 2 with the diagnostic on
+// screen over a pty, refused = 0 and nothing printed over a byte source.
+//
+// Stderr is a WORSE channel than the mailbox and that is why it is the fallback
+// rather than the mechanism -- an application on the alternate screen has its
+// stderr painted into a buffer `\e[?1049l` is about to discard, which is the
+// whole reason these reports are routed through the mailbox in the first place
+// (apply_msg's WHY NOT STDERR). But the two cases this branch covers are the
+// cases where the mailbox is not a channel at all: it is closed, or it has been
+// full for the entire attempt window. Against "nothing", a message that the
+// default .Inline renderer shows perfectly and the alternate screen may swallow
+// is strictly better, and it costs a correct program exactly nothing because a
+// correct program never produces one of these.
+//
+// CR-LF, not LF: the terminal is in raw mode whenever this can fire, so a bare
+// \n would leave the next line indented by however far across the screen the
+// cursor happened to be.
+@(private = "file")
+report_to_stderr :: proc(msg: any, why: string) {
+	text := "a runetea contract was violated"
+	if pm, ok := msg.(Panicked_Msg); ok {
+		p := pm   // addressable: msg_text_string takes ^Msg_Text and `pm` from a type assert is fine, but keep the idiom uniform
+		text = msg_text_string(&p.message)
+	}
+	fmt.eprintf("\r\nrunetea: %s (%s)\r\n", text, why)
+}
+
 @(private = "file")
 deliver_report :: proc(d: ^Dispatcher, msg: any) {
 	if d == nil || d.mailbox == nil {
+		report_to_stderr(msg, "no mailbox to report through")
 		box_free(msg, context.allocator)
 		return
 	}
@@ -1015,12 +1052,14 @@ deliver_report :: proc(d: ^Dispatcher, msg: any) {
 			if d.wake != nil { d.wake(d.wake_data) }
 			return
 		case .Closed:
+			report_to_stderr(msg, "reported after the session closed its mailbox")
 			box_free(msg, context.allocator)
 			return
 		case .Full:
 			thread.yield()
 		}
 	}
+	report_to_stderr(msg, "mailbox full for the whole retry window")
 	box_free(msg, context.allocator)
 }
 

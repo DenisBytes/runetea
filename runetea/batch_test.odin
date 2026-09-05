@@ -902,3 +902,84 @@ test_batch_does_not_refuse_an_allocator_that_merely_looks_like_an_arena :: proc(
 	// virtual.arena_destroy above reclaims the spec and its child list; the
 	// children own nothing (nil env, zero ticket), so nothing else is owed.
 }
+
+// ============================================================================
+// LIMITATIONS 2.11: a tick()/every() Cmd nested inside batch()/sequence() gated
+// nothing, silently.
+//
+// `sequence([step_a, tick(1s), step_b])` reads as "do a, wait a second, do b"
+// and did not wait -- a timer child signals `done` when it is HANDED to the
+// timer thread, not when it fires. Nothing failed, nothing leaked, and the only
+// symptom was a program whose timing was wrong, which is the worst shape a bug
+// can have in a library whose whole discipline is that a broken contract says
+// so.
+// ============================================================================
+
+@(private = "file")
+noop_timer_fn :: proc(env: rawptr, tk: time.Tick) -> any { return nil }
+
+@(private = "file")
+Nested_Timer_Model :: struct { ended: bool }
+
+@(private = "file")
+nested_timer_view :: proc(m: Nested_Timer_Model, alloc: mem.Allocator) -> string { return "" }
+
+@(private = "file")
+nested_timer_update :: proc(m: ^Nested_Timer_Model, msg: any, alloc: mem.Allocator) -> Cmd {
+	if k, is_key := msg.(Key_Msg); is_key && k.r == 'a' {
+		// The exact shape 2.11 names. `context.allocator`, not `alloc` -- the
+		// frame-allocator refusal is a DIFFERENT contract and would mask this
+		// one if it fired first.
+		tk, h := tick_cancellable(time.Second, noop_timer_fn, 0, context.allocator)
+		timer_stop(h)
+		return sequence([]Cmd{quit_cmd(), tk}, context.allocator)
+	}
+	return cmd_nil()
+}
+
+@(test)
+test_a_nested_timer_in_a_sequence_is_refused :: proc(t: ^testing.T) {
+	src := input_source_from_bytes(transmute([]u8)string("a"))
+	defer input_close(&src)
+	b := strings.builder_make(); defer strings.builder_destroy(&b)
+
+	p: Program(Nested_Timer_Model)
+	program_init(&p, Nested_Timer_Model{}, nested_timer_update, nested_timer_view)
+
+	err := run(&p, &src, &b)
+	pe, is_panic := err.(Panicked_Error)
+	if !testing.expectf(t, is_panic, "a nested tick() must END the session, not gate nothing; got %v", err) {
+		return
+	}
+	defer delete(pe.message)
+
+	// The diagnostic has to name the constructor, the problem AND the
+	// alternative -- a refusal that does not say what to write instead is just
+	// a different way to lose an afternoon.
+	testing.expectf(t, strings.contains(pe.message, "sequence()"),
+		"the refusal must name the constructor; got %q", pe.message)
+	testing.expectf(t, strings.contains(pe.message, "update()"),
+		"the refusal must say what to do instead; got %q", pe.message)
+}
+
+// The batch() half, driven through guarded() directly rather than through a
+// whole program: the refusal lives in the shared `compose`, but the constructor
+// NAME in the diagnostic does not, and a test that only covered sequence()
+// would not notice `batch()` reporting itself as `sequence()`.
+@(test)
+test_a_nested_timer_in_a_batch_is_refused :: proc(t: ^testing.T) {
+	info := guarded(proc(ud: rawptr) {
+		tk, h := tick_cancellable(time.Second, noop_timer_fn, 0, context.allocator)
+		timer_stop(h)
+		_ = batch([]Cmd{quit_cmd(), tk}, context.allocator)
+	}, nil)
+
+	if !testing.expect(t, info.recovered, "batch() must refuse a tick() child") { return }
+	defer delete(info.message)
+	testing.expectf(t, strings.contains(info.message, "batch()"),
+		"the refusal must name batch(), not the shared helper; got %q", info.message)
+	// The marker is what makes apply_msg end the session rather than hand this
+	// to a `case Panicked_Msg` the canonical update switch leaves empty.
+	testing.expectf(t, is_cmd_alloc_contract_panic(info.message),
+		"the refusal must carry the contract marker; got %q", info.message)
+}

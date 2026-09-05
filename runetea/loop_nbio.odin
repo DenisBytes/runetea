@@ -63,16 +63,40 @@ run_nbio :: proc(p: ^Program($T), fd: posix.FD, out: ^strings.Builder, flush_fd:
 	}
 	defer frame_arena_destroy(&fa)
 
-	mbox: Mailbox
-	if err := mailbox_init(&mbox, MAILBOX_CAP); err != nil {
+	// Resolved once, and used both as the mailbox's capacity and as this
+	// host's coalescing budget -- the two are the same number by construction
+	// (Program.mailbox_cap, tea.odin).
+	mbox_cap := program_mailbox_cap(p)
+
+	// HEAP-ALLOCATED, in a Reap_Ctx, for exactly the reason run() does it: so
+	// that quitting can be BOUNDED. See Reap_Ctx's own doc comment (cmd.odin).
+	// A Cmd still running when the user quits may keep touching this
+	// Dispatcher's pool and this Mailbox for as long as it runs, so both must
+	// be able to outlive run_nbio's stack frame -- which a `mbox: Mailbox` /
+	// `disp: Dispatcher` local, which is what these were, can never do.
+	//
+	// WHAT THE LOCALS COST. run_nbio tore down with `defer
+	// dispatcher_destroy(&disp)`, which blocks in thread.pool_finish until
+	// every in-flight Cmd returns. So quitting an application took as long as
+	// its slowest Cmd, with the terminal already restored and nothing on
+	// screen: press q against a Cmd sleeping 10 s and the shell prompt came
+	// back 10 s later. run() has been bounded at QUIT_GRACE since the
+	// cancellation work; this host simply never got the same treatment, and
+	// LIMITATIONS 2.6 recorded the divergence rather than closing it.
+	reap := new(Reap_Ctx, context.allocator)
+	if reap == nil {
+		return Terminal_Error{detail = "dispatcher/mailbox allocation failed"}
+	}
+	if err := mailbox_init(&reap.mbox, mbox_cap); err != nil {
+		free(reap, context.allocator)
 		return Terminal_Error{detail = "mailbox init failed"}
 	}
-	defer mailbox_destroy(&mbox)
 
 	if aerr := nbio.acquire_thread_event_loop(); aerr != nil {
+		mailbox_destroy(&reap.mbox)
+		free(reap, context.allocator)
 		return Terminal_Error{detail = "nbio acquire_thread_event_loop failed"}
 	}
-	defer nbio.release_thread_event_loop()
 	loop := nbio.current_thread_event_loop()
 
 	// Same relative ordering as run(), same reason: signal_watcher_start
@@ -80,16 +104,77 @@ run_nbio :: proc(p: ^Program($T), fd: posix.FD, out: ^strings.Builder, flush_fd:
 	// created AFTER that inherit the block (signals.odin's own doc comment).
 	// The Dispatcher's pool must therefore start after the watcher, exactly
 	// as in run().
+	//
+	// THE RETURN VALUE IS CHECKED, as run() has always checked it. It used to
+	// be discarded here, so a failed pthread_create left a program that looked
+	// fine and silently answered no SIGINT, no SIGTERM and no SIGWINCH for the
+	// rest of its life -- the resize half of that being invisible until the
+	// user resized. The two hosts now fail the same way, at the same point,
+	// with the same message.
 	sw: Signal_Watcher
-	if flush_fd >= 0 { signal_watcher_start(&sw, &mbox, flush_fd, wake = nbio_wake, wake_data = loop) }
-	defer signal_watcher_stop(&sw)
+	if flush_fd >= 0 && !signal_watcher_start(&sw, &reap.mbox, flush_fd, wake = nbio_wake, wake_data = loop) {
+		nbio.release_thread_event_loop()
+		mailbox_destroy(&reap.mbox)
+		free(reap, context.allocator)
+		return Terminal_Error{detail = "could not start the signal watcher thread (pthread_create failed)"}
+	}
 
-	disp: Dispatcher
-	dispatcher_init(&disp, &mbox, 4, wake = nbio_wake, wake_data = loop)
-	defer dispatcher_destroy(&disp)
+	dispatcher_init(&reap.disp, &reap.mbox, 4, wake = nbio_wake, wake_data = loop)
+
+	// ONE ORDERED TEARDOWN, written as a single deferred block rather than as
+	// three separate defers, because all three steps have to happen in an
+	// order that defer's LIFO rule cannot express here on its own -- the nbio
+	// release has to sit BETWEEN two things whose own setup order is fixed.
+	//
+	// 1. signal_watcher_stop FIRST. dispatcher_reap's PRECONDITION (cmd.odin)
+	//    is that every OTHER producer into the mailbox is already stopped and
+	//    joined by the time it is called, because it hands the mailbox to a
+	//    background thread that will free it. The watcher is that other
+	//    producer.
+	//
+	// 2. dispatcher_reap SECOND, with the same QUIT_GRACE run() uses. This is
+	//    the whole change: it fires the cancellation token, closes the mailbox
+	//    (so a Cmd finishing after this point gets .Closed and discards its
+	//    result instead of retrying against a queue nobody drains -- the same
+	//    "orphaned results are discarded" rule run() has always had), and then
+	//    joins the pool on a BACKGROUND thread, waiting at most QUIT_GRACE for
+	//    that to finish. Closing the mailbox on the teardown path is what the
+	//    now-deleted `defer mailbox_close(&mbox)` was for; dispatcher_reap does
+	//    it as its very first act, which is where run() has always got the same
+	//    guarantee from, so the explicit defer is redundant rather than lost.
+	//
+	// 3. release_thread_event_loop LAST, AND ONLY IF THE REAP FINISHED IN
+	//    TIME. This is the one genuinely subtle ordering constraint in this
+	//    function, and it is why the release is not simply an early `defer`
+	//    the way it used to be. This Dispatcher is built with
+	//    `wake = nbio_wake, wake_data = loop`, so every pool worker and every
+	//    timer fire calls nbio.wake_up(loop) after a successful delivery. If
+	//    the loop were released while a worker could still do that, the wake
+	//    would be a use-after-free on the event loop. A reap that returned
+	//    TRUE is proof there is no such worker left: the reaper thread ran
+	//    dispatcher_destroy to completion, which joins every pool worker and
+	//    every detached Cmd. A reap that returned FALSE is proof of the
+	//    opposite, so the loop is DELIBERATELY NOT RELEASED on that path --
+	//    a bounded, one-per-session leak of a thread-local event loop, taken
+	//    knowingly, on the pathological path where a Cmd has already outlived
+	//    its cancellation by more than QUIT_GRACE. Freeing it there would
+	//    trade a leak for a crash.
+	//
+	// p.reaper_pending carries the same meaning it does for run() -- see its
+	// field comment (tea.odin) for what a caller must do about a `true`.
+	defer view_leak_report(p.view_leak_frames, p.view_leak_blocks, p.view_leak_bytes)
+	defer {
+		signal_watcher_stop(&sw)
+		finished := dispatcher_reap(reap, QUIT_GRACE)
+		p.reaper_pending = !finished
+		if finished { nbio.release_thread_event_loop() }
+	}
+	// (Historical note, kept because it is the reason the mailbox is closed on
+	// the teardown path at all.)
 	// CLOSE THE MAILBOX BEFORE TEARING DOWN ANYTHING THAT CAN STILL SEND INTO
-	// IT. Declared here, immediately after dispatcher_destroy's defer, so
-	// LIFO ordering runs it FIRST of the two -- which is the same invariant
+	// IT. This used to be a bare `defer mailbox_close(&mbox)` declared
+	// immediately after dispatcher_destroy's defer, so that
+	// LIFO ordering ran it FIRST of the two -- which is the same invariant
 	// run() gets from dispatcher_reap (cmd.odin closes the mailbox as its very
 	// first act) and from its reader-teardown defer.
 	//
@@ -118,10 +203,14 @@ run_nbio :: proc(p: ^Program($T), fd: posix.FD, out: ^strings.Builder, flush_fd:
 	// equivalent program never had the problem, because dispatcher_reap
 	// (cmd.odin) closes the mailbox as its very first act.
 	//
-	// Closing here also makes signal_watcher_stop's defer (declared above, so
-	// it runs after this one) collect a watcher that sees .Closed and gives up,
-	// rather than one parked in a retry loop.
-	defer mailbox_close(&mbox)
+	// Closing before the pool join also makes the watcher, which is stopped
+	// first now, collect cleanly: it sees .Closed and gives up rather than
+	// parking in a retry loop.
+	//
+	// All of that still holds -- dispatcher_reap closes the mailbox as its
+	// very first act, before it hands anything to the reaper thread -- so the
+	// invariant this comment defends is now enforced by the shared teardown
+	// path both hosts use, rather than by a defer only one of them had.
 
 	r: Renderer
 	// Same width-seeding rationale as run() (tea.odin) -- see the comment
@@ -136,7 +225,16 @@ run_nbio :: proc(p: ^Program($T), fd: posix.FD, out: ^strings.Builder, flush_fd:
 	if flush_fd >= 0 {
 		if w, h, ok := term_size(flush_fd); ok { initial_w, initial_h = w, h }
 	}
-	renderer_init(&r, out, initial_w, initial_h, p.render_mode)
+	// THE USER'S RENDER-MODE PREFERENCE OVERRIDES THE APPLICATION'S, and only
+	// in the direction that gives the terminal back: $RUNETEA_INLINE can force
+	// .Inline, nothing can force a viewport-owning mode on an application that
+	// did not ask for one. Resolved here rather than by mutating p.render_mode,
+	// so the Program a caller handed in is not rewritten under it and can still
+	// be inspected for what the APPLICATION wanted. See A11y_Prefs.inline_only
+	// for why this is separate from no_alt (LIMITATIONS 11.2).
+	mode := p.render_mode
+	if a11y_prefs().inline_only { mode = .Inline }
+	renderer_init(&r, out, initial_w, initial_h, mode)
 	// T3-A: .Diff allocates two cell grids on its first sized frame; the
 	// other two modes allocate nothing and this is a no-op for them. Deferred
 	// right at construction so no early return -- and there are several, on
@@ -157,10 +255,10 @@ run_nbio :: proc(p: ^Program($T), fd: posix.FD, out: ^strings.Builder, flush_fd:
 	// so every defer already registered above tears down with nothing
 	// outstanding.
 	if e := guarded_render(p, &fa, &r, out, flush_fd); e != nil { return e }
-	if !cmd_is_nil(p.init_cmd) { dispatch(&disp, p.init_cmd) }
+	if !cmd_is_nil(p.init_cmd) { dispatch(&reap.disp, p.init_cmd) }
 
 	rc: Nbio_Read_Ctx
-	rc.mailbox = &mbox
+	rc.mailbox = &reap.mbox
 	rc.legacy  = p.legacy
 	h, aerr := nbio.associate_handle(uintptr(fd))
 	if aerr != nil { return Terminal_Error{detail = "nbio associate_handle failed"} }
@@ -230,7 +328,7 @@ run_nbio :: proc(p: ^Program($T), fd: posix.FD, out: ^strings.Builder, flush_fd:
 		for rc.backlog_pos < len(rc.backlog) {
 			msg := rc.backlog[rc.backlog_pos]
 			rc.backlog_pos += 1
-			e, updated := apply_msg(p, msg, &fa, &disp, &r)
+			e, updated := apply_msg(p, msg, &fa, &reap.disp, &r)
 			if updated { dirty = true }
 			if e != nil { return e }
 			if p.quit { break }
@@ -281,13 +379,13 @@ run_nbio :: proc(p: ^Program($T), fd: posix.FD, out: ^strings.Builder, flush_fd:
 		// thread competing fairly for mailbox slots; here the reader IS this
 		// thread.
 		saturated := false   // the drain stopped on the budget, not on an empty queue
-		for n := 0; n < COALESCE_BUDGET && !p.quit; n += 1 {
-			msg, ok := mailbox_try_recv(&mbox)
+		for n := 0; n < mbox_cap && !p.quit; n += 1 {
+			msg, ok := mailbox_try_recv(&reap.mbox)
 			if !ok { break }
-			e, updated := apply_msg(p, msg, &fa, &disp, &r)
+			e, updated := apply_msg(p, msg, &fa, &reap.disp, &r)
 			if updated { dirty = true }
 			if e != nil { return e }
-			if n + 1 == COALESCE_BUDGET { saturated = true }
+			if n + 1 == mbox_cap { saturated = true }
 		}
 
 		if dirty {
@@ -298,7 +396,7 @@ run_nbio :: proc(p: ^Program($T), fd: posix.FD, out: ^strings.Builder, flush_fd:
 		// EOF, drained -- mirrors run()'s mailbox_recv ok=false. Both queues
 		// have to be empty, not just the mailbox: the backlog may still hold
 		// the keys decoded from the very read that hit EOF.
-		if rc.backlog_pos >= len(rc.backlog) && mailbox_closed_and_empty(&mbox) { break }
+		if rc.backlog_pos >= len(rc.backlog) && mailbox_closed_and_empty(&reap.mbox) { break }
 
 		// tick() is reached on EVERY iteration now; only its timeout varies.
 		// NO_TIMEOUT (the default, and what this call used to pass

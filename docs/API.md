@@ -76,6 +76,7 @@ rt.program_init(&p, Model{}, update, view /*, init_cmd */)
 p.render_mode = .Diff              // .Inline is the zero value
 p.cursor      = nil                // optional per-frame Cursor callback
 p.legacy      = {}                 // which side of each legacy C0 collision you want
+p.mailbox_cap = 0                  // 0 == 256; raise it for wide bursts, lower it to bound one batch
 ```
 
 | Field | Zero value | Meaning |
@@ -88,7 +89,9 @@ p.legacy      = {}                 // which side of each legacy C0 collision you
 | `render_mode` | `.Inline` | see [§6](#6-drawing--render-modes-the-cursor-the-view-contract) |
 | `legacy` | `{}` | `Legacy_Key_Encoding` — see [§2](#2-reacting-to-input--the-message-vocabulary) |
 | `quit` | `false` | set by the loop when `Quit_Msg` arrives; you do not write it |
-| `reaper_pending` | `false` | set by `run()` on the way out; you read it. `true` means `run()` gave up waiting for an in-flight Cmd past its 100 ms grace and returned anyway, leaving a detached thread still freeing allocations made through *your* `context.allocator` — which must therefore outlive the slowest Cmd. `run_nbio` never sets it. |
+| `mailbox_cap` | `0` (= 256) | how many messages the mailbox holds, **and** the most either host applies before it stops and paints — the two are the same number by construction. Values below 8 are clamped up; a negative reads as "unset". Cannot lose a message either way: the back-pressure policy is retry-forever, so a small mailbox costs latency, not delivery. |
+| `reaper_pending` | `false` | set by **both** hosts on the way out; you read it. `true` means the host gave up waiting for an in-flight Cmd past its 100 ms grace and returned anyway, leaving a detached thread still freeing allocations made through *your* `context.allocator` — which must therefore outlive the slowest Cmd. |
+| `view_leak_frames`, `view_leak_blocks`, `view_leak_bytes` | `0` | set by both hosts; you read them **after your own `term_restore()`**. Non-zero means your `view` or `cursor` called something whose allocator argument defaults to `context.allocator` — `fmt.aprintf`, `strings.clone`, `rg.render` — without passing the `alloc` it was handed, so the frame arena never held the memory and cannot reclaim it. The library also prints a summary to stderr, but a program on the alternate screen has that discarded; the fields survive. See [`LIMITATIONS`](LIMITATIONS.md) 3.15. |
 
 ### `run` and `run_nbio`
 
@@ -175,7 +178,15 @@ whatever state its last real message left it ([§9](#9-how-a-session-ends);
 Space, Up, Down, Right, Left, Home, End, Page_Up, Page_Down, Insert, Delete,
 F1…F12, Find, Select` — because Odin cannot express Bubble Tea's
 match-by-method-set. `Modifiers` is `bit_set[Modifier]` over `Ctrl, Alt, Shift,
-Meta`.
+Meta, Super, Hyper, Caps_Lock, Num_Lock` — all eight bits the wire encoding
+carries, which is also exactly what the backing `u8` holds.
+
+`Caps_Lock` and `Num_Lock` are **lock states, not held keys**: they report what
+the keyboard's latches were at the moment of the press, so match on
+`.Ctrl in k.mods` rather than `k.mods == {.Ctrl}` unless you mean to exclude a
+user with Caps Lock on. `Super` is only ever produced by the Kitty keyboard
+protocol — the legacy encoding's bit 8 is genuinely ambiguous between Meta and
+Super and resolves as Meta ([`LIMITATIONS`](LIMITATIONS.md) 5.7).
 
 <!-- doccheck: decl input -->
 ```odin
@@ -790,6 +801,57 @@ are immune: they address every row absolutely and truncate at the bottom.
 | `term_restore` | `runetea/term.odin` | undo exactly what was set, once |
 | `term_size` | `runetea/term.odin` | `(w, h, ok)` from a live `ioctl` |
 | `term_supports_escapes` | `runetea/term.odin` | false for `TERM=dumb`, empty or unset. `term_enter_raw` and the renderer already gate themselves on it; ask when *you* want to degrade something |
+| `A11y_Prefs`, `a11y_prefs` | `runetea/a11y.odin` | what the **user** asked for. Two of the three are enforced for you; see below |
+| `reduce_motion` | `runetea/a11y.odin` | advisory — read it, decide what it means for your animation |
+| `set_a11y_prefs`, `clear_a11y_prefs` | `runetea/a11y.odin` | wire your own `--no-alt` flag into the same lever |
+
+### The end user's levers
+
+RuneTea reads three environment variables on your behalf. **You do not have to do
+anything for the first two to work**, and you cannot stop them working — that is
+the point of them.
+
+| Variable | Effect | Enforced |
+|---|---|---|
+| `RUNETEA_NO_ALT` | never enter the alternate screen | **yes** — applied *after* your `Term_Opts` |
+| `RUNETEA_INLINE` | force `Render_Mode.Inline` (implies no-alt) | **yes** — at renderer construction |
+| `RUNETEA_REDUCE_MOTION` | `rt.reduce_motion()` returns true | no — advisory |
+
+Set and non-empty means on, whatever the value, exactly as `$NO_COLOR` specifies —
+so `RUNETEA_NO_ALT=0` turns it **on**.
+
+These can only take a terminal mode **away**, never grant one: nothing in the
+environment can put an application on the alternate screen that never asked for
+it.
+
+`reduce_motion` is advisory because it cannot honestly be anything else — RuneTea
+does not own your animation, and silently slowing or dropping timer fires would
+break a program that is counting them. Read it and decide:
+
+<!-- doccheck: decl a11y -->
+```odin
+FRAME_INTERVAL :: 100 * time.Millisecond
+
+// Keep the interval in the MODEL, not in a constant, so it can be slowed
+// without an edit -- "slow it down" is the accommodation most people want when
+// "stop it" is too much.
+Spinner :: struct {
+    paused:   bool,
+    interval: time.Duration,
+}
+
+spinner_init :: proc(m: ^Spinner) {
+    m.interval = FRAME_INTERVAL
+    if rt.reduce_motion() {
+        m.paused   = true            // nothing moves until the user asks
+        m.interval = 4 * FRAME_INTERVAL
+    }
+}
+```
+
+`examples/spinner` is the worked version, including the pause key that WCAG 2.2.2
+asks for. If your application has its own `--no-alt` flag, route it through
+`set_a11y_prefs` rather than inventing a parallel lever only you honour.
 | `install_crash_handlers` | `runetea/guard.odin` | Tier-2 recovery: restore the terminal on a fatal signal, and on Ctrl+Z |
 | `install_stop_handlers` | `runetea/guard.odin` | just the `SIGTSTP`/`SIGCONT` pair, for an app that re-installs its own handlers |
 | `Kitty_Flags`, `Mouse_Mode` | `runetea/term.odin` | the opt-in vocabularies |
@@ -1265,6 +1327,8 @@ privacy, not because they are API.)
 | `display_width`, `Width_Options`, `Emoji_Width`, `measure_line`, `Line_Metrics`, `rows_for_line`, `Cluster_Iter`, `cluster_iter_make`, `cluster_next`, `is_ambiguous_width`, `TAB_STOP_DEFAULT` | `width.odin` |
 | `term_enter_raw`, `Term_Opts`, `term_restore`, `term_size`, `term_supports_escapes`, `Kitty_Flag`, `Kitty_Flags`, `Mouse_Mode` | `term.odin` |
 | `install_crash_handlers`, `install_stop_handlers`, `guarded`, `Panic_Info` | `guard.odin` |
+| `A11y_Prefs`, `a11y_prefs`, `set_a11y_prefs`, `clear_a11y_prefs`, `a11y_from_env`, `a11y_from_env_values`, `reduce_motion` | `a11y.odin` |
+| `View_Leak_Watch`, `view_leak_watch_allocator` | `viewleak.odin` |
 | `signal_unblock_for_child`, `runetea_signal_set` | `signals.odin` |
 
 ### `runegloss`

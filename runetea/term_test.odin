@@ -1362,6 +1362,28 @@ test_a_job_control_stop_restores_the_tty_and_a_resume_re_acquires_it :: proc(t: 
 		// CHILD. Deliberately no `defer term_restore()`: everything asserted
 		// below has to come from the SIGTSTP/SIGCONT handlers or not at all.
 		posix.close(pty.master)
+
+		// ITS OWN PROCESS GROUP, AND THIS IS LOAD-BEARING RATHER THAN TIDY.
+		// POSIX says a stop signal delivered to a process in an ORPHANED
+		// process group is DISCARDED -- the process does not stop -- and a
+		// group is orphaned when no member has a parent in a different group
+		// of the same session. Inheriting the test runner's group makes that
+		// condition depend entirely on how the runner was invoked: this test
+		// passed when run directly and failed EVERY time under
+		// `tools/test.sh`, which runs the binary as the left-hand side of a
+		// `| tee` pipeline inside a shell function with job control off. The
+		// symptom was this test's own "the child must actually STOP" message,
+		// which read like a handler bug and was an environment artifact.
+		//
+		// setpgid(0, 0) makes the child the sole member of a new group whose
+		// parent -- the runner -- is in a different group in the same session,
+		// so the group can never be orphaned and SIGTSTP is never discarded.
+		// waitpid and kill are unaffected: the child is still a child. And the
+		// pty is O_NOCTTY and claimed by nobody, so a background group here
+		// still cannot raise SIGTTOU on the handler's writes (see this block's
+		// own comment above).
+		posix.setpgid(0, 0)
+
 		install_crash_handlers()
 		if !term_enter_raw(pty.slave, {kb = {.Disambiguate}, paste = true, mouse = .Normal, alt = true}) {
 			posix._exit(1)
@@ -1585,4 +1607,79 @@ test_a_declared_cursor_hide_comes_back_on_the_resume_path :: proc(t: ^testing.T)
 	got := drain_master(pty.master, buf3[:], len("\e[?25l"))
 	testing.expectf(t, got == "\e[?25l",
 		"the resume wrote %q, want the declared hide back %q -- an opt-in this file does not RECORD cannot be replayed", got, "\e[?25l")
+}
+
+// ============================================================================
+// LIMITATIONS 11.2: nothing in runetea consulted the environment for an
+// accessibility preference, so an end user had no lever at all unless the
+// application's author had written one -- and none of the five examples had.
+// ============================================================================
+
+@(test)
+test_a11y_env_policy :: proc(t: ^testing.T) {
+	// Unset is unset.
+	testing.expect_value(t, a11y_from_env_values("", "", ""), A11y_Prefs{})
+
+	// $NO_COLOR's convention: SET AND NON-EMPTY is on, whatever the value.
+	// "0" is deliberately ON -- see A11y_Prefs for why parsing the value would
+	// be worse than not parsing it.
+	testing.expect_value(t, a11y_from_env_values("1", "", ""), A11y_Prefs{no_alt = true})
+	testing.expect_value(t, a11y_from_env_values("0", "", ""), A11y_Prefs{no_alt = true})
+	testing.expect_value(t, a11y_from_env_values("no", "", ""), A11y_Prefs{no_alt = true})
+
+	// Inline IMPLIES no-alt: an inline frame painted onto the alternate screen
+	// is discarded whole on exit, which is the opposite of what was asked for.
+	testing.expect_value(t, a11y_from_env_values("", "1", ""),
+		A11y_Prefs{inline_only = true, no_alt = true})
+
+	// Reduce-motion is orthogonal to both and never implies either.
+	testing.expect_value(t, a11y_from_env_values("", "", "1"), A11y_Prefs{reduce_motion = true})
+}
+
+// The lever has to be ENFORCED, not merely offered, or it is not a lever: the
+// application here asks for the alternate screen and must not get it.
+@(test)
+test_no_alt_overrides_an_application_that_asked_for_the_alt_screen :: proc(t: ^testing.T) {
+	pty, ok := open_test_pty()
+	if !testing.expect(t, ok, "could not open a pty") { return }
+	defer close_test_pty(pty)
+	g_term = {}
+	defer g_term = {}
+	defer clear_a11y_prefs()
+
+	set_a11y_prefs(A11y_Prefs{no_alt = true})
+	testing.expect(t, term_enter_raw(pty.slave, {alt = true}), "term_enter_raw should succeed")
+
+	// The RECORDED state is what matters, not just the bytes: g_term.opts is
+	// what guard.odin replays on SIGCONT, so a preference honoured only at the
+	// wire would come undone the first time the user pressed Ctrl+Z and `fg`.
+	testing.expect(t, !g_term.alt_active,
+		"$RUNETEA_NO_ALT must leave alt_active false, or a SIGCONT resume re-enters the alt screen")
+
+	term_restore()
+	buf: [64]u8
+	got := drain_master(pty.master, buf[:], 0)
+	testing.expectf(t, !strings.contains(got, "\e[?1049"),
+		"$RUNETEA_NO_ALT must write neither the enter nor the leave; got %q", got)
+}
+
+// ...and only in the safe direction. Nothing in the environment may hand an
+// application a terminal mode it never asked for.
+@(test)
+test_a11y_can_only_take_the_alt_screen_away_never_give_it :: proc(t: ^testing.T) {
+	pty, ok := open_test_pty()
+	if !testing.expect(t, ok, "could not open a pty") { return }
+	defer close_test_pty(pty)
+	g_term = {}
+	defer g_term = {}
+	defer clear_a11y_prefs()
+
+	set_a11y_prefs(A11y_Prefs{})
+	testing.expect(t, term_enter_raw(pty.slave, {}), "term_enter_raw should succeed")
+	term_restore()
+
+	buf: [64]u8
+	got := drain_master(pty.master, buf[:], 0)
+	testing.expectf(t, !strings.contains(got, "\e[?1049"),
+		"an app that asked for nothing must get nothing; got %q", got)
 }

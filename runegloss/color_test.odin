@@ -369,3 +369,65 @@ test_contrast_ratio_matches_the_wcag_anchors :: proc(t: ^testing.T) {
 	_, _, _, none_ok := reference_rgb(Color{})
 	testing.expect(t, !none_ok, "a .None colour has no RGB to measure")
 }
+
+// ============================================================================
+// docs/LIMITATIONS.md 7.9: nearest_256 recomputed to_lab for all 240 palette
+// entries on every call (~720 cube roots per coloured Style per render), and
+// nearest_16's twin check paid the same tax on its own 16. g_palette_lab is
+// filled once by an @(init) proc instead.
+//
+// THE RISK THE CACHE INTRODUCES IS NOT SPEED, IT IS AGREEMENT. A precomputed
+// table that is subtly wrong -- filled in the wrong order, filled before
+// BASE16's own initialiser ran, indexed with an offset -- would down-convert
+// every colour slightly differently and every existing expectation in this file
+// that happens not to name an affected colour would still pass. So this asserts
+// the property that actually matters: for every one of the 256 palette entries,
+// the cached Lab value is bit-identical to computing it on the spot.
+// ============================================================================
+@(test)
+test_the_palette_lab_cache_agrees_with_computing_it_on_the_spot :: proc(t: ^testing.T) {
+	for i in 0 ..< 256 {
+		r, g, b := palette_rgb(u8(i))
+		want := to_lab(r, g, b)
+		got  := g_palette_lab[i]
+		testing.expectf(t, got == want,
+			"palette entry %d (#%02X%02X%02X): cached Lab %v, computed %v", i, r, g, b, got, want)
+	}
+}
+
+// And the end-to-end property: a spread of colours across the space must
+// down-convert to exactly what an uncached search would have chosen. This is the
+// regression guard that would catch an off-by-one in the loop bounds -- note
+// nearest_256 searches 16..=255 and must NOT be allowed to start at 0, which is
+// the whole reason entries 0-15 are excluded (see its own comment).
+@(test)
+test_down_conversion_is_unchanged_by_the_cache :: proc(t: ^testing.T) {
+	reference_256 :: proc(r, g, b: u8) -> int {
+		target := to_lab(r, g, b)
+		best, best_d := 16, max(f64)
+		for i in 16 ..= 255 {
+			pr, pg, pb := palette_rgb(u8(i))
+			if d := lab_dist2(target, to_lab(pr, pg, pb)); d < best_d {
+				best, best_d = i, d
+			}
+		}
+		return best
+	}
+
+	// A deterministic spread rather than a random one: 6^3 = 216 points on an
+	// even grid across the whole cube, plus the corners the grid misses.
+	for ri in 0 ..< 6 do for gi in 0 ..< 6 do for bi in 0 ..< 6 {
+		r := u8(ri * 51); g := u8(gi * 51); b := u8(bi * 51)
+		testing.expectf(t, nearest_256(r, g, b) == reference_256(r, g, b),
+			"#%02X%02X%02X: cached search chose %d, uncached %d",
+			r, g, b, nearest_256(r, g, b), reference_256(r, g, b))
+	}
+
+	// The colours this library's own documentation and examples name, so a
+	// regression shows up as a changed screenshot rather than a changed number.
+	for hex in ([?]string{"#7D56F4", "#04B575", "#FF5F87", "#FFFDF5", "#874BFD"}) {
+		c := color_hex(hex)
+		testing.expectf(t, nearest_256(c.r, c.g, c.b) == reference_256(c.r, c.g, c.b),
+			"%s down-converted differently under the cache", hex)
+	}
+}

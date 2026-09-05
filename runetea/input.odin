@@ -75,7 +75,25 @@ Legacy_Key_Encoding :: bit_set[Legacy_Key; u8]
 // Alt on every terminal -- most Unix terminals send ESC-prefixed bytes for Alt
 // and never set this bit -- but the wire encoding has a slot for it, so it
 // gets a name rather than being silently folded into Alt.
-Modifier  :: enum u8 { Ctrl, Alt, Shift, Meta }
+// The four that follow Meta are the Kitty protocol's own, and they exist
+// because "lossy but honest" had run out of road: `Modifiers` had four members
+// against a wire encoding with eight, so every bit above 8 was masked off and
+// `CSI 1;33A` -- Meta+Up from any terminal speaking Kitty's table -- arrived as
+// a plain, unmodified Up. An application simply could not bind a Super key.
+//
+// EIGHT MEMBERS IS THE CEILING of the u8 backing, and that is deliberate rather
+// than lucky: it is exactly the number of bits the wire has, so the set can now
+// represent every modifier either encoding can express and there is no longer
+// any masking to document.
+//
+// SUPER IS ONLY EVER PRODUCED BY THE KITTY PATH, and that is the one genuine
+// ambiguity in the whole area rather than an omission -- see xterm_mods and
+// kitty_mods, which disagree about bit 8 because xterm and Kitty disagree about
+// bit 8. Caps_Lock and Num_Lock are LOCK STATES, not keys held down: they say
+// what the keyboard's latches were at the moment of the press, so an
+// application matching on `mods == {.Ctrl}` should mask them out rather than
+// expect them absent.
+Modifier  :: enum u8 { Ctrl, Alt, Shift, Meta, Super, Hyper, Caps_Lock, Num_Lock }
 Modifiers :: bit_set[Modifier; u8]
 
 Key_Msg :: struct {
@@ -585,23 +603,46 @@ decode_c0 :: proc(b: u8, legacy: Legacy_Key_Encoding) -> Key_Msg {
 // letter we recognise, say) from being forced into a plausible-looking
 // modifier set.
 //
-// Bits above 8 are MASKED OFF, deliberately: Modifiers has no member for them,
-// and mapping them onto the four we do have would report a modifier the user
-// did not press. CSI 1;33A therefore decodes as plain Up, which is a lossy but
-// honest answer.
-//
 // THIS IS NOT THE KITTY BITMASK -- see kitty_mods, which is a different
 // function of the same-shaped number. Bit 8 here is Meta (xterm's meaning);
 // bit 8 in Kitty is Super and Meta moves to bit 32. Sharing one proc between
 // the two encodings would mis-name a modifier on every Kitty event that has
 // one, which is precisely why there are two.
+//
+// BITS ABOVE 8 USED TO BE MASKED OFF, and this is where LIMITATIONS 5.7's
+// "CSI 1;33A decodes as plain Up" came from. They are decoded now, using
+// KITTY'S table for exactly the bits where the two encodings cannot disagree:
+//
+//   bit  16  32  64  128
+//        Hyper Meta Caps Num      (Kitty)
+//        --unused, all four--     (xterm)
+//
+// xterm's table stops at bit 8, so no terminal driving THIS proc under xterm's
+// rules can ever set one of them. A set bit up there is therefore proof the
+// terminal is speaking Kitty's table, and decoding it can only add information
+// that was previously thrown away -- it cannot mis-name anything, because there
+// is no competing meaning to mis-name it as.
+//
+// BIT 8 IS THE ONE PLACE THAT ARGUMENT DOES NOT HOLD, and it stays Meta. xterm
+// says Meta, Kitty says Super, both send it in this same sequence shape, and
+// nothing in the bytes distinguishes them. Meta is kept because it is what this
+// proc has always answered, what xterm -- the encoding this proc is named for
+// -- defines, and what the existing tests pin. The consequence, stated rather
+// than hidden: a Super-modified arrow key from a Kitty-protocol terminal that
+// chose the legacy sequence shape reports as {.Meta}. An application that wants
+// an unambiguous Super binding should enable the Kitty keyboard protocol, where
+// kitty_mods reads the same bit correctly.
 xterm_mods :: proc(param: int) -> (mods: Modifiers, ok: bool) {
 	if param < 1 || param > 256 { return {}, false }
 	mask := param - 1
-	if mask & 1 != 0 { mods += {.Shift} }
-	if mask & 2 != 0 { mods += {.Alt} }
-	if mask & 4 != 0 { mods += {.Ctrl} }
-	if mask & 8 != 0 { mods += {.Meta} }
+	if mask &   1 != 0 { mods += {.Shift} }
+	if mask &   2 != 0 { mods += {.Alt} }
+	if mask &   4 != 0 { mods += {.Ctrl} }
+	if mask &   8 != 0 { mods += {.Meta} }
+	if mask &  16 != 0 { mods += {.Hyper} }
+	if mask &  32 != 0 { mods += {.Meta} }
+	if mask &  64 != 0 { mods += {.Caps_Lock} }
+	if mask & 128 != 0 { mods += {.Num_Lock} }
 	return mods, true
 }
 
@@ -820,13 +861,25 @@ csi_letter_code :: proc(final: u8) -> (code: Key_Code, mods: Modifiers, ok: bool
 // Out of range is rejected rather than clamped, matching xterm_mods, so a
 // sequence carrying a nonsense modifier field is cleanly ignored instead of
 // being forced into a plausible-looking key event.
+// The Kitty keyboard protocol's full eight-bit modifier table, all of it. The
+// four this used to drop -- Super (8), Hyper (16), Caps Lock (64) and Num Lock
+// (128) -- are LIMITATIONS 5.7's other half: Kitty's Ctrl+Super+a arrived as a
+// plain Ctrl+a, because bit 8 had nowhere to go.
+//
+// Bit 8 is SUPER here and Meta here is bit 32. That is not a typo and not a
+// disagreement with xterm_mods above; it is the protocols themselves
+// disagreeing, which is why these are two procs and not one with a flag.
 kitty_mods :: proc(param: int) -> (mods: Modifiers, ok: bool) {
 	if param < 1 || param > 256 { return {}, false }
 	mask := param - 1
-	if mask &  1 != 0 { mods += {.Shift} }
-	if mask &  2 != 0 { mods += {.Alt} }
-	if mask &  4 != 0 { mods += {.Ctrl} }
-	if mask & 32 != 0 { mods += {.Meta} }
+	if mask &   1 != 0 { mods += {.Shift} }
+	if mask &   2 != 0 { mods += {.Alt} }
+	if mask &   4 != 0 { mods += {.Ctrl} }
+	if mask &   8 != 0 { mods += {.Super} }
+	if mask &  16 != 0 { mods += {.Hyper} }
+	if mask &  32 != 0 { mods += {.Meta} }
+	if mask &  64 != 0 { mods += {.Caps_Lock} }
+	if mask & 128 != 0 { mods += {.Num_Lock} }
 	return mods, true
 }
 
@@ -904,6 +957,31 @@ kitty_key_code :: proc(code: int) -> (key: Key_Msg, ok: bool) {
 	return Key_Msg{code = .Rune, r = rune(code)}, true
 }
 
+// The codepoints of a Kitty associated-text field AFTER the first, which the
+// key's own Key_Msg.r already carries. Returned alongside the key rather than
+// stored on it -- see kitty_decode's field-2 comment for why the tail becomes
+// extra Key_Msgs instead of a field every application would have to learn
+// about. Plain POD, returned by value, never allocated: `n` is 0 for every
+// sequence that is not a multi-codepoint Kitty text event, which is all of
+// them except IME and dead-key composition.
+Key_Text_Tail :: struct {
+	r: [KITTY_MAX_SUBS - 1]rune,
+	n: int,
+}
+
+// Appends a decoded key and whatever associated-text codepoints followed it.
+// One proc rather than two open-coded loops so the two csi_decode call sites
+// below cannot drift on what a tail means.
+append_key :: proc(out: ^[dynamic]Key_Msg, key: Key_Msg, tail: Key_Text_Tail) {
+	append(out, key)
+	for i in 0 ..< tail.n {
+		// Deliberately bare: no modifiers, no kind, and NOT marked `pasted`
+		// (this is typed text, not a paste, and an application filtering on
+		// `pasted` is asking a different question).
+		append(out, Key_Msg{code = .Rune, r = tail.r[i]})
+	}
+}
+
 // Kitty's parameter grid: up to KITTY_MAX_FIELDS ';'-separated fields, each
 // with ':'-separated sub-parameters. Values are -1 when the slot is present but
 // empty ("\e[97;;98u" has an empty modifier field), which is NOT the same as 0.
@@ -911,7 +989,14 @@ kitty_key_code :: proc(code: int) -> (key: Key_Msg, ok: bool) {
 // `nsub` counts sub-parameters even past what `v` can store, because the text
 // field's COUNT is what decides whether it is usable (see kitty_decode).
 KITTY_MAX_FIELDS :: 3
-KITTY_MAX_SUBS   :: 3
+// Was 3, which was enough for fields 0 and 1 (they define three sub-parameters
+// each and no more) but not for field 2, the ASSOCIATED TEXT, whose length the
+// protocol does not bound. 8 covers what a keyboard actually produces: a dead
+// key or IME commit is one to three codepoints, and the longest realistic case
+// is a ZWJ emoji sequence. Text longer than this is truncated to the first 8
+// codepoints rather than dropped whole, which is the same trade the rest of
+// this decoder makes -- see kitty_decode.
+KITTY_MAX_SUBS   :: 8
 
 Kitty_Params :: struct {
 	v:      [KITTY_MAX_FIELDS][KITTY_MAX_SUBS]int,
@@ -1018,7 +1103,7 @@ kitty_flags_reply :: proc(p: []u8) -> (flags: Kitty_Flags, ok: bool) {
 // multi-codepoint text properly needs a `text` field on Key_Msg (a Msg_Text
 // style inline buffer, since Msg types must stay POD -- see arena.odin's
 // is_pod check), which is a vocabulary change and not T1-J's job.
-kitty_decode :: proc(p: []u8) -> (key: Key_Msg, ok: bool) {
+kitty_decode :: proc(p: []u8) -> (key: Key_Msg, tail: Key_Text_Tail, ok: bool) {
 	kp := kitty_params(p) or_return
 
 	// Field 0 sub 0: the unicode key code. CSI u's documented default is 1.
@@ -1055,13 +1140,43 @@ kitty_decode :: proc(p: []u8) -> (key: Key_Msg, ok: bool) {
 		}
 	}
 
-	// Field 2: the text. See this proc's doc comment for the multi-codepoint
-	// answer. Only overrides a .Rune key: a functional key's text field (if a
-	// terminal ever sent one) has no rune to override.
-	if kp.nfield >= 3 && kp.nsub[2] == 1 && key.code == .Rune && kitty_printable(kp.v[2][0]) {
+	// Field 2: the ASSOCIATED TEXT. Only overrides a .Rune key: a functional
+	// key's text field (if a terminal ever sent one) has no rune to override.
+	//
+	// EVERY CODEPOINT IS EMITTED, NOT JUST THE FIRST (LIMITATIONS 5.8). The
+	// guard here used to be `kp.nsub[2] == 1`, so a text field with more than
+	// one codepoint -- which is exactly what IME composition and dead-key
+	// sequences produce -- failed the test and the whole field was dropped: the
+	// user typed `é` and the application received the raw key with no text at
+	// all. That was the single largest correctness gap left in this decoder for
+	// anyone typing a language that needs composition.
+	//
+	// WHY EXTRA Key_Msgs RATHER THAN A MULTI-RUNE FIELD ON Key_Msg, which is
+	// what 5.8 assumed the fix would be. A `text: [8]rune` field would be
+	// POD-safe and would work, but every application would have to learn about
+	// it: `case .Rune: insert_rune(k.r)` -- the shape every example, the README
+	// and docs/API.md all teach -- would still insert only the first codepoint,
+	// so the bug would move from the decoder into every program written against
+	// it. Emitting the tail as ordinary .Rune presses instead means an
+	// application that already handles typing handles composition too, with no
+	// edit. It is also not a new idea here: bracketed paste already delivers its
+	// content as ordinary keypresses for precisely this reason (Key_Msg.pasted).
+	//
+	// THE TAIL CARRIES NO MODIFIERS AND NO EVENT KIND, deliberately, and again
+	// this follows paste. Composed text is TEXT; the Shift that produced the
+	// dead key is a property of the keystroke, not of each codepoint it
+	// committed. The first Key_Msg keeps the full key semantics so a binding on
+	// it still matches.
+	if kp.nfield >= 3 && kp.nsub[2] >= 1 && key.code == .Rune && kitty_printable(kp.v[2][0]) {
 		key.r = rune(kp.v[2][0])
+		n := min(kp.nsub[2], KITTY_MAX_SUBS)
+		for s in 1 ..< n {
+			if !kitty_printable(kp.v[2][s]) { break }
+			tail.r[tail.n] = rune(kp.v[2][s])
+			tail.n += 1
+		}
 	}
-	return key, true
+	return key, tail, true
 }
 
 // Decodes one COMPLETE CSI whose parameter bytes are `p` and whose final byte
@@ -1072,8 +1187,8 @@ kitty_decode :: proc(p: []u8) -> (key: Key_Msg, ok: bool) {
 // ok = false means "complete, but not a key this decoder understands" -- the
 // caller consumes the sequence and emits nothing. It never means "incomplete";
 // incompleteness is decided by the caller before this proc is reached.
-csi_decode :: proc(p: []u8, has_intermed: bool, final: u8, legacy: Legacy_Key_Encoding) -> (key: Key_Msg, ok: bool) {
-	if has_intermed { return {}, false }
+csi_decode :: proc(p: []u8, has_intermed: bool, final: u8, legacy: Legacy_Key_Encoding) -> (key: Key_Msg, tail: Key_Text_Tail, ok: bool) {
+	if has_intermed { return {}, {}, false }
 
 	// 'u' is the Kitty keyboard protocol's dispatch point, and it is routed
 	// BEFORE csi_params on purpose: the Kitty grammar has ':' sub-parameters
@@ -1130,13 +1245,13 @@ csi_decode :: proc(p: []u8, has_intermed: bool, final: u8, legacy: Legacy_Key_En
 			key  := kitty_key_code(params[2]) or_return
 			key.kind  = kind
 			key.mods += mods
-			return key, true
+			return key, {}, true
 		}
-		if count == 0 || count > 2 { return {}, false }
+		if count == 0 || count > 2 { return {}, {}, false }
 		code := csi_tilde_code(params[0], legacy) or_return
-		if count == 1 { return Key_Msg{kind = kind, code = code}, true }
+		if count == 1 { return Key_Msg{kind = kind, code = code}, {}, true }
 		mods := xterm_mods(params[1]) or_return
-		return Key_Msg{kind = kind, code = code, mods = mods}, true
+		return Key_Msg{kind = kind, code = code, mods = mods}, {}, true
 	}
 
 	// URXVT'S MODIFIED TILDE KEYS: the modifier rides in the FINAL BYTE, not in
@@ -1158,7 +1273,7 @@ csi_decode :: proc(p: []u8, has_intermed: bool, final: u8, legacy: Legacy_Key_En
 	// calls in here with has_intermed = false, which is why this arm sits below
 	// the `has_intermed` rejection at the top rather than being exempted from it.
 	if final == '$' || final == '^' || final == '@' {
-		if count != 1 { return {}, false }
+		if count != 1 { return {}, {}, false }
 		code := csi_tilde_code(params[0], legacy) or_return
 		mods: Modifiers
 		switch final {
@@ -1166,22 +1281,22 @@ csi_decode :: proc(p: []u8, has_intermed: bool, final: u8, legacy: Legacy_Key_En
 		case '^': mods = {.Ctrl}
 		case '@': mods = {.Ctrl, .Shift}
 		}
-		return Key_Msg{kind = kind, code = code, mods = mods}, true
+		return Key_Msg{kind = kind, code = code, mods = mods}, {}, true
 	}
 
 	code, base := csi_letter_code(final) or_return
-	if count == 0 { return Key_Msg{kind = kind, code = code, mods = base}, true }
-	if count > 2 { return {}, false }
+	if count == 0 { return Key_Msg{kind = kind, code = code, mods = base}, {}, true }
+	if count > 2 { return {}, {}, false }
 	// The first parameter of a modified cursor/function key is always 1 (the
 	// "one key" repeat count); anything else is a different sequence that
 	// happens to share our final byte -- a cursor position report, most
 	// importantly -- and must not be decoded as a key.
 	id := params[0]
 	if id < 0 { id = 1 }
-	if id != 1 { return {}, false }
-	if count == 1 { return Key_Msg{kind = kind, code = code, mods = base}, true }
+	if id != 1 { return {}, {}, false }
+	if count == 1 { return Key_Msg{kind = kind, code = code, mods = base}, {}, true }
 	mods := xterm_mods(params[1]) or_return
-	return Key_Msg{kind = kind, code = code, mods = mods + base}, true
+	return Key_Msg{kind = kind, code = code, mods = mods + base}, {}, true
 }
 
 // SS3: ESC O <digits>* <GL byte>. The digit run is the same 1+bitmask
@@ -1748,8 +1863,8 @@ decode_keys :: proc(
 				// final. csi_bare_number is what keeps that from stealing DECRPM,
 				// whose '$' really is an intermediate; read its comment.
 				if j < len(data) && data[j] == '$' && csi_bare_number(data[ps:pe]) {
-					if key, ok := csi_decode(data[ps:pe], false, '$', legacy); ok {
-						append(out, key)
+					if key, tail, ok := csi_decode(data[ps:pe], false, '$', legacy); ok {
+						append_key(out, key, tail)
 					}
 					i = j + 1
 					continue
@@ -1914,8 +2029,8 @@ decode_keys :: proc(
 					i = j + 1
 					continue
 				}
-				if key, ok := csi_decode(data[ps:pe], pe != j, final, legacy); ok {
-					append(out, key)
+				if key, tail, ok := csi_decode(data[ps:pe], pe != j, final, legacy); ok {
+					append_key(out, key, tail)
 				}
 				// Whether decoded or not, the sequence is consumed as ONE unit
 				// -- "cleanly ignore an unsupported key" rather than leaking
