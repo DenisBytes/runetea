@@ -1,6 +1,14 @@
 # SDD scratch workspace (ledger, briefs, review packages)
 .superpowers/
 
+# Python bytecode. tools/difftest/check.py and tools/doccheck/{cite,screen}.py are
+# run directly, so CPython caches bytecode next to them. One .pyc was tracked for
+# three commits: it is regenerated automatically, it is tagged with the
+# interpreter version (cpython-310), so it produces a spurious diff for anyone on
+# a different Python, and it had been pushed to a public repository.
+__pycache__/
+*.py[cod]
+
 # Odin build artifacts
 *.o
 *.obj
